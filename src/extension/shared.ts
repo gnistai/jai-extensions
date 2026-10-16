@@ -81,7 +81,7 @@ export interface RenderPortRequest {
   pageId: string;
   modelId: string | null;
   inputImage: { b64: string; mime: string } | null;
-  originalRatio: number | null;
+  governingRatio: number | null;
   target: { width: number; height: number } | null;
   automatic: boolean;
 }

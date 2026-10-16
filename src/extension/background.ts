@@ -64,7 +64,7 @@ async function handleRender(req: RenderPortRequest, post: (m: RenderPortReply) =
   if (req.automatic && read.diagnostics.some(d => d.code === 'unsupported-version')) return post({ type: 'error', kind: 'consent', message: 'Unknown JAI version: not rendered automatically.' });
 
   const hasInput = req.inputImage !== null;
-  const { interpreted: it, diagnostics: idiag } = interpret(read.document, { catalog: catalog(s), families: FAMILIES, hasOriginal: hasInput });
+  const { interpreted: it, diagnostics: idiag } = interpret(read.document, { catalog: catalog(s), families: FAMILIES, hasOriginal: hasInput, governingRatio: req.governingRatio });
   let modelId = req.modelId && s.enabledModels.includes(req.modelId) ? req.modelId : it.matched ?? null;
   if (!modelId) return post({ type: 'error', kind: 'config', message: 'No model is enabled. Choose one in the options.' });
   const model = REPLICATE_MODELS.find(m => m.id === modelId);
@@ -77,7 +77,9 @@ async function handleRender(req: RenderPortRequest, post: (m: RenderPortReply) =
 
   // Cache: identity + renderer configuration + input image + top-level site (spec: Caches).
   const inputHash = req.inputImage ? await sha256Hex(b64decode(req.inputImage.b64)) : '-';
-  const key = await sha256Hex(new TextEncoder().encode([await identity(read.document), modelId, model.version ?? '', s.foldAvoid ? 'fold' : 'omit', inputHash, req.topSite].join('|')));
+  // The ratio actually requested is part of the render configuration (spec: render cache key).
+  const ratioKey = req.governingRatio ? req.governingRatio.toFixed(3) : (it.ratio ? it.ratio.toFixed(3) : '-');
+  const key = await sha256Hex(new TextEncoder().encode([await identity(read.document), modelId, model.version ?? '', s.foldAvoid ? 'fold' : 'omit', inputHash, ratioKey, req.topSite].join('|')));
   // Identical requests already in flight share one provider job (never pay twice).
   // Registration is synchronous, before any further await, so concurrent requests cannot race.
   const pending = inflight.get(key);
@@ -123,7 +125,7 @@ async function handleRender(req: RenderPortRequest, post: (m: RenderPortReply) =
     const result = await renderer.render({
       intent, modelId, signal,
       inputImage: req.inputImage ? { bytes: b64decode(req.inputImage.b64), mime: req.inputImage.mime } : null,
-      originalRatio: req.originalRatio, target: req.target,
+      governingRatio: req.governingRatio, target: req.target,
       onStatus: st => post({ type: 'status', status: st }),
     });
     const interpreterCodes = idiag.filter(d => ['repeated-single', 'invalid-value', 'adjusted-value', 'ignored-value', 'invalid-image', 'unsupported-preview', 'no-matching-model', 'substituted-model', 'version-ignored'].includes(d.code));

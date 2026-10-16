@@ -27,6 +27,8 @@ export interface Interpreted {
   preview: string | null;
   animate: boolean;
   matched?: string | null;
+  /** Ratio to render at (spec §Size and aspect); null when the preview or the renderer default decides. */
+  ratio?: number | null;
 }
 
 const NUM_SRC = '(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)';
@@ -64,9 +66,9 @@ export function parseAspect(v: string): Aspect | null {
   return { kind: 'ratio', width: rw, height: rh, ratio: r };
 }
 
-export interface InterpretOptions { catalog?: CatalogModel[]; families?: Record<string, string[]>; hasOriginal?: boolean }
+export interface InterpretOptions { catalog?: CatalogModel[]; families?: Record<string, string[]>; hasOriginal?: boolean; governingRatio?: number | null }
 
-export function interpret(doc: JaiDocument, { catalog = [], families = {}, hasOriginal = false }: InterpretOptions = {}): { interpreted: Interpreted; diagnostics: Diagnostic[] } {
+export function interpret(doc: JaiDocument, { catalog = [], families = {}, hasOriginal = false, governingRatio = null }: InterpretOptions = {}): { interpreted: Interpreted; diagnostics: Diagnostic[] } {
   const diagnostics: Diagnostic[] = [];
   const out: Interpreted = { prompt: null, description: '', style: [], avoid: [], model: [], aspect: null, mode: 'generate', strength: null, seed: null, source: null, preview: null, animate: false };
   const single = (key: string): string | null => {
@@ -122,6 +124,18 @@ export function interpret(doc: JaiDocument, { catalog = [], families = {}, hasOr
     if (['true', 'yes', '1', 'on'].includes(lv)) out.animate = true;
     else if (['false', 'no', '0', 'off'].includes(lv)) out.animate = false;
     else diagnostics.push(diag('invalid-value', 'animate'));
+  }
+  // Ratio to render at (spec §Size and aspect): the governing ratio wins over aspect.
+  out.ratio = out.aspect ? out.aspect.width / out.aspect.height : null;
+  if (governingRatio !== null && governingRatio > 0) {
+    if (out.aspect) {
+      const r = out.aspect.width / out.aspect.height;
+      const differs = out.aspect.keyword === 'landscape' ? !(governingRatio > 1)
+        : out.aspect.keyword === 'portrait' ? !(governingRatio < 1)
+        : Math.abs(Math.log(r / governingRatio)) > 0.01;
+      if (differs) diagnostics.push(diag('ignored-value', 'aspect'));
+    }
+    out.ratio = governingRatio;
   }
   if (catalog.length) {
     const needsImage = out.mode === 'transform' && (hasOriginal || out.source !== null);

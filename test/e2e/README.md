@@ -27,3 +27,7 @@ node test/e2e/driver.mjs <chrome> <extension-copy> http://localhost:8766 <file-w
 ```
 
 The driver needs `puppeteer-core` and must run on the same machine as Chrome.
+
+Use a fresh profile directory after changing extension code: Chrome keeps running a
+cached copy of the background worker in a reused profile, even after a version bump,
+so tests silently exercise old code. A fresh profile re-renders (a few cents).

@@ -32,8 +32,8 @@ export interface RenderRequest {
   modelId: string;
   /** Pixels the page itself could read (spec: Inputs the viewer may use). */
   inputImage: InputImage | null;
-  /** Ratio of the original image when one exists; it governs the render in HTML. */
-  originalRatio: number | null;
+  /** The element's governing ratio (original image, or an author-sized layout box); it overrides aspect. */
+  governingRatio: number | null;
   /** Desired output size in device pixels (layout box x DPR), advisory. */
   target: { width: number; height: number } | null;
   signal?: AbortSignal;

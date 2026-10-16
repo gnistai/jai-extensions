@@ -4,7 +4,7 @@ import { buildInput, REPLICATE_MODELS, ReplicateRenderer, sniffImage } from '../
 
 const model = id => REPLICATE_MODELS.find(m => m.id === id);
 const intent = (o = {}) => ({ description: 'A castle', style: [], avoid: [], aspect: null, mode: 'generate', strength: null, seed: null, animate: false, ...o });
-const req = (o = {}) => ({ intent: intent(o.intent), modelId: o.modelId ?? 'black-forest-labs/flux-schnell', inputImage: o.inputImage ?? null, originalRatio: o.originalRatio ?? null, target: o.target ?? null });
+const req = (o = {}) => ({ intent: intent(o.intent), modelId: o.modelId ?? 'black-forest-labs/flux-schnell', inputImage: o.inputImage ?? null, governingRatio: o.governingRatio ?? null, target: o.target ?? null });
 const codes = r => r.diagnostics.map(d => d.code + (d.key ? ':' + d.key : ''));
 
 test('flux: style appended, aspect snapped to the enum, avoid folded and reported', () => {
@@ -32,10 +32,17 @@ test('sdxl: style first (short window), native negative prompt, width/height', (
   assert.equal(r.input.apply_watermark, false);
 });
 
-test('an original image ratio governs; a differing aspect is reported as ignored', () => {
-  const r = buildInput(model('black-forest-labs/flux-schnell'), req({ originalRatio: 1.5, intent: { aspect: { width: 1, height: 1 } } }), { foldAvoid: true });
+test('the governing ratio (original or sized box) overrides aspect; the library, not the engine, reports it', () => {
+  const r = buildInput(model('black-forest-labs/flux-schnell'), req({ governingRatio: 1.5, intent: { aspect: { width: 1, height: 1 } } }), { foldAvoid: true });
   assert.equal(r.input.aspect_ratio, '3:2');
-  assert.ok(codes(r).includes('ignored-value:aspect'));
+  assert.ok(!codes(r).includes('ignored-value:aspect'));
+});
+
+test('without a governing ratio, aspect decides; the displayed size of an unsized box does not', () => {
+  const r = buildInput(model('black-forest-labs/flux-schnell'), req({ target: { width: 800, height: 800 }, intent: { aspect: { width: 16, height: 9 } } }), { foldAvoid: true });
+  assert.equal(r.input.aspect_ratio, '16:9');
+  const none = buildInput(model('black-forest-labs/flux-schnell'), req({ target: { width: 800, height: 400 } }), { foldAvoid: true });
+  assert.equal(none.input.aspect_ratio, undefined);
 });
 
 test('flux-dev transform: input image and departure strength', () => {

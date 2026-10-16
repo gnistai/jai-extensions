@@ -29,7 +29,7 @@ function init(): void {
     render?: Extract<RenderPortReply, { type: 'done' }>;
     badge?: HTMLButtonElement;
   }
-  interface SavedState { srcset: string | null; sizes: string | null; alt: string | null; ariaDescription: string | null; ariaBusy: string | null; insertedSource: HTMLSourceElement | null; canvas: HTMLCanvasElement | null; display: string }
+  interface SavedState { srcset: string | null; sizes: string | null; alt: string | null; ariaDescription: string | null; ariaBusy: string | null; insertedSource: HTMLSourceElement | null; canvas: HTMLCanvasElement | null; display: string; objectFit: string | null }
 
   const items = new Map<HTMLImageElement, Item>();
   const ours = new WeakSet<Element>();
@@ -251,7 +251,7 @@ function init(): void {
     const req: RenderPortRequest = {
       type: 'render', canonicalJSON: canonicalJSON(item.doc), origin, topSite, pageId, modelId, automatic,
       inputImage: input,
-      originalRatio: hasOriginal ? item.img.naturalWidth / item.img.naturalHeight : null,
+      governingRatio: governingRatio(item.img, hasOriginal),
       target: rect.width ? { width: Math.round(rect.width * devicePixelRatio), height: Math.round(rect.height * devicePixelRatio) } : null,
     };
     item.status = 'rendering'; placeBadge(item);
@@ -269,8 +269,19 @@ function init(): void {
     port.postMessage(req);
   }
 
+  /** Spec §Size and aspect: the original's ratio, else an author-sized box (width+height or CSS aspect-ratio). */
+  function governingRatio(img: HTMLImageElement, hasOriginal: boolean): number | null {
+    if (hasOriginal) return img.naturalWidth / img.naturalHeight;
+    const w = Number(img.getAttribute('width')), h = Number(img.getAttribute('height'));
+    if (w > 0 && h > 0) return w / h;
+    const ar = getComputedStyle(img).aspectRatio; // "16 / 9", "auto 4 / 3", "1.5" or "auto"
+    const m = /([0-9.]+)\s*(?:\/\s*([0-9.]+))?\s*$/.exec(ar);
+    if (m && ar.trim() !== 'auto') { const a = Number(m[1]), b = m[2] ? Number(m[2]) : 1; if (a > 0 && b > 0) return a / b; }
+    return null;
+  }
+
   function save(img: HTMLImageElement): SavedState {
-    return { srcset: img.getAttribute('srcset'), sizes: img.getAttribute('sizes'), alt: img.getAttribute('alt'), ariaDescription: img.getAttribute('aria-description'), ariaBusy: img.getAttribute('aria-busy'), insertedSource: null, canvas: null, display: img.style.display };
+    return { srcset: img.getAttribute('srcset'), sizes: img.getAttribute('sizes'), alt: img.getAttribute('alt'), ariaDescription: img.getAttribute('aria-description'), ariaBusy: img.getAttribute('aria-busy'), insertedSource: null, canvas: null, display: img.style.display, objectFit: null };
   }
 
   async function apply(item: Item, r: Extract<RenderPortReply, { type: 'done' }>): Promise<void> {
@@ -309,14 +320,24 @@ function init(): void {
         ours.add(c);
         c.width = Math.round(rect.width * devicePixelRatio) || bmp.width; c.height = Math.round(rect.height * devicePixelRatio) || bmp.height;
         c.style.cssText = `width:${rect.width}px;height:${rect.height}px;display:inline-block;vertical-align:${getComputedStyle(img).verticalAlign}`;
-        c.getContext('2d')?.drawImage(bmp, 0, 0, c.width, c.height);
+        // Cover-crop, centred: never stretch (spec §Size and aspect).
+        const scale = Math.max(c.width / bmp.width, c.height / bmp.height);
+        const sw = c.width / scale, sh = c.height / scale;
+        c.getContext('2d')?.drawImage(bmp, (bmp.width - sw) / 2, (bmp.height - sh) / 2, sw, sh, 0, 0, c.width, c.height);
         c.setAttribute('role', 'img');
         img.after(c);
         img.style.display = 'none';
         saved.canvas = c;
         describe(c, item);
       } catch { item.status = 'failed'; item.error = 'This page does not allow replacement images.'; placeBadge(item); return; }
-    } else describe(img, item);
+    } else {
+      describe(img, item);
+      // Never stretch (spec §Size and aspect): honour the page's object-fit, else cover-crop.
+      if (getComputedStyle(img).objectFit === 'fill' && saved.objectFit === null) {
+        saved.objectFit = img.style.objectFit;
+        img.style.objectFit = 'cover';
+      }
+    }
     img.removeAttribute('aria-busy');
     item.status = 'rendered';
     placeBadge(item);
@@ -344,6 +365,7 @@ function init(): void {
     undoReplacement(img, saved);
     saved.canvas?.remove(); saved.canvas = null;
     img.style.display = saved.display;
+    if (saved.objectFit !== null) img.style.objectFit = saved.objectFit;
     if (saved.alt === null) img.removeAttribute('alt'); else img.setAttribute('alt', saved.alt);
     if (saved.ariaDescription === null) img.removeAttribute('aria-description'); else img.setAttribute('aria-description', saved.ariaDescription);
     item.saved = undefined;

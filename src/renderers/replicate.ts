@@ -76,13 +76,9 @@ export function buildInput(model: ReplicateModel, req: RenderRequest, opts: { fo
   if (assembled.negative !== null) input.negative_prompt = assembled.negative;
   if (model.outputFormat) input[model.outputFormat.field] = model.outputFormat.value;
 
-  // Aspect: an original image's ratio governs in HTML (spec: Size and aspect).
-  let ratio: number | null = null;
-  if (req.originalRatio) {
-    ratio = req.originalRatio;
-    if (intent.aspect && Math.abs(Math.log(intent.aspect.width / intent.aspect.height / ratio)) > 0.02) diagnostics.push({ code: 'ignored-value', key: 'aspect' });
-  } else if (intent.aspect) ratio = intent.aspect.width / intent.aspect.height;
-  else if (req.target && req.target.width > 0 && req.target.height > 0) ratio = req.target.width / req.target.height;
+  // Ratio (spec: Size and aspect): the element's governing ratio, else aspect, else the model default.
+  // Whether aspect was ignored is the interpreter's decision (library), not reported again here.
+  const ratio: number | null = req.governingRatio ?? (intent.aspect ? intent.aspect.width / intent.aspect.height : null);
 
   const transform = intent.mode === 'transform' && req.inputImage !== null;
   if (model.sizeInputs) {
@@ -94,7 +90,7 @@ export function buildInput(model: ReplicateModel, req: RenderRequest, opts: { fo
     else if (ratio) {
       const a = nearestAspect(ratio, model.aspects);
       input.aspect_ratio = a;
-      if (intent.aspect && !req.originalRatio && Math.abs(Math.log(ratioOf(a) / ratio)) > 0.05) diagnostics.push({ code: 'adjusted-value', key: 'aspect', requested: `${intent.aspect.width}:${intent.aspect.height}`, actual: a });
+      if (intent.aspect && !req.governingRatio && Math.abs(Math.log(ratioOf(a) / ratio)) > 0.05) diagnostics.push({ code: 'adjusted-value', key: 'aspect', requested: `${intent.aspect.width}:${intent.aspect.height}`, actual: a });
     }
   }
 
