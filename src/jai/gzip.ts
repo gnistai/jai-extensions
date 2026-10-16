@@ -30,10 +30,19 @@ const DBASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 3
 const DEXT = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
 const ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
 
-function buildTree(lengths: ArrayLike<number>): Tree {
+type TreeKind = 'codes' | 'lens' | 'dists' | 'fixed';
+
+/** Canonical Huffman decoding table; rejects over-subscribed and incomplete codes as zlib's inflate_table does. */
+function buildTree(lengths: ArrayLike<number>, kind: TreeKind): Tree {
   const count = new Uint16Array(16), symbol = new Uint16Array(lengths.length);
-  for (let s = 0; s < lengths.length; s++) { const l = lengths[s] ?? 0; count[l] = (count[l] ?? 0) + 1; }
+  let max = 0;
+  for (let s = 0; s < lengths.length; s++) { const l = lengths[s] ?? 0; count[l] = (count[l] ?? 0) + 1; if (l > max) max = l; }
   count[0] = 0;
+  if (max > 0 && kind !== 'fixed') { // zlib builds the fixed tables without these checks
+    let left = 1;
+    for (let len = 1; len < 16; len++) { left <<= 1; left -= count[len] ?? 0; if (left < 0) throw new InflateError('over-subscribed'); }
+    if (left > 0 && (kind === 'codes' || max !== 1)) throw new InflateError('incomplete');
+  }
   const offs = new Uint16Array(16);
   for (let i = 1; i < 16; i++) offs[i] = (offs[i - 1] ?? 0) + (count[i - 1] ?? 0);
   for (let s = 0; s < lengths.length; s++) {
@@ -48,7 +57,7 @@ function fixedTrees(): [Tree, Tree] {
   if (!fixed) {
     const l = new Uint8Array(288);
     l.fill(8, 0, 144); l.fill(9, 144, 256); l.fill(7, 256, 280); l.fill(8, 280, 288);
-    fixed = [buildTree(l), buildTree(new Uint8Array(30).fill(5))];
+    fixed = [buildTree(l, 'fixed'), buildTree(new Uint8Array(30).fill(5), 'fixed')];
   }
   return fixed;
 }
@@ -118,21 +127,23 @@ export function inflateRaw(input: Uint8Array, start = 0, maxOutput = 16 * 1024 *
       const [lt, dt] = fixedTrees(); inflateBlock(lt, dt);
     } else if (type === 2) {
       const hlit = bits(5) + 257, hdist = bits(5) + 1, hclen = bits(4) + 4;
+      if (hlit > 286 || hdist > 30) throw new InflateError('too-many-codes');
       const cl = new Uint8Array(19);
       for (let k = 0; k < hclen; k++) cl[ORDER[k] ?? 0] = bits(3);
-      const ct = buildTree(cl);
+      const ct = buildTree(cl, 'codes');
       const lens = new Uint8Array(hlit + hdist);
       for (let n = 0; n < hlit + hdist;) {
         const sym = decodeSym(ct);
-        if (sym < 16) lens[n++] = sym;
-        else if (sym === 16) {
-          if (n === 0) throw new InflateError('bad-repeat');
-          const prev = lens[n - 1] ?? 0; let r = 3 + bits(2);
-          while (r--) { if (n >= lens.length) throw new InflateError('bad-lengths'); lens[n++] = prev; }
-        } else if (sym === 17) { let r = 3 + bits(3); while (r--) { if (n >= lens.length) throw new InflateError('bad-lengths'); lens[n++] = 0; } }
-        else { let r = 11 + bits(7); while (r--) { if (n >= lens.length) throw new InflateError('bad-lengths'); lens[n++] = 0; } }
+        if (sym < 16) { lens[n++] = sym; continue; }
+        let r: number, val = 0;
+        if (sym === 16) { if (n === 0) throw new InflateError('bad-repeat'); val = lens[n - 1] ?? 0; r = 3 + bits(2); }
+        else if (sym === 17) r = 3 + bits(3);
+        else r = 11 + bits(7);
+        if (n + r > hlit + hdist) throw new InflateError('bad-lengths');
+        while (r--) lens[n++] = val;
       }
-      inflateBlock(buildTree(lens.subarray(0, hlit)), buildTree(lens.subarray(hlit)));
+      if (lens[256] === 0) throw new InflateError('missing-end-of-block');
+      inflateBlock(buildTree(lens.subarray(0, hlit), 'lens'), buildTree(lens.subarray(hlit), 'dists'));
     } else throw new InflateError('bad-block-type');
   } while (!final);
   pos -= bitCnt >> 3; // give back whole bytes pulled into the bit buffer but unused
@@ -151,7 +162,12 @@ export function gunzipOne(bytes: Uint8Array, maxOutput = 16 * 1024 * 1024): { co
   if (flg & 0x04) { if (p + 2 > bytes.length) throw new InflateError('truncated'); const xlen = (bytes[p] ?? 0) | ((bytes[p + 1] ?? 0) << 8); p += 2 + xlen; }
   if (flg & 0x08) { while (p < bytes.length && bytes[p] !== 0) p++; p++; }
   if (flg & 0x10) { while (p < bytes.length && bytes[p] !== 0) p++; p++; }
-  if (flg & 0x02) p += 2;
+  if (flg & 0x02) {
+    if (p + 2 > bytes.length) throw new InflateError('truncated');
+    const hcrc = (bytes[p] ?? 0) | ((bytes[p + 1] ?? 0) << 8);
+    if ((crc32(bytes.subarray(0, p)) & 0xffff) !== hcrc) throw new InflateError('bad-header-crc');
+    p += 2;
+  }
   if (p > bytes.length) throw new InflateError('truncated');
   const { output, consumed } = inflateRaw(bytes, p, maxOutput);
   p += consumed;

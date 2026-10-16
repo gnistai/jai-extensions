@@ -11,8 +11,9 @@ export interface ElementLike {
   children: ArrayLike<ElementLike> | Iterable<ElementLike>;
   ownerDocument?: { baseURI?: string } | null;
   shadowRoot?: RootLike | null;
+  getAttributeNames?(): string[];
 }
-export interface RootLike { querySelectorAll(selector: string): ArrayLike<ElementLike> | Iterable<ElementLike> }
+export interface RootLike { children?: ArrayLike<ElementLike> | Iterable<ElementLike>; querySelectorAll?(selector: string): ArrayLike<ElementLike> | Iterable<ElementLike> }
 
 export interface Discovery {
   carrier: 1 | 2 | 3 | 4;
@@ -29,18 +30,61 @@ function mimeEssence(type: string | null): string {
   return asciiLower((type.split(';')[0] ?? '').replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, ''));
 }
 
-/** First candidate URL of a srcset attribute (URL, then descriptors), or null. */
+export interface SrcsetCandidate { url: string; width: number | null; density: number | null; height: number | null }
+
+/** HTML's "parse a srcset attribute": the candidates that survive, in order. */
+export function srcsetCandidates(input: string | null | undefined): SrcsetCandidate[] {
+  const s = String(input ?? '');
+  const isWS = (c: string): boolean => c === ' ' || c === '\t' || c === '\n' || c === '\f' || c === '\r';
+  const out: SrcsetCandidate[] = [];
+  let pos = 0;
+  for (;;) {
+    while (pos < s.length && (isWS(s.charAt(pos)) || s.charAt(pos) === ',')) pos++;
+    if (pos >= s.length) return out;
+    const start = pos;
+    while (pos < s.length && !isWS(s.charAt(pos))) pos++;
+    let url = s.slice(start, pos);
+    const descriptors: string[] = [];
+    if (url.endsWith(',')) url = url.replace(/,+$/, '');
+    else {
+      while (pos < s.length && isWS(s.charAt(pos))) pos++;
+      let current = '';
+      let state: 'in' | 'paren' | 'after' = 'in';
+      for (;;) {
+        const c = pos < s.length ? s.charAt(pos) : undefined;
+        if (state === 'in') {
+          if (c !== undefined && isWS(c)) { if (current) { descriptors.push(current); current = ''; } state = 'after'; }
+          else if (c === ',') { pos++; if (current) descriptors.push(current); break; }
+          else if (c === '(') { current += c; state = 'paren'; }
+          else if (c === undefined) { if (current) descriptors.push(current); break; }
+          else current += c;
+        } else if (state === 'paren') {
+          if (c === ')') { current += c; state = 'in'; }
+          else if (c === undefined) { descriptors.push(current); break; }
+          else current += c;
+        } else if (c === undefined) break;
+        else if (!isWS(c)) { state = 'in'; continue; }
+        pos++;
+      }
+    }
+    let error = false;
+    let w: number | null = null, d: number | null = null, h: number | null = null;
+    for (const desc of descriptors) {
+      const last = desc.charAt(desc.length - 1), val = desc.slice(0, -1);
+      if (last === 'w' && /^[0-9]+$/.test(val)) { if (w !== null || d !== null) error = true; else { w = +val; if (w === 0) error = true; } }
+      else if (last === 'x' && /^-?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/.test(val)) { if (w !== null || d !== null || h !== null) error = true; else { d = parseFloat(val); if (d < 0) error = true; } }
+      else if (last === 'h' && /^[0-9]+$/.test(val)) { if (h !== null || d !== null) error = true; else { h = +val; if (h === 0) error = true; } }
+      else error = true;
+    }
+    if (h !== null && w === null) error = true;
+    if (!error && url) out.push({ url, width: w, density: d, height: h });
+  }
+}
+
+/** First candidate URL of a srcset attribute under HTML's parsing, or null. */
 export function firstSrcsetURL(srcset: string | null): string | null {
   if (srcset == null) return null;
-  const s = String(srcset);
-  let i = 0;
-  while (i < s.length && /[\t\n\f\r ,]/.test(s.charAt(i))) i++;
-  if (i >= s.length) return null;
-  let j = i;
-  while (j < s.length && !/[\t\n\f\r ]/.test(s.charAt(j))) j++;
-  let url = s.slice(i, j);
-  if (j >= s.length) url = url.replace(/,+$/, '');
-  return url || null;
+  return srcsetCandidates(srcset)[0]?.url ?? null;
 }
 
 const toArray = <T>(x: ArrayLike<T> | Iterable<T>): T[] => Array.from(x as ArrayLike<T>);
@@ -86,16 +130,16 @@ export function discover(img: ElementLike, { baseURL }: { baseURL?: string } = {
   return null;
 }
 
-/** Every carried document under a root, in tree order, descending into open shadow roots. */
+/** Every carried document under a root, in tree order; open shadow trees are visited at their host. */
 export function discoverAll(root: RootLike, opts?: { baseURL?: string }): Array<Discovery & { element: ElementLike }> {
   const out: Array<Discovery & { element: ElementLike }> = [];
-  const walk = (node: RootLike): void => {
-    for (const img of toArray(node.querySelectorAll('img'))) {
-      const d = discover(img, opts);
-      if (d) out.push({ element: img, ...d });
+  const visit = (node: { children?: ArrayLike<ElementLike> | Iterable<ElementLike> }): void => {
+    for (const el of toArray(node.children ?? [])) {
+      if (el.localName === 'img') { const d = discover(el, opts); if (d) out.push({ element: el, ...d }); }
+      if (el.shadowRoot) visit(el.shadowRoot);
+      visit(el);
     }
-    for (const el of toArray(node.querySelectorAll('*'))) if (el.shadowRoot) walk(el.shadowRoot);
   };
-  walk(root);
+  visit(root);
   return out;
 }

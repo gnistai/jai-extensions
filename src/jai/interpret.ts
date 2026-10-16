@@ -7,7 +7,7 @@ export interface Aspect { kind: 'ratio' | 'keyword'; width: number; height: numb
 export interface CatalogModel {
   id: string;
   aliases?: string[];
-  family?: string;
+  family?: string | null;
   imageInput?: boolean;
   image_input?: boolean;
   default?: boolean;
@@ -35,13 +35,12 @@ const ASPECT_NUM_RE = new RegExp(`^${NUM_SRC}$`);
 const STRENGTH_RE = new RegExp(`^(${NUM_SRC})[${WS_CLASS}]*(%)?$`);
 const SEED_RE = /^[0-9]{1,20}$/;
 
-function lexical(key: string, value: string, diagnostics: Diagnostic[]): string {
+function lexical(value: string): string {
+  // Single-valued keys only: one surrounding pair of ASCII quotes, then one trailing full stop.
   let v = value;
   const q = v.charAt(0);
-  if (v.length >= 2 && (q === '"' || q === "'") && v.charAt(v.length - 1) === q) {
-    diagnostics.push(diag('quoted-value', key)); v = trim(v.slice(1, -1));
-  }
-  if (key !== 'prompt' && key !== 'style' && key !== 'avoid' && v.endsWith('.')) v = v.slice(0, -1);
+  if (v.length >= 2 && (q === '"' || q === "'") && v.charAt(v.length - 1) === q) v = trim(v.slice(1, -1));
+  if (v.endsWith('.')) v = v.slice(0, -1);
   return v;
 }
 
@@ -74,13 +73,13 @@ export function interpret(doc: JaiDocument, { catalog = [], families = {}, hasOr
     const vals = doc.get(key);
     if (!vals || !vals.length) return null;
     if (vals.length > 1) diagnostics.push(diag('repeated-single', key));
-    return lexical(key, vals[vals.length - 1] ?? '', diagnostics);
+    return lexical(vals[vals.length - 1] ?? '');
   };
   const prompts = doc.get('prompt');
   if (prompts) { out.prompt = prompts.slice(); out.description = prompts.join('\n'); }
+  // prompt, style, avoid and model are used exactly as written.
   out.style = (doc.get('style') ?? []).slice();
   out.avoid = (doc.get('avoid') ?? []).slice();
-  for (const a of out.avoid) if (/^(no|not|without|never)[\t\n\f\r  ]/i.test(a)) diagnostics.push(diag('negated-avoid', 'avoid'));
   out.model = (doc.get('model') ?? []).slice();
 
   let v: string | null;
@@ -99,16 +98,20 @@ export function interpret(doc: JaiDocument, { catalog = [], families = {}, hasOr
       if (n < 0 || n > 1) { n = Math.min(1, Math.max(0, n)); diagnostics.push(diag('adjusted-value', 'strength')); }
       out.strength = n;
     } else diagnostics.push(diag('invalid-value', 'strength'));
-    if (out.mode !== 'transform') diagnostics.push(diag('strength-without-transform', 'strength'));
   }
   if ((v = single('seed')) !== null) {
     if (SEED_RE.test(v)) out.seed = v; else diagnostics.push(diag('invalid-value', 'seed'));
   }
   if ((v = single('source')) !== null) {
-    const d = /^data:/i.test(v) ? parseDataURL(v) : null;
-    if (d) { if (RASTER_TYPES.has(d.essence)) out.source = v; else diagnostics.push(diag('invalid-image', 'source')); }
-    else out.source = v;
-    if (out.mode !== 'transform') diagnostics.push(diag('ignored-value', 'source'));
+    let valid: boolean;
+    if (/^data:/i.test(v)) { const d = parseDataURL(v); valid = !!d && RASTER_TYPES.has(d.essence); }
+    else if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(v)) valid = /^https?:/i.test(v);
+    else valid = true; // a relative URL
+    if (!valid) diagnostics.push(diag('invalid-image', 'source'));
+    else {
+      out.source = v;
+      if (out.mode !== 'transform') diagnostics.push(diag('ignored-value', 'source'));
+    }
   }
   if ((v = single('preview')) !== null) {
     const d = /^data:/i.test(v) ? parseDataURL(v) : null;
@@ -121,9 +124,11 @@ export function interpret(doc: JaiDocument, { catalog = [], families = {}, hasOr
     else diagnostics.push(diag('invalid-value', 'animate'));
   }
   if (catalog.length) {
-    const m = matchModel(out.model, { catalog, families, needsImage: out.mode === 'transform' && (hasOriginal || out.source !== null) });
+    const needsImage = out.mode === 'transform' && (hasOriginal || out.source !== null);
+    const m = matchModel(out.model, { catalog, families, needsImage });
     out.matched = m.model ? m.model.id : null;
     diagnostics.push(...m.diagnostics);
+    if (needsImage && m.model && !(m.model.imageInput || m.model.image_input)) diagnostics.push(diag('mode-degraded', 'mode'));
   }
   return { interpreted: out, diagnostics };
 }
@@ -132,37 +137,53 @@ const wordsOf = (s: string): string[] => asciiLower(s).match(/[a-z0-9]+/g) ?? []
 
 export interface MatchOptions { catalog?: CatalogModel[]; families?: Record<string, string[]>; needsImage?: boolean; pinsVersions?: boolean }
 
-/** Model matching: selector, never locator. Only catalog models (the user's configuration) can be chosen. */
+/** Model matching (spec §Model matching): a selector, never a locator. Only catalog models can be returned. */
 export function matchModel(values: string[], { catalog = [], families = {}, needsImage = false, pinsVersions = false }: MatchOptions = {}): { model: CatalogModel | null; diagnostics: Diagnostic[] } {
   const diagnostics: Diagnostic[] = [];
-  const usable = needsImage ? catalog.filter(m => m.imageInput || m.image_input) : catalog;
-  const familyOf = (name: string): CatalogModel | null => usable.find(m => m.family === name && m.default) ?? usable.find(m => m.family === name) ?? null;
-  for (const raw of values) {
-    let v = raw;
-    if (!pinsVersions) {
-      const stripped = v.replace(/[:@][^:@/]*$/, '');
-      if (stripped !== v && stripped.length) { v = stripped; diagnostics.push(diag('version-ignored', 'model')); }
-    }
+  const imageOk = (m: CatalogModel): boolean => !!(m.imageInput || m.image_input);
+  const eligible = needsImage ? catalog.filter(imageOk) : catalog.slice();
+  const userDefault = catalog.find(m => m.default) ?? catalog[0] ?? null;
+  const exact = (v: string): CatalogModel | null => {
     const lv = asciiLower(v);
-    const exact = usable.find(m => asciiLower(m.id) === lv || (m.aliases ?? []).some(a => asciiLower(a) === lv));
-    if (exact) return { model: exact, diagnostics };
-    const last = v.split('/').pop() ?? v;
-    for (const candidate of [last, v]) {
+    return eligible.find(m => asciiLower(m.id) === lv || (m.aliases ?? []).some(a => asciiLower(a) === lv)) ?? null;
+  };
+  const known: Array<{ name: string; spellings: string[] }> = Object.entries(families).map(([name, sp]) => ({ name, spellings: [name, ...(sp ?? [])] }));
+  for (const m of catalog) if (m.family && !known.some(f => f.name === m.family)) known.push({ name: m.family, spellings: [m.family] });
+  const familyDefault = (name: string): CatalogModel | null =>
+    userDefault && eligible.includes(userDefault) && userDefault.family === name ? userDefault : eligible.find(m => m.family === name) ?? null;
+  for (const v of values) {
+    let m = exact(v);
+    if (m) return { model: m, diagnostics };
+    const slash = v.lastIndexOf('/');
+    const seg = v.slice(slash + 1);
+    if (!pinsVersions) {
+      let cut = -1;
+      for (let i = seg.length - 1; i >= 1; i--) if (seg.charAt(i) === ':' || seg.charAt(i) === '@') { cut = i; break; }
+      if (cut >= 1) {
+        m = exact(v.slice(0, slash + 1 + cut));
+        if (m) { diagnostics.push(diag('version-ignored', 'model')); return { model: m, diagnostics }; }
+      }
+    }
+    for (const candidate of [seg, v]) {
       const words = wordsOf(candidate);
-      for (const [fam, spellings] of Object.entries(families)) {
-        for (const sp of [fam, ...(spellings ?? [])]) {
+      let best: { name: string; start: number; len: number; order: number } | null = null;
+      known.forEach((f, order) => {
+        if (!familyDefault(f.name)) return;
+        for (const sp of f.spellings) {
           const sw = wordsOf(sp);
           if (!sw.length) continue;
           for (let i = 0; i + sw.length <= words.length; i++) {
             if (sw.every((w, k) => words[i + k] === w)) {
-              const m = familyOf(fam);
-              if (m) { diagnostics.push(diag('substituted-model', 'model', { family: fam })); return { model: m, diagnostics }; }
+              if (!best || i < best.start || (i === best.start && (sw.length > best.len || (sw.length === best.len && order < best.order)))) best = { name: f.name, start: i, len: sw.length, order };
+              break;
             }
           }
         }
-      }
+      });
+      const chosen = best as { name: string } | null;
+      if (chosen) { diagnostics.push(diag('substituted-model', 'model', { family: chosen.name })); return { model: familyDefault(chosen.name), diagnostics }; }
     }
   }
   diagnostics.push(diag('no-matching-model', 'model'));
-  return { model: usable.find(m => m.default) ?? usable[0] ?? null, diagnostics };
+  return { model: userDefault, diagnostics };
 }

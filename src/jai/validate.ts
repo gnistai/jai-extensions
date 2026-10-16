@@ -1,5 +1,7 @@
 // Advisory validator (spec §Diagnostics, validator codes).
-import { SINGLE_VALUED, STANDARD_KEYS, WS_CLASS, asciiLower, diag, trim, type Diagnostic, type JaiDocument } from './chars.ts';
+import { MEDIA_TYPE, SINGLE_VALUED, STANDARD_KEYS, WS_CLASS, asciiLower, diag, trim, type Diagnostic, type JaiDocument } from './chars.ts';
+import { srcsetCandidates } from './html.ts';
+import { canonicalJSON } from './json.ts';
 import type { DecodeResult } from './decode.ts';
 import type { ElementLike } from './html.ts';
 import { interpret, parseAspect } from './interpret.ts';
@@ -12,26 +14,32 @@ const KNOWN_FOREIGN = /(^|\s)--(ar|no|seed|niji|style|v|q|chaos|stylize)\b|^Nega
 export function validate(doc: JaiDocument, info?: ParseInfo | null): Diagnostic[] {
   const d: Diagnostic[] = [];
   const stdset = new Set(STANDARD_KEYS);
+  const utf8 = (s: string): number => new TextEncoder().encode(s).length;
   for (const [k, vals] of doc) {
     if (!k.includes('.') && !stdset.has(k)) d.push(diag('unknown-key', k));
     for (const v of vals) {
       if (/[\u0000-\u0008\u000b\u000e-\u001f\u007f-\u009f]/.test(v)) d.push(diag('control-character', k));
       if (/[​-‍⁠]|.﻿/s.test(v)) d.push(diag('invisible-char', k));
       if (/[‪-‮⁦-⁩]/.test(v)) d.push(diag('bidi-control', k));
-      if (v.length > 8192) d.push(diag('large-payload', k));
+      if (utf8(v) > 8192) d.push(diag('large-payload', k));
       if (/\n[\t\n\f\r ]*[A-Za-z0-9][A-Za-z0-9_.-]*[\t\n\f\r ]*=/.test(v)) d.push(diag('newline-assignment', k));
       if (k === 'prompt' && /^jai:/i.test(v)) d.push(diag('prefix-in-prompt', k));
       if (k === 'prompt' && KNOWN_FOREIGN.test(v)) d.push(diag('foreign-syntax', k));
       if (CONFUSABLE_DELIM.test(v)) d.push(diag('confusable-delimiter', k));
       else if (CONFUSABLE_EQ.test(v)) d.push(diag('confusable-equals', k));
       if (!['source', 'preview', 'model'].includes(k) && !/^[a-z][a-z0-9+.-]*:/i.test(v) && /%[0-9A-Fa-f]{2}/.test(v) && !/%25/i.test(v)) d.push(diag('percent-encoded-text', k));
+      if (k === 'avoid' && /^(no|not|without|never)[\t\n\f\r  ]/i.test(v)) d.push(diag('negated-avoid', k));
+    }
+    if (SINGLE_VALUED.has(k)) {
+      const last = vals[vals.length - 1] ?? '';
+      const q = last.charAt(0);
+      if (last.length >= 2 && (q === '"' || q === "'") && last.charAt(last.length - 1) === q) d.push(diag('quoted-value', k));
     }
   }
-  if (!doc.has('prompt')) {
-    const mode = doc.get('mode');
-    const m = mode ? asciiLower(mode[mode.length - 1] ?? '') : 'generate';
-    if (m === 'generate' && !doc.has('source')) d.push(diag('no-prompt'));
-  }
+  if (utf8(canonicalJSON(doc)) > 65536) d.push(diag('large-payload'));
+  const interp = interpret(doc);
+  if (!doc.has('prompt') && interp.interpreted.mode === 'generate') d.push(diag('no-prompt'));
+  if (doc.has('strength') && interp.interpreted.mode !== 'transform') d.push(diag('strength-without-transform', 'strength'));
   for (const v of doc.get('model') ?? []) if (/^[a-z][a-z0-9+.-]*:\/\/|^\.?\.?\//i.test(v)) d.push(diag('model-looks-like-locator', 'model'));
   if (info?.segments) {
     const segs = info.segments;
@@ -49,7 +57,7 @@ export function validate(doc: JaiDocument, info?: ParseInfo | null): Diagnostic[
       if (prev && s && s.kind === 'assignment' && ['charset', 'base64', 'name', 'filename'].includes(s.key) && prev.kind === 'assignment' && (prev.key === 'source' || prev.key === 'preview')) d.push(diag('split-data-uri', prev.key));
     }
   }
-  for (const x of interpret(doc).diagnostics) if (['repeated-single', 'invalid-value', 'negated-avoid', 'strength-without-transform', 'quoted-value'].includes(x.code)) d.push(x);
+  for (const x of interp.diagnostics) if (x.code === 'repeated-single' || x.code === 'invalid-value') d.push(x);
   const aspect = doc.get('aspect');
   if (aspect) {
     const v = aspect[aspect.length - 1] ?? '';
@@ -59,14 +67,55 @@ export function validate(doc: JaiDocument, info?: ParseInfo | null): Diagnostic[
   return d;
 }
 
-/** Advisories about delivery: decode() result and/or discovery carrier. */
-export function validateDelivery({ decoded, carrier, element }: { decoded?: Pick<DecodeResult, 'document'> & Partial<Pick<DecodeResult, 'form'>> | null; carrier?: number; element?: ElementLike } = {}): Diagnostic[] {
+/** Checks on a data:image/jai URL written in a carrier (validator codes). */
+function dataURLAdvisories(url: string): Diagnostic[] {
   const d: Diagnostic[] = [];
-  if (decoded && (decoded.form === 'json' || decoded.form === 'text')) d.push(diag('non-canonical-encoding'));
+  const s = String(url).replace(/^[\u0000- ]+|[\u0000- ]+$/g, '');
+  if (!/^data:image\/jai(?=[;,]|$)/i.test(s)) return d;
+  const comma = s.indexOf(',');
+  if (comma < 0) { d.push(diag('data-url-missing-comma')); return d; }
+  const params = s.slice(5, comma).split(';').slice(1).map(p => asciiLower((p.trim().split('=')[0]) ?? ''));
+  if (params.some(p => p && p !== 'base64' && p !== 'charset')) d.push(diag('data-url-parameter'));
+  const body = s.slice(comma + 1);
+  if (/[\t\n\r ]|#/.test(body) || /%(?![0-9A-Fa-f]{2})/.test(body)) d.push(diag('unencoded-url-text'));
+  return d;
+}
+
+/**
+ * Advisories about delivery: a decode() result (bytes from a file or fetched
+ * resource; viaDataURL for a data: body) and/or a discovery carrier and element.
+ */
+export function validateDelivery({ decoded, carrier, element, viaDataURL = false }: { decoded?: (Pick<DecodeResult, 'document'> & Partial<Pick<DecodeResult, 'form'>>) | null; carrier?: number; element?: ElementLike; viaDataURL?: boolean } = {}): Diagnostic[] {
+  const d: Diagnostic[] = [];
+  if (decoded && !viaDataURL && (decoded.form === 'json' || decoded.form === 'text')) d.push(diag('non-canonical-encoding'));
+  const doc = decoded?.document;
   if (carrier === 4) {
     d.push(diag('alt-carrier'));
-    if (decoded?.document) for (const vals of decoded.document.values()) if (vals.some(v => /data:/i.test(v))) { d.push(diag('alt-carrier-payload')); break; }
+    if (doc) for (const vals of doc.values()) if (vals.some(v => /data:/i.test(v))) { d.push(diag('alt-carrier-payload')); break; }
   }
   if (carrier === 3 && element && !(element.getAttribute('width') && element.getAttribute('height'))) d.push(diag('missing-size'));
+  if (carrier === 1 && doc) { const m = doc.get('mode'); if (m && asciiLower(trim(m[m.length - 1] ?? '')) === 'keep') d.push(diag('keep-in-source')); }
+  if (element) {
+    const names = typeof element.getAttributeNames === 'function' ? element.getAttributeNames() : [];
+    if (names.some(n => /["';=]/.test(n))) d.push(diag('attribute-split'));
+    const src = element.getAttribute('src');
+    if (src) d.push(...dataURLAdvisories(src));
+    const parent = element.parentElement;
+    if (parent && parent.localName === 'picture') {
+      let after = false;
+      for (const ch of Array.from(parent.children as ArrayLike<ElementLike>)) {
+        if (ch === element) { after = true; continue; }
+        if (ch.localName !== 'source') continue;
+        const type = ch.getAttribute('type'), ss = ch.getAttribute('srcset') ?? '';
+        const isJai = asciiLower(((type ?? '').split(';')[0] ?? '').replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '')) === MEDIA_TYPE;
+        const first = (ss.replace(/^[\t\n\f\r ,]+/, '').split(/[\t\n\f\r ]/)[0] ?? '').replace(/,+$/, '');
+        const looksJai = /^data:image\/jai(?=[;,]|$)/i.test(first) || /\.jai(?:[?#]|$)/i.test(first);
+        if (after) { if (isJai || looksJai) d.push(diag('source-after-img')); continue; }
+        if (isJai && srcsetCandidates(ss).length === 0) d.push(diag('srcset-unparseable'));
+        if (!type && looksJai) d.push(diag('source-missing-type'));
+        if (isJai) d.push(...dataURLAdvisories(first));
+      }
+    }
+  }
   return d;
 }

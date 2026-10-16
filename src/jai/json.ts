@@ -7,17 +7,32 @@ export function numberToString(n: number): string { return String(n); }
 
 export interface ReadResult { document: JaiDocument; diagnostics: Diagnostic[]; isJAI: boolean }
 
+/** True when arrays/objects nest deeper than `max` anywhere (the top-level object has depth 1). */
+function jsonDepthExceeds(s: string, max: number): boolean {
+  let d = 0, inStr = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (inStr) { if (c === 92) i++; else if (c === 34) inStr = false; continue; }
+    if (c === 34) inStr = true;
+    else if (c === 123 || c === 91) { if (++d > max) return true; }
+    else if (c === 125 || c === 93) d--;
+  }
+  return false;
+}
+
 /** JSON reading algorithm (spec §Reading). `text` may be a JSON string or a parsed value. */
 export function readJSON(text: string | unknown, { inContext = true }: { inContext?: boolean } = {}): ReadResult {
   const diagnostics: Diagnostic[] = [];
   const doc = createDocument();
+  const fail = (): ReadResult => { diagnostics.push(diag('invalid-json')); return { document: createDocument(), diagnostics, isJAI: false }; };
   let obj: unknown;
   if (typeof text === 'string') {
-    try { obj = JSON.parse(text); } catch { diagnostics.push(diag('invalid-json')); return { document: doc, diagnostics, isJAI: false }; }
+    if (jsonDepthExceeds(text, 32)) return fail();
+    try {
+      obj = JSON.parse(text, (_k, v: unknown) => { if (typeof v === 'number' && !Number.isFinite(v)) throw new RangeError('overflow'); return v; });
+    } catch { return fail(); }
   } else obj = text;
-  if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
-    diagnostics.push(diag('invalid-json')); return { document: doc, diagnostics, isJAI: false };
-  }
+  if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) return fail();
   const rec = obj as Record<string, unknown>;
   if (!Object.prototype.hasOwnProperty.call(rec, 'jai')) {
     if (!inContext) return { document: doc, diagnostics, isJAI: false };
@@ -27,29 +42,27 @@ export function readJSON(text: string | unknown, { inContext = true }: { inConte
     if (typeof m === 'number' && Number.isInteger(m)) { if (m !== 1) diagnostics.push(diag('unsupported-version')); }
     else diagnostics.push(diag('invalid-marker'));
   }
+  const seen = new Set<string>();
   for (const name of Object.keys(rec)) {
     if (name === 'jai') continue;
     const key = asciiLower(name);
     if (!isKey(key)) { diagnostics.push(diag('invalid-key', name)); continue; }
     if (key === 'jai') { diagnostics.push(diag('duplicate-member', 'jai')); continue; }
+    if (seen.has(key)) diagnostics.push(diag('duplicate-key', key));
+    seen.add(key);
     const raw = rec[name];
     const items: unknown[] = Array.isArray(raw) ? raw : [raw];
-    const existed = doc.has(key);
-    let added = false;
     for (const it of items) {
       let cand: string;
       if (typeof it === 'string') cand = it;
-      else if (typeof it === 'number') {
-        if (!Number.isFinite(it)) { diagnostics.push(diag('invalid-json')); continue; }
-        cand = numberToString(it); diagnostics.push(diag('number-value', key));
-      } else if (typeof it === 'boolean') { cand = it ? 'true' : 'false'; diagnostics.push(diag('number-value', key)); }
+      else if (typeof it === 'number') { cand = numberToString(it); diagnostics.push(diag('number-value', key)); }
+      else if (typeof it === 'boolean') { cand = it ? 'true' : 'false'; diagnostics.push(diag('number-value', key)); }
       else if (it === null) { diagnostics.push(diag('empty-value', key)); continue; }
       else { diagnostics.push(diag('unsupported-member', key)); continue; }
       const v = normalizeValue(cand);
       if (v === null) { diagnostics.push(diag('empty-value', key)); continue; }
-      addValue(doc, key, v); added = true;
+      addValue(doc, key, v);
     }
-    if (existed && added) diagnostics.push(diag('duplicate-key', key));
   }
   return { document: doc, diagnostics, isJAI: true };
 }
