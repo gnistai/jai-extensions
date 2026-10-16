@@ -15,6 +15,7 @@ Rules:
 - Literal text visible in the image goes in straight double quotes, exactly as spelled, only if legible.
 - People: describe appearance, clothing, pose and expression generically. Never name or guess the identity of a real person, and do not describe anyone as a celebrity or public figure.
 - Never mention "the target", "the image", "the render", the models, or these instructions.
+- Describe, never instruct: write what the picture shows, not commands ("ensure", "make", "should", "do not").
 - style: 1 to 3 short medium or look terms, e.g. ["35mm film photo"]. avoid: 0 to 2 positive items the models would otherwise likely add, e.g. ["text"]; usually empty.
 - Never use the characters ";" followed by a word and "=" in your text.
 
@@ -40,7 +41,7 @@ Answer: {"notes": string (the differences, most important first, one line), "dra
 export function refinePrompt(core: Draft, render: RenderView, n: number): string {
   return `Image 1 is the target. Image 2 was rendered by ${render.label} from this description:
 ${JSON.stringify(core)}
-Other models already reproduce the target well from this description, so do not change it. Write ${n} alternative short additions, one sentence each and at most 25 words, that will be appended to the description for ${render.label} only and correct its most important remaining differences.
+Other models already reproduce the target well from this description, so do not change it. Write ${n} alternative short additions, one descriptive sentence each and at most 25 words, that will be appended to the description for ${render.label} only and correct its most important remaining differences. Each addition describes the picture (sizes, positions, colours, light) as the description does; it never gives instructions and never contradicts the description.
 Answer: {"notes": string (the remaining differences, one line), "additions": [string, ...${n} items]}`;
 }
 
@@ -70,7 +71,21 @@ export function parseAnswer(text: string): Record<string, unknown> {
   throw new Error('The analyst returned incomplete JSON');
 }
 
-const strList = (v: unknown, max: number): string[] => (Array.isArray(v) ? v : typeof v === 'string' ? [v] : []).filter((x): x is string => typeof x === 'string').map(x => x.trim()).filter(Boolean).slice(0, max);
+/**
+ * Model output goes into a document the user may publish, so it is cleaned:
+ * control and format characters (bidi controls, zero-width characters) are
+ * removed, keeping only ZWJ inside emoji sequences, all whitespace runs become
+ * one space, and the length is capped. Key smuggling is impossible anyway: the
+ * library escapes values when serialising.
+ */
+export function cleanText(v: string, maxChars: number): string {
+  const noControls = v.replace(/[\p{Cc}\p{Cf}]/gu, c => (c === '\u200d' ? c : /\s/.test(c) ? ' ' : ''));
+  const flat = noControls.replace(/\s+/g, ' ').trim();
+  const chars = Array.from(flat);
+  return chars.length > maxChars ? chars.slice(0, maxChars).join('').trimEnd() : flat;
+}
+
+const strList = (v: unknown, max: number, maxChars = 200): string[] => (Array.isArray(v) ? v : typeof v === 'string' ? [v] : []).filter((x): x is string => typeof x === 'string').map(x => cleanText(x, maxChars)).filter(Boolean).slice(0, max);
 
 /** Validate and clean drafts: no empty prompts, no line breaks, bounded lengths. */
 export function toDrafts(v: unknown): Draft[] {
@@ -79,7 +94,7 @@ export function toDrafts(v: unknown): Draft[] {
   for (const d of v) {
     if (!d || typeof d !== 'object') continue;
     const o = d as Record<string, unknown>;
-    const prompt = typeof o.prompt === 'string' ? o.prompt.replace(/\s+/g, ' ').trim().slice(0, 2000) : '';
+    const prompt = typeof o.prompt === 'string' ? cleanText(o.prompt, 2000) : '';
     if (!prompt) continue;
     out.push({ prompt, style: strList(o.style, 3), avoid: strList(o.avoid, 2) });
   }
@@ -87,5 +102,5 @@ export function toDrafts(v: unknown): Draft[] {
 }
 
 export function toAdditions(v: unknown): string[] {
-  return strList(v, 8).map(s => s.replace(/\s+/g, ' ').slice(0, 300));
+  return strList(v, 8, 300);
 }

@@ -10,6 +10,9 @@ body{max-width:980px;margin:0 auto;padding:20px 16px 60px}
 .drop{border:2px dashed var(--border);border-radius:12px;padding:18px;text-align:center}
 .drop.over{border-color:var(--accent);background:var(--accent-soft)}
 #preview{max-width:240px;max-height:240px;border-radius:8px;display:block;margin:10px auto 0}
+.drop{border-color:var(--muted)}
+.filebtn{display:inline-block}
+.filebtn:focus-within{outline:2px solid var(--accent);outline-offset:2px;border-radius:8px}
 fieldset{border:0;padding:0;margin:8px 0}
 legend{font-weight:600;margin-bottom:4px}
 .models label{display:flex;gap:8px;align-items:baseline;margin:4px 0}
@@ -36,10 +39,11 @@ legend{font-weight:600;margin-bottom:4px}
 <div class="card">
   <h2 style="margin-top:0">1. Image</h2>
   <div class="drop" id="drop">
-    <p style="margin:0">Drop an image here, or <label style="display:inline;color:var(--accent);text-decoration:underline;cursor:pointer">choose a file<input type="file" id="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" hidden></label>.</p>
+    <p style="margin:0 0 8px">Drop an image here, paste one (Ctrl+V), or choose a file.</p>
+    <label class="filebtn btn">Choose an image file<input type="file" id="file" class="sr-only" accept="image/png,image/jpeg,image/webp,image/gif,image/avif"></label>
     <div id="src-row" class="row" hidden style="justify-content:center;margin-top:8px"><button type="button" id="load-src" class="secondary">Load the image you right-clicked</button></div>
     <img id="preview" alt="" hidden>
-    <div id="dims" class="muted"></div>
+    <div id="dims" class="muted" role="status"></div>
   </div>
 </div>
 
@@ -54,22 +58,22 @@ legend{font-weight:600;margin-bottom:4px}
   </div>
   <label><input type="checkbox" id="judge" checked> Let the analyst rate renders as well (more faithful, one extra call per model and generation)</label>
   <p class="notice" id="consent-text">Encoding sends a copy of this image, at most 1024 pixels on its longest side and without metadata, to Replicate. Replicate runs the analyst, a CLIP model and the image models you chose, under your account. The limit is enforced from price estimates; Replicate bills actual usage.</p>
-  <label><input type="checkbox" id="consent"> I understand</label>
+  <label><input type="checkbox" id="consent" aria-describedby="consent-text"> I understand</label>
   <div class="row">
     <button type="button" id="start" disabled>Encode</button>
     <button type="button" id="cancel" class="secondary" disabled>Cancel</button>
-    <span id="spend" class="muted" aria-live="polite"></span>
+    <span id="spend" class="muted"></span>
   </div>
 </div>
 
 <div class="card" id="progress-card" hidden>
   <h2 style="margin-top:0">3. Progress</h2>
-  <ol id="log" aria-live="polite"></ol>
+  <ol id="log" role="log" aria-live="polite" tabindex="0" aria-label="Progress messages"></ol>
   <div id="gens"></div>
 </div>
 
 <div class="card" id="result-card" hidden>
-  <h2 style="margin-top:0">4. Result</h2>
+  <h2 style="margin-top:0" id="result-heading" tabindex="-1">4. Result</h2>
   <pre id="result-text"></pre>
   <div class="row"><button type="button" id="copy">Copy</button><button type="button" id="download" class="secondary">Download .jai</button></div>
   <table id="ranking" style="margin-top:10px"></table>

@@ -6,10 +6,11 @@
 // chooses among the models the user enabled, renders, and returns bytes.
 import { identity, interpret, readJSON, sha256Hex, type CatalogModel } from '../jai/index.ts';
 import { FAMILIES, REPLICATE_MODELS, ReplicateRenderer } from '../renderers/replicate.ts';
-import { HttpReplicateClient, type ModelRef } from '../providers/replicate-client.ts';
+import { HttpReplicateClient } from '../providers/replicate-client.ts';
+import { PortLedger, allowedModel, sanitizeInput } from './encode-guard.ts';
 import { RenderError, type RenderIntent } from '../renderers/types.ts';
 import { idbAll, idbClear, idbDelete, idbGet, idbSet } from './idb.ts';
-import { b64decode, b64encode, getSettings, saveSettings, siteMode, today, type BgRequest, type EncodePortReply, type EncodePortRequest, type RenderPortReply, type RenderPortRequest, type Settings, type StateReply } from './shared.ts';
+import { b64decode, b64encode, getSettings, readCapped, saveSettings, siteMode, today, type BgRequest, type EncodePortReply, type EncodePortRequest, type RenderPortReply, type RenderPortRequest, type Settings, type StateReply } from './shared.ts';
 
 // ---------------------------------------------------------------- token
 
@@ -32,14 +33,29 @@ async function acquire(max: number, signal: AbortSignal): Promise<void> {
 }
 function release(): void { running--; waiting.shift()?.(); }
 
-async function usageToday(): Promise<number> {
-  const { usage } = await chrome.storage.local.get('usage');
-  const u = usage as { day: string; count: number } | undefined;
-  return u && u.day === today() ? u.count : 0;
+// Daily usage lives in memory once loaded, so that checking and reserving a render
+// happen in one synchronous step (no await between them); writes are serialised.
+let usage: { day: string; count: number } | null = null;
+let usageLoad: Promise<void> | null = null;
+let usageWrite: Promise<unknown> = Promise.resolve();
+function loadUsage(): Promise<void> {
+  usageLoad ??= chrome.storage.local.get('usage').then(({ usage: u }) => {
+    const v = u as { day?: unknown; count?: unknown } | undefined;
+    usage = v && v.day === today() && Number.isInteger(v.count) ? { day: today(), count: v.count as number } : { day: today(), count: 0 };
+  });
+  return usageLoad;
 }
-async function countUsage(): Promise<void> {
-  await chrome.storage.local.set({ usage: { day: today(), count: (await usageToday()) + 1 } });
+function usageNow(): number {
+  if (!usage || usage.day !== today()) usage = { day: today(), count: 0 };
+  return usage.count;
 }
+function addUsage(delta: number): void {
+  usageNow();
+  usage!.count = Math.max(0, usage!.count + delta);
+  const snapshot = { ...usage! };
+  usageWrite = usageWrite.then(() => chrome.storage.local.set({ usage: snapshot })).catch(() => undefined);
+}
+async function usageToday(): Promise<number> { await loadUsage(); return usageNow(); }
 
 // ---------------------------------------------------------------- model choice
 
@@ -52,6 +68,7 @@ function catalog(s: Settings): CatalogModel[] {
 interface CacheEntry { b64: string; mime: string; model: string; sentPrompt: string; sentNegative: string | null; sentInput: Record<string, unknown>; jobId: string | null; diagnostics: Array<{ code: string; key?: string }>; created: number }
 
 async function handleRender(req: RenderPortRequest, post: (m: RenderPortReply) => void, signal: AbortSignal): Promise<void> {
+  await loadUsage();
   const s = await getSettings();
   const token = await getToken();
   if (!token) return post({ type: 'error', kind: 'config', message: 'Add your Replicate API token in the extension options first.' });
@@ -104,24 +121,28 @@ async function handleRender(req: RenderPortRequest, post: (m: RenderPortReply) =
     return post(done);
   }
 
-  // Budgets (spec: Consent, budgets and cancellation).
+  // Budgets (spec: Consent, budgets and cancellation). Check and reserve in one
+  // synchronous step, so that a burst of requests cannot all pass the check.
   const pageCount = perPage.get(req.pageId) ?? 0;
   if (pageCount >= s.maxPerPage) { finish(null); return post({ type: 'error', kind: 'budget', message: `Page limit reached (${s.maxPerPage} renders). Change it in the options.` }); }
-  if ((await usageToday()) >= s.maxPerDay) { finish(null); return post({ type: 'error', kind: 'budget', message: `Daily limit reached (${s.maxPerDay} renders). Change it in the options.` }); }
+  if (usageNow() >= s.maxPerDay) { finish(null); return post({ type: 'error', kind: 'budget', message: `Daily limit reached (${s.maxPerDay} renders). Change it in the options.` }); }
   perPage.set(req.pageId, pageCount + 1);
+  addUsage(1);
 
   post({ type: 'status', status: 'queued' });
   try {
     await acquire(s.maxConcurrent, signal);
   } catch {
+    // Canceled before the provider was asked: give the reservation back.
+    perPage.set(req.pageId, Math.max(0, (perPage.get(req.pageId) ?? 1) - 1));
+    addUsage(-1);
     finish(null);
     return post({ type: 'error', kind: 'canceled', message: 'Canceled' });
   }
   const t0 = Date.now();
   try {
-    await countUsage();
     const intent: RenderIntent = {
-      description: merged.description, style: merged.style, avoid: merged.avoid,
+      description: merged.modelDescription, style: merged.modelStyle, avoid: merged.modelAvoid,
       aspect: it.aspect ? { width: it.aspect.width, height: it.aspect.height } : null,
       mode: it.mode, strength: it.strength, seed: it.seed, animate: it.animate,
     };
@@ -150,41 +171,47 @@ async function handleRender(req: RenderPortRequest, post: (m: RenderPortReply) =
   }
 }
 
-// ---------------------------------------------------------------- encoder port
+const originOf = (url: string): string | null => { try { const o = new URL(url).origin; return o === 'null' ? null : o; } catch { return null; } };
+/** The origin of the frame that sent a message, as the browser reports it. */
+function senderOrigin(sender: chrome.runtime.MessageSender | undefined): string | null {
+  if (!sender) return null;
+  if (sender.origin && sender.origin !== 'null') return sender.origin;
+  return sender.url ? originOf(sender.url) : null;
+}
 
-/** Models the encode page may run: the renderers, the analysts and the scorer, pinned where community. */
-const ENCODER_MODELS: ModelRef[] = [
-  ...REPLICATE_MODELS.map(m => (m.official ? { id: m.id } : { id: m.id, version: m.version })),
-  { id: 'google/gemini-2.5-flash' },
-  { id: 'anthropic/claude-4.5-sonnet' },
-  { id: 'krthr/clip-embeddings', version: '1c0371070cb827ec3c7f2f28adcdde54b50dcd239aa6faea0bc98b174ef03fb4' },
-];
-const allowedModel = (m: { id?: unknown; version?: unknown }): ModelRef | null =>
-  ENCODER_MODELS.find(a => a.id === m.id && (a.version ?? null) === (m.version ?? null)) ?? null;
+// ---------------------------------------------------------------- encoder port
 
 function handleEncodePort(port: chrome.runtime.Port): void {
   const jobs = new Map<number, AbortController>();
+  const ledger = new PortLedger();
   let open = true;
   const post = (m: EncodePortReply): void => { if (open) port.postMessage(m); };
   port.onDisconnect.addListener(() => { open = false; for (const ac of jobs.values()) ac.abort(); jobs.clear(); });
   port.onMessage.addListener((msg: EncodePortRequest) => {
+    if (msg?.type === 'begin') { ledger.begin(msg.budgetUSD); return; }
     if (msg?.type === 'cancel') { jobs.get(msg.id)?.abort(); return; }
-    if (msg?.type !== 'predict' || typeof msg.id !== 'number' || jobs.has(msg.id)) return;
+    if (msg?.type !== 'predict' || !Number.isSafeInteger(msg.id) || jobs.has(msg.id)) return;
+    const refuse = (message: string): void => post({ type: 'error', id: msg.id, kind: 'config', message, jobId: null });
     const model = allowedModel(msg.model ?? {});
-    if (!model) return post({ type: 'error', id: msg.id, kind: 'config', message: 'That model is not available to the encoder.', jobId: null });
-    if (!msg.input || typeof msg.input !== 'object' || Array.isArray(msg.input)) return post({ type: 'error', id: msg.id, kind: 'config', message: 'Invalid input.', jobId: null });
+    if (!model) return refuse('That model is not available to the encoder.');
+    const clean = sanitizeInput(model, msg.input);
+    if ('error' in clean) return refuse(clean.error);
+    const denied = ledger.admit(model);
+    if (denied) return post({ type: 'error', id: msg.id, kind: 'budget', message: denied, jobId: null });
     const ac = new AbortController();
     jobs.set(msg.id, ac);
+    let metrics: Record<string, unknown> | null = null;
     void (async () => {
-      const token = await getToken();
-      if (!token) return post({ type: 'error', id: msg.id, kind: 'auth', message: 'Add your Replicate API token in the extension options first.', jobId: null });
       try {
-        const p = await new HttpReplicateClient(token).predict(model, msg.input, { signal: ac.signal, onStatus: status => post({ type: 'status', id: msg.id, status }) });
+        const token = await getToken();
+        if (!token) return post({ type: 'error', id: msg.id, kind: 'auth', message: 'Add your Replicate API token in the extension options first.', jobId: null });
+        const p = await new HttpReplicateClient(token).predict(model, clean.input, { signal: ac.signal, onStatus: status => post({ type: 'status', id: msg.id, status }) });
+        metrics = p.metrics ?? null;
         post({ type: 'result', id: msg.id, prediction: { id: p.id, status: p.status, output: p.output, metrics: p.metrics } });
       } catch (e) {
         const err = e as RenderError;
         post({ type: 'error', id: msg.id, kind: err.kind ?? 'provider', message: err.message, jobId: err.jobId ?? null });
-      } finally { jobs.delete(msg.id); }
+      } finally { jobs.delete(msg.id); ledger.done(model, metrics); }
     })();
   });
 }
@@ -204,7 +231,11 @@ chrome.runtime.onConnect.addListener(port => {
   port.onMessage.addListener((msg: RenderPortRequest | { type: 'cancel' }) => {
     if (msg.type === 'cancel') { ac.abort(); return; }
     if (msg.type !== 'render') return;
-    void handleRender(msg, m => { if (open) port.postMessage(m); }, ac.signal);
+    // Origins come from the browser, not from the message (a compromised renderer could lie).
+    const origin = senderOrigin(port.sender);
+    const top = port.sender?.tab?.url ? originOf(port.sender.tab.url) : null;
+    if (!origin || !top) { if (open) port.postMessage({ type: 'error', kind: 'config', message: 'Unknown page origin.' }); return; }
+    void handleRender({ ...msg, origin, topSite: top }, m => { if (open) port.postMessage(m); }, ac.signal);
   });
 });
 
@@ -245,7 +276,7 @@ async function onRequest(msg: BgRequest | { type: 'found'; count: number }, send
       const reply: StateReply = {
         hasToken: !!(await getToken()), mode: siteMode(s, msg.origin), disclosed: !!s.disclosed[msg.origin],
         models: REPLICATE_MODELS.map(m => ({ id: m.id, label: m.label, imageInput: m.imageInput, costHint: m.costHint, enabled: s.enabledModels.includes(m.id), description: m.description })),
-        defaultModel: s.defaultModel, usage: { today: await usageToday(), maxPerDay: s.maxPerDay, maxPerPage: s.maxPerPage },
+        defaultModel: s.defaultModel, usage: { today: await usageToday(), maxPerDay: s.maxPerDay, maxPerPage: s.maxPerPage }, minDisplayedPx: s.minDisplayedPx,
       };
       return reply;
     }
@@ -256,6 +287,8 @@ async function onRequest(msg: BgRequest | { type: 'found'; count: number }, send
     }
     case 'openOptions': await chrome.runtime.openOptionsPage(); return true;
     case 'acceptDisclosure': {
+      // A content script may accept only for its own origin.
+      if (!sender.url?.startsWith(chrome.runtime.getURL('')) && senderOrigin(sender) !== msg.origin) return false;
       const s = await getSettings();
       await saveSettings({ disclosed: { ...s.disclosed, [msg.origin]: true } });
       return true;
@@ -273,8 +306,8 @@ async function onRequest(msg: BgRequest | { type: 'found'; count: number }, send
       try {
         const res = await fetch(msg.url, { credentials: 'omit', referrerPolicy: 'no-referrer' });
         if (!res.ok) return { error: `HTTP ${res.status}` };
-        const buf = new Uint8Array(await res.arrayBuffer());
-        if (buf.length > 16 * 1024 * 1024) return { error: 'Too large' };
+        const buf = await readCapped(res, 16 * 1024 * 1024);
+        if (!buf) return { error: 'Too large' };
         return { b64: b64encode(buf) };
       } catch (e) { return { error: String((e as Error).message) }; }
     }
@@ -309,7 +342,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Pages other than the options page may not manage the token.
   // Content scripts report the web page's URL; only the extension's own pages have its origin.
   const fromExtensionPage = !!sender.url?.startsWith(chrome.runtime.getURL(''));
-  if (['setToken', 'clearToken', 'testToken', 'history', 'clearHistory', 'clearCache'].includes((msg as { type: string }).type) && !fromExtensionPage) { sendResponse(null); return false; }
+  if (['setToken', 'clearToken', 'testToken', 'tokenStatus', 'setSiteMode', 'history', 'clearHistory', 'clearCache'].includes((msg as { type: string }).type) && !fromExtensionPage) { sendResponse(null); return false; }
   onRequest(msg, sender).then(sendResponse, e => sendResponse({ error: String(e) }));
   return true;
 });

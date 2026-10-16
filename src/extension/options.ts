@@ -33,6 +33,8 @@ async function main(): Promise<void> {
     const tr = document.createElement('tr');
     const use = document.createElement('input'); use.type = 'checkbox'; use.checked = s.enabledModels.includes(m.id);
     const def = document.createElement('input'); def.type = 'radio'; def.name = 'default'; def.checked = s.defaultModel === m.id;
+    use.setAttribute('aria-label', `Use ${m.label}`);
+    def.setAttribute('aria-label', `Make ${m.label} the default`);
     const c1 = document.createElement('td'); c1.append(use);
     const c2 = td(`${m.label} — ${m.description}${m.imageInput ? ' (accepts an input image)' : ''}`);
     const c3 = document.createElement('td'); c3.append(def);

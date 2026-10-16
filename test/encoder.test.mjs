@@ -108,7 +108,8 @@ test('encoder: refines the lagging model with prompt/<family> and ranks models b
   assert.ok(log.some(l => l.model === 'acme/beta' && l.description.includes('beta-fix')));
   // The document interprets for beta with the refinement appended to the core.
   const it = interpret(doc, { catalog: MODELS.map(m => ({ ...m, default: false })), selected: 'acme/beta' }).interpreted;
-  assert.ok(it.description.endsWith('\nA small beta-fix detail.'));
+  assert.ok(it.modelDescription.endsWith('\nA small beta-fix detail.'));
+  assert.ok(!it.description.includes('beta-fix'), 'the description stays the core');
 });
 
 test('encoder: a failed render scores 0 and is still charged', async () => {
@@ -173,7 +174,7 @@ test('encoder helpers', () => {
   assert.equal(reduceAspect(3000, 2000), '3:2');
   assert.equal(reduceAspect(1000, 1001), '1:1');
   assert.equal(reduceAspect(997, 211), '19:4');
-  assert.equal(reduceAspect(6400, 9), '6400:9');
+  assert.equal(reduceAspect(6400, 90), '640:9');
   assert.equal(cosine([1, 0], [1, 0]), 1);
   const px = (r, g, b) => ({ width: 1, height: 1, data: new Uint8Array([r, g, b, 255]) });
   assert.equal(thumbnailSimilarity(px(10, 20, 30), px(10, 20, 30)), 1);
@@ -182,7 +183,9 @@ test('encoder helpers', () => {
   assert.deepEqual(toDrafts([{ prompt: ' a\nb ', style: 'x', avoid: [1, 'y'] }, { prompt: '' }, null]), [{ prompt: 'a b', style: ['x'], avoid: ['y'] }]);
   const flux = (id, aliases) => ({ id, family: 'flux', aliases });
   assert.deepEqual(refinementTargets([flux('bfl/flux-schnell', ['flux-schnell']), { id: 'sai/sdxl', family: 'sdxl', aliases: [] }]), { 'bfl/flux-schnell': 'flux', 'sai/sdxl': 'sdxl' });
-  assert.deepEqual(refinementTargets([flux('bfl/flux-schnell', ['flux-schnell']), flux('bfl/flux-dev', ['flux-dev'])]), { 'bfl/flux-schnell': 'flux-schnell', 'bfl/flux-dev': 'flux-dev' });
+  assert.deepEqual(refinementTargets([flux('bfl/flux-schnell', ['flux-schnell']), flux('bfl/flux-dev', ['flux-dev'])]), {}, 'a shared family is not refined');
+  assert.equal(reduceAspect(30000, 100), '100:1');
+  assert.equal(reduceAspect(100, 30000), '1:100');
   const doc = buildDocument({ prompt: 'x', style: [], avoid: [] }, { 'bfl/flux-schnell': ['y'] }, { 'bfl/flux-schnell': 'flux' }, ['bfl/flux-schnell'], '3:2');
   assert.deepEqual([...doc.keys()], ['prompt', 'prompt/flux', 'aspect', 'model']);
   const b = new Budget(1);

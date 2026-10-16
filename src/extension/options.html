@@ -12,7 +12,7 @@
 
   <h2>Replicate API token</h2>
   <div class="card">
-    <div id="token-status" class="muted">Checking…</div>
+    <div id="token-status" class="muted" role="status">Checking…</div>
     <label>Token <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="r8_…" style="width:100%"></label>
     <div class="row"><button id="save-token" type="button">Save</button><button id="test-token" type="button" class="secondary">Test</button><button id="clear-token" type="button" class="secondary">Remove</button></div>
     <p class="muted" style="margin-bottom:0">Create one at <a href="https://replicate.com/account/api-tokens">replicate.com/account/api-tokens</a>. It is stored only in this browser profile, in the extension's private storage, and is used only by the extension's background worker to call api.replicate.com. Web pages and the extension's in-page code never see it.</p>
@@ -32,7 +32,7 @@
       <label>At most <input id="max-day" type="number" min="1" max="2000" style="width:5em"> renders per day</label>
       <label><input id="max-conc" type="number" min="1" max="4" style="width:4em"> at a time</label>
     </div>
-    <div class="row"><button id="save-limits" type="button">Save limits</button><span id="limits-saved" class="ok" hidden>Saved</span></div>
+    <div class="row"><button id="save-limits" type="button">Save limits</button><span role="status"><span id="limits-saved" class="ok" hidden>Saved</span></span></div>
   </div>
 
   <h2>Sites</h2>

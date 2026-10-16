@@ -41,6 +41,9 @@ const gcd = (a: number, b: number): number => (b ? gcd(b, a % b) : a);
 export function reduceAspect(width: number, height: number): string {
   if (!(width > 0 && height > 0)) throw new RangeError('dimensions must be positive');
   const r = width / height;
+  // The aspect grammar accepts quotients from 1/100 to 100.
+  if (r >= 100) return '100:1';
+  if (r <= 0.01) return '1:100';
   for (let h = 1; h <= 32; h++) {
     const w = Math.round(r * h);
     if (w >= 1 && w <= 64 && Math.abs(Math.log(w / h / r)) < 0.01) return `${w}:${h}`;

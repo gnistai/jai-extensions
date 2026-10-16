@@ -26,6 +26,11 @@ export interface Interpreted {
   source: string | null;
   preview: string | null;
   animate: boolean;
+  /** What the selected model receives (spec §Per-model refinements): core values, then matching refinements. */
+  modelPrompt: string[];
+  modelDescription: string;
+  modelStyle: string[];
+  modelAvoid: string[];
   matched?: string | null;
   /** Ratio to render at (spec §Size and aspect); null when the preview or the renderer default decides. */
   ratio?: number | null;
@@ -70,7 +75,7 @@ export interface InterpretOptions { catalog?: CatalogModel[]; families?: Record<
 
 export function interpret(doc: JaiDocument, { catalog = [], families = {}, hasOriginal = false, governingRatio = null, selected = null }: InterpretOptions = {}): { interpreted: Interpreted; diagnostics: Diagnostic[] } {
   const diagnostics: Diagnostic[] = [];
-  const out: Interpreted = { prompt: null, description: '', style: [], avoid: [], model: [], aspect: null, mode: 'generate', strength: null, seed: null, source: null, preview: null, animate: false };
+  const out: Interpreted = { prompt: null, description: '', style: [], avoid: [], model: [], aspect: null, mode: 'generate', strength: null, seed: null, source: null, preview: null, animate: false, modelPrompt: [], modelDescription: '', modelStyle: [], modelAvoid: [] };
   const single = (key: string): string | null => {
     const vals = doc.get(key);
     if (!vals || !vals.length) return null;
@@ -148,18 +153,16 @@ export function interpret(doc: JaiDocument, { catalog = [], families = {}, hasOr
     diagnostics.push(...m.diagnostics);
     if (needsImage && m.model && !(m.model.imageInput || m.model.image_input)) diagnostics.push(diag('mode-degraded', 'mode'));
   }
-  // Per-model refinements (spec §Per-model refinements): core values, then matching qualified values.
-  if (chosen) {
-    const names = [chosen.family, chosen.id, ...(chosen.aliases ?? [])].filter((x): x is string => !!x).map(asciiLower);
-    const qualified = [...doc.keys()].filter(k => k.includes('/')).sort(byCodePoint);
-    for (const base of QUALIFIABLE) {
-      const extra = qualified.filter(k => k.startsWith(base + '/') && names.includes(k.slice(base.length + 1))).flatMap(k => doc.get(k) ?? []);
-      if (!extra.length) continue;
-      if (base === 'prompt') { out.prompt = [...(out.prompt ?? []), ...extra]; out.description = out.prompt.join('\n'); }
-      else if (base === 'style') out.style = [...out.style, ...extra];
-      else out.avoid = [...out.avoid, ...extra];
-    }
-  }
+  // Per-model refinements (spec §Per-model refinements): the selected model receives the core values,
+  // then the values of matching qualified keys. The description (core) is what readers see.
+  const names = chosen ? [chosen.family, chosen.id, ...(chosen.aliases ?? [])].filter((x): x is string => !!x).map(asciiLower) : [];
+  const extraFor = (base: string): string[] => (chosen
+    ? [...doc.keys()].filter(k => k.startsWith(base + '/') && names.includes(asciiLower(k.slice(base.length + 1)))).sort(byCodePoint).flatMap(k => doc.get(k) ?? [])
+    : []);
+  out.modelPrompt = [...(out.prompt ?? []), ...extraFor('prompt')];
+  out.modelDescription = out.modelPrompt.join('\n');
+  out.modelStyle = [...out.style, ...extraFor('style')];
+  out.modelAvoid = [...out.avoid, ...extraFor('avoid')];
   return { interpreted: out, diagnostics };
 }
 

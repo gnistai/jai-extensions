@@ -2,6 +2,7 @@
 // through a ReplicateClient, so the extension can keep the token in its
 // background while the engine runs in a page.
 import type { ModelRef, ReplicateClient } from '../providers/replicate-client.ts';
+import { tokenCostUSD, worstCaseUSD } from '../providers/pricing.ts';
 import { cosine } from './metrics.ts';
 import { SYSTEM, describePrompt, judgePrompt, parseAnswer, refinePrompt, revisePrompt, toAdditions, toDrafts, toScores } from './prompts.ts';
 import type { Analyst, AnalystContext, AnalystReply, Draft, ImageRef, RenderView, Scorer } from './types.ts';
@@ -11,34 +12,37 @@ const textOf = (output: unknown): string => (Array.isArray(output) ? output.join
 /** Google Gemini 2.5 Flash: sees the target and several renders in one call. */
 export class GeminiAnalyst implements Analyst {
   readonly id = 'google/gemini-2.5-flash';
+  /** The worst case of one call, held before calling; the actual cost is charged from token counts. */
   readonly costHint: number;
+  private last = 0;
   constructor(private readonly client: ReplicateClient, private readonly opts: { costHint?: number; temperature?: number; thinkingBudget?: number } = {}) {
-    this.costHint = opts.costHint ?? 0.01;
+    this.costHint = opts.costHint ?? worstCaseUSD(this.id);
   }
   private async ask(prompt: string, images: ImageRef[], signal?: AbortSignal): Promise<Record<string, unknown>> {
     const p = await this.client.predict({ id: this.id }, {
       prompt, images: images.slice(0, 10).map(i => i.url), system_instruction: SYSTEM,
-      temperature: this.opts.temperature ?? 0.8, thinking_budget: this.opts.thinkingBudget ?? 1024, max_output_tokens: 8192,
+      temperature: this.opts.temperature ?? 0.8, thinking_budget: Math.min(1024, this.opts.thinkingBudget ?? 1024), max_output_tokens: 8192,
     }, { signal });
+    this.last = Math.min(this.costHint, tokenCostUSD(this.id, p.metrics) ?? this.costHint);
     return parseAnswer(textOf(p.output));
   }
   async describe(target: ImageRef, n: number, ctx: AnalystContext): Promise<AnalystReply<Draft[]>> {
     const a = await this.ask(describePrompt(n, ctx.models), [target], ctx.signal);
-    return { value: toDrafts(a.drafts).slice(0, n), notes: String(a.notes ?? ''), cost: this.costHint };
+    return { value: toDrafts(a.drafts).slice(0, n), notes: String(a.notes ?? ''), cost: this.last };
   }
   async revise(target: ImageRef, current: Draft, renders: RenderView[], n: number, ctx: AnalystContext): Promise<AnalystReply<Draft[]>> {
     const shown = renders.slice(0, 9);
     const a = await this.ask(revisePrompt(current, shown, n), [target, ...shown.map(r => r.image)], ctx.signal);
-    return { value: toDrafts(a.drafts).slice(0, n), notes: String(a.notes ?? ''), cost: this.costHint };
+    return { value: toDrafts(a.drafts).slice(0, n), notes: String(a.notes ?? ''), cost: this.last };
   }
   async refine(target: ImageRef, core: Draft, render: RenderView, n: number, ctx: AnalystContext): Promise<AnalystReply<string[]>> {
     const a = await this.ask(refinePrompt(core, render, n), [target, render.image], ctx.signal);
-    return { value: toAdditions(a.additions).slice(0, n), notes: String(a.notes ?? ''), cost: this.costHint };
+    return { value: toAdditions(a.additions).slice(0, n), notes: String(a.notes ?? ''), cost: this.last };
   }
   async judge(target: ImageRef, renders: RenderView[], ctx: AnalystContext): Promise<AnalystReply<number[]>> {
     if (renders.length > 9) throw new RangeError('judge at most 9 renders per call');
     const a = await this.ask(judgePrompt(renders), [target, ...renders.map(r => r.image)], ctx.signal);
-    return { value: toScores(a.scores, renders.length), notes: String(a.notes ?? ''), cost: this.costHint };
+    return { value: toScores(a.scores, renders.length), notes: String(a.notes ?? ''), cost: this.last };
   }
 }
 
@@ -54,13 +58,14 @@ export class ClaudeAnalyst implements Analyst {
   readonly judgeLimit = 5;
   /** Judging needs the images side by side, so it exists only with `composite`. */
   readonly judge?: (target: ImageRef, renders: RenderView[], ctx: AnalystContext) => Promise<AnalystReply<number[]>>;
+  private last = 0;
   constructor(private readonly client: ReplicateClient, private readonly opts: { costHint?: number; composite?: (images: ImageRef[]) => Promise<ImageRef> } = {}) {
-    this.costHint = opts.costHint ?? 0.04;
+    this.costHint = opts.costHint ?? worstCaseUSD(this.id);
     if (opts.composite) this.judge = async (target, renders, ctx) => {
       const shown = renders.slice(0, 5);
       if (shown.length !== renders.length) throw new RangeError('judge at most 5 renders per call with a composite');
       const a = await this.ask(judgePrompt(shown), [target, ...shown.map(r => r.image)], ctx.signal);
-      return { value: toScores(a.scores, shown.length), notes: String(a.notes ?? ''), cost: this.costHint };
+      return { value: toScores(a.scores, shown.length), notes: String(a.notes ?? ''), cost: this.last };
     };
   }
   private async ask(prompt: string, images: ImageRef[], signal?: AbortSignal): Promise<Record<string, unknown>> {
@@ -71,20 +76,21 @@ export class ClaudeAnalyst implements Analyst {
       note = '\n(The images are shown side by side in one picture, left to right: image 1, image 2, ...)';
     } else if (images.length > 1) note = '\n(Only image 1, the target, is attached; judge the renders from their similarity values.)';
     const p = await this.client.predict({ id: this.id }, { prompt: prompt + note, system_prompt: SYSTEM, max_tokens: 4096, ...(image ? { image: image.url } : {}) }, { signal });
+    this.last = Math.min(this.costHint, tokenCostUSD(this.id, p.metrics) ?? this.costHint);
     return parseAnswer(textOf(p.output));
   }
   async describe(target: ImageRef, n: number, ctx: AnalystContext): Promise<AnalystReply<Draft[]>> {
     const a = await this.ask(describePrompt(n, ctx.models), [target], ctx.signal);
-    return { value: toDrafts(a.drafts).slice(0, n), notes: String(a.notes ?? ''), cost: this.costHint };
+    return { value: toDrafts(a.drafts).slice(0, n), notes: String(a.notes ?? ''), cost: this.last };
   }
   async revise(target: ImageRef, current: Draft, renders: RenderView[], n: number, ctx: AnalystContext): Promise<AnalystReply<Draft[]>> {
     const shown = renders.slice(0, 3);
     const a = await this.ask(revisePrompt(current, shown, n), [target, ...shown.map(r => r.image)], ctx.signal);
-    return { value: toDrafts(a.drafts).slice(0, n), notes: String(a.notes ?? ''), cost: this.costHint };
+    return { value: toDrafts(a.drafts).slice(0, n), notes: String(a.notes ?? ''), cost: this.last };
   }
   async refine(target: ImageRef, core: Draft, render: RenderView, n: number, ctx: AnalystContext): Promise<AnalystReply<string[]>> {
     const a = await this.ask(refinePrompt(core, render, n), [target, render.image], ctx.signal);
-    return { value: toAdditions(a.additions).slice(0, n), notes: String(a.notes ?? ''), cost: this.costHint };
+    return { value: toAdditions(a.additions).slice(0, n), notes: String(a.notes ?? ''), cost: this.last };
   }
 }
 

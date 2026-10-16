@@ -6,7 +6,7 @@
 // The token comes from REPLICATE_API_TOKEN (or --env <file>); it is never
 // printed or written to reports. Run `npm run build` first.
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
-import { basename, extname, join, resolve } from 'node:path';
+import { basename, dirname, extname, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
 const HELP = `jai encode <image> [options]
@@ -22,6 +22,7 @@ const HELP = `jai encode <image> [options]
   --scores              record scores in jaitools.* vendor keys
   --out <file.jai>      output file (default <image>.jai)
   --report <dir>        report directory (default <out>.report)
+  --force               overwrite an existing output file
 jai render <file.jai | text> [--model <id>] [--out <image>]
 jai validate <file.jai | text>
 Common: --env <file>  read REPLICATE_API_TOKEN from a dotenv file`;
@@ -32,7 +33,7 @@ const { values: o, positionals } = parseArgs({
     models: { type: 'string' }, model: { type: 'string' }, budget: { type: 'string' }, population: { type: 'string' },
     generations: { type: 'string' }, 'judge-weight': { type: 'string' }, seeds: { type: 'string' }, analyst: { type: 'string' }, 'no-pixel': { type: 'boolean' },
     'no-refine': { type: 'boolean' }, scores: { type: 'boolean' }, out: { type: 'string' }, report: { type: 'string' },
-    env: { type: 'string' }, help: { type: 'boolean', short: 'h' },
+    env: { type: 'string' }, force: { type: 'boolean' }, help: { type: 'boolean', short: 'h' },
   },
 });
 const [cmd, input] = positionals;
@@ -68,6 +69,18 @@ function readDocument(arg) {
   return { document: r.document, diagnostics: r.diagnostics, info: r.info };
 }
 
+/** A number option: finite, within [lo, hi], an integer when asked; exits with code 2 otherwise. */
+function numberOption(name, fallback, lo, hi, integer = false) {
+  const raw = o[name];
+  if (raw === undefined) return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < lo || n > hi || (integer && !Number.isInteger(n))) {
+    console.error(`--${name} must be ${integer ? 'an integer' : 'a number'} from ${lo} to ${hi}`);
+    process.exit(2);
+  }
+  return n;
+}
+
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const usd = n => `$${n.toFixed(4)}`;
 const scoreLine = c => Object.entries(c.perModel).map(([m, s]) => `${m.split('/')[1]} ${s.toFixed(3)}`).join(', ');
@@ -88,7 +101,7 @@ if (cmd === 'render') {
   if (it.mode !== 'generate') { console.error(`mode=${it.mode} needs an input image; the CLI renders generate only.`); process.exit(2); }
   const model = E.REPLICATE_MODELS.find(m => m.id === it.matched);
   const renderer = new E.ReplicateRenderer(token(), { foldAvoid: true });
-  const res = await renderer.render({ intent: { description: it.description, style: it.style, avoid: it.avoid, aspect: it.aspect ? { width: it.aspect.width, height: it.aspect.height } : null, mode: 'generate', strength: null, seed: it.seed, animate: false }, modelId: model.id, inputImage: null, governingRatio: null, target: null });
+  const res = await renderer.render({ intent: { description: it.modelDescription, style: it.modelStyle, avoid: it.modelAvoid, aspect: it.aspect ? { width: it.aspect.width, height: it.aspect.height } : null, mode: 'generate', strength: null, seed: it.seed, animate: false }, modelId: model.id, inputImage: null, governingRatio: null, target: null });
   const out = o.out ?? `render-${Date.now()}.${res.mime.split('/')[1]}`;
   writeFileSync(out, res.bytes);
   console.log(`${model.label} -> ${out} (about ${usd(model.costHint)})`);
@@ -102,26 +115,37 @@ if (cmd !== 'encode') { console.log(HELP); process.exit(2); }
 // ---------------------------------------------------------------- encode
 const sharp = (await import('sharp')).default;
 const src = resolve(input);
-const meta = await sharp(src).rotate().metadata();
+// Refuse decompression bombs before decoding (spec: Untrusted input and bounds).
+const PIXELS = 64e6;
+const meta = await sharp(src, { limitInputPixels: PIXELS }).metadata().catch(e => { console.error(`Cannot read ${basename(src)}: ${e.message}`); process.exit(1); });
+if (!meta.width || !meta.height || meta.width * meta.height > PIXELS) { console.error(`${basename(src)} is larger than ${PIXELS / 1e6} megapixels.`); process.exit(1); }
 const oriented = (meta.orientation ?? 1) >= 5 ? { width: meta.height, height: meta.width } : { width: meta.width, height: meta.height };
 // Upload copy: at most 1024 px on the long side, JPEG, metadata stripped.
-const upload = await sharp(src).rotate().resize(1024, 1024, { fit: 'inside', withoutEnlargement: true }).jpeg({ quality: 85 }).toBuffer();
+const upload = await sharp(src, { limitInputPixels: PIXELS }).rotate().resize(1024, 1024, { fit: 'inside', withoutEnlargement: true }).jpeg({ quality: 85 }).toBuffer();
 const target = { url: `data:image/jpeg;base64,${upload.toString('base64')}`, width: oriented.width, height: oriented.height };
 const THUMB = 16;
 const thumb = async buf => { const { data, info } = await sharp(buf).rotate().removeAlpha().resize(THUMB, THUMB, { fit: 'cover' }).ensureAlpha().raw().toBuffer({ resolveWithObject: true }); return { width: info.width, height: info.height, data }; };
 
 const models = (o.models ?? 'flux-schnell').split(',').filter(Boolean).map(findModel);
-const budgetUSD = Number(o.budget ?? '0.5');
-if (!(budgetUSD > 0)) { console.error('--budget must be a positive number of USD'); process.exit(2); }
+const budgetUSD = numberOption('budget', 0.5, 0.01, 50);
+const population = numberOption('population', 4, 1, 9, true);
+const generations = numberOption('generations', 5, 1, 30, true);
+const judgeWeight = numberOption('judge-weight', 0.5, 0, 1);
+const seeds = (o.seeds ?? '1').split(',').map(x => {
+  const n = Number(x);
+  if (!Number.isSafeInteger(n) || n < 0 || n > 2 ** 32 - 1) { console.error('--seeds must be integers from 0 to 4294967295'); process.exit(2); }
+  return n;
+});
 const client = new E.HttpReplicateClient(token());
 const composite = async images => {
   const bufs = await Promise.all(images.map(async i => i.url.startsWith('data:') ? Buffer.from(i.url.split(',')[1], 'base64') : Buffer.from(await (await fetch(i.url)).arrayBuffer())));
-  const tiles = await Promise.all(bufs.map(b => sharp(b).resize(512, 512, { fit: 'contain', background: '#fff' }).toBuffer()));
+  const tiles = await Promise.all(bufs.map(b => sharp(b, { limitInputPixels: PIXELS }).resize(512, 512, { fit: 'contain', background: '#fff' }).toBuffer()));
   const img = await sharp({ create: { width: 512 * tiles.length, height: 512, channels: 3, background: '#fff' } }).composite(tiles.map((t, k) => ({ input: t, left: 512 * k, top: 0 }))).jpeg({ quality: 85 }).toBuffer();
   return { url: `data:image/jpeg;base64,${img.toString('base64')}` };
 };
 const analyst = o.analyst === 'claude' ? new E.ClaudeAnalyst(client, { composite }) : new E.GeminiAnalyst(client);
-const out = o.out ?? `${src.slice(0, -extname(src).length)}.jai`;
+const out = resolve(o.out ?? join(dirname(src), `${basename(src, extname(src))}.jai`));
+if (existsSync(out) && !o.force) { console.error(`${out} exists; pass --force to overwrite it.`); process.exit(2); }
 const reportDir = o.report ?? `${out}.report`;
 mkdirSync(join(reportDir, 'renders'), { recursive: true });
 writeFileSync(join(reportDir, 'target.jpg'), upload);
@@ -132,8 +156,8 @@ let n = 0;
 const result = await E.encode({
   target, models: models.map(m => m.id), renderer: new E.ReplicateRenderer(client, { foldAvoid: true }), analyst, scorer: new E.ClipScorer(client),
   ...(o['no-pixel'] ? {} : { thumbnail: r => thumb(Buffer.from(r.bytes)), targetThumbnail: await thumb(upload) }),
-  budgetUSD, judgeWeight: Number(o['judge-weight'] ?? 0.5), population: Number(o.population ?? 4), maxGenerations: Number(o.generations ?? 5),
-  seeds: (o.seeds ?? '1').split(',').map(Number).filter(Number.isFinite), refine: o['no-refine'] ? false : undefined,
+  budgetUSD, judgeWeight, population, maxGenerations: generations,
+  seeds, refine: o['no-refine'] ? false : undefined,
   onEvent: e => {
     if (e.type === 'phase') console.log(`\n== ${e.phase}`);
     if (e.type === 'candidate') {

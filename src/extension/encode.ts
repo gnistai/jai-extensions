@@ -6,7 +6,7 @@ import { ClaudeAnalyst, ClipScorer, GeminiAnalyst, encode, type Candidate, type 
 import type { ModelRef, PredictOptions, Prediction, ReplicateClient } from '../providers/replicate-client.ts';
 import { REPLICATE_MODELS, ReplicateRenderer } from '../renderers/replicate.ts';
 import { RenderError } from '../renderers/types.ts';
-import type { EncodePortReply } from './shared.ts';
+import { readCapped, type EncodePortReply } from './shared.ts';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string): T => document.getElementById(id) as T;
 const el = <K extends keyof HTMLElementTagNameMap>(tag: K, props: Partial<HTMLElementTagNameMap[K]> = {}, ...kids: Array<Node | string>): HTMLElementTagNameMap[K] => {
@@ -19,12 +19,15 @@ const usd = (n: number): string => `$${n.toFixed(3)}`;
 // ---------------------------------------------------------------- provider access through the background
 
 class PortClient implements ReplicateClient {
+  /** The background enforces this run's limit too; it is declared once when the port opens. */
+  constructor(private readonly budgetUSD: number) {}
   private port: chrome.runtime.Port | null = null;
   private next = 1;
   private waiting = new Map<number, { resolve: (p: Prediction) => void; reject: (e: Error) => void; onStatus?: (s: string) => void }>();
   private connect(): chrome.runtime.Port {
     if (this.port) return this.port;
     const port = chrome.runtime.connect({ name: 'encode' });
+    port.postMessage({ type: 'begin', budgetUSD: this.budgetUSD });
     port.onMessage.addListener((m: EncodePortReply) => {
       const w = this.waiting.get(m.id);
       if (!w) return;
@@ -70,16 +73,34 @@ function coverThumb(src: CanvasImageSource, w: number, h: number): Thumbnail {
 const blobToDataURL = (b: Blob): Promise<string> => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result)); r.onerror = () => rej(r.error); r.readAsDataURL(b); });
 
 interface Loaded { target: ImageRef & { width: number; height: number }; thumb: Thumbnail; name: string; previewURL: string }
+const MAX_BYTES = 40 * 1024 * 1024;
+const MAX_PIXELS = 40e6;
+
+/** Read the dimensions from the header before any full decode (decompression bombs). */
+function dimensionsOf(blob: Blob): Promise<{ width: number; height: number }> {
+  const url = URL.createObjectURL(blob);
+  return new Promise<{ width: number; height: number }>((resolve, reject) => {
+    const img = new Image();
+    img.decoding = 'async';
+    img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
+    img.onerror = () => reject(new Error('not an image this browser can read'));
+    img.src = url;
+  }).finally(() => URL.revokeObjectURL(url));
+}
+
 async function loadImage(blob: Blob, name: string): Promise<Loaded> {
-  if (blob.size > 40 * 1024 * 1024) throw new Error('That image is larger than 40 MB.');
-  const bmp = await createImageBitmap(blob, { imageOrientation: 'from-image' });
-  const { width, height } = bmp;
-  if (width * height > 64e6) throw new Error('That image has more than 64 megapixels.');
+  if (blob.size > MAX_BYTES) throw new Error('That image is larger than 40 MB.');
+  if (blob.type && !/^image\//.test(blob.type)) throw new Error('That file is not an image.');
+  const { width, height } = await dimensionsOf(blob);
+  if (!width || !height) throw new Error('That image has no size.');
+  if (width * height > MAX_PIXELS) throw new Error(`That image has more than ${MAX_PIXELS / 1e6} megapixels.`);
   const scale = Math.min(1, 1024 / Math.max(width, height));
-  const c = new OffscreenCanvas(Math.round(width * scale), Math.round(height * scale));
-  c.getContext('2d')!.drawImage(bmp, 0, 0, c.width, c.height);
+  // Decode straight to the upload size.
+  const bmp = await createImageBitmap(blob, { imageOrientation: 'from-image', resizeWidth: Math.max(1, Math.round(width * scale)), resizeHeight: Math.max(1, Math.round(height * scale)), resizeQuality: 'high' });
+  const c = new OffscreenCanvas(bmp.width, bmp.height);
+  c.getContext('2d')!.drawImage(bmp, 0, 0);
   const jpeg = await c.convertToBlob({ type: 'image/jpeg', quality: 0.85 });
-  const thumb = coverThumb(bmp, width, height);
+  const thumb = coverThumb(bmp, bmp.width, bmp.height);
   bmp.close();
   return { target: { url: await blobToDataURL(jpeg), width, height }, thumb, name, previewURL: URL.createObjectURL(jpeg) };
 }
@@ -109,15 +130,20 @@ for (const m of REPLICATE_MODELS) {
 const chosenModels = (): string[] => [...modelsBox.querySelectorAll<HTMLInputElement>('input:checked')].map(i => i.value);
 
 function refresh(): void {
-  $<HTMLButtonElement>('start').disabled = !!running || !loaded || !chosenModels().length || !$<HTMLInputElement>('consent').checked;
-  $<HTMLButtonElement>('cancel').disabled = !running;
+  const start = $<HTMLButtonElement>('start'), cancel = $<HTMLButtonElement>('cancel');
+  const hadFocus = document.activeElement === start || document.activeElement === cancel;
+  start.disabled = !!running || !loaded || !chosenModels().length || !$<HTMLInputElement>('consent').checked;
+  cancel.disabled = !running;
+  // Keep keyboard focus on whichever button is usable.
+  if (hadFocus && (document.activeElement as HTMLButtonElement | null)?.disabled) (running ? cancel : start).focus();
 }
 $('consent').addEventListener('change', refresh);
 
 function log(message: string): void {
-  const li = el('li', {}, message);
-  $('log').append(li);
-  li.scrollIntoView({ block: 'nearest' });
+  const box = $('log');
+  const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
+  box.append(el('li', {}, message));
+  if (atEnd) box.scrollTop = box.scrollHeight; // scroll the log only, never the page
 }
 
 async function useBlob(blob: Blob, name: string): Promise<void> {
@@ -138,23 +164,41 @@ const drop = $('drop');
 drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
 drop.addEventListener('dragleave', () => drop.classList.remove('over'));
 drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('over'); const f = e.dataTransfer?.files?.[0]; if (f) void useBlob(f, f.name); });
+document.addEventListener('paste', e => {
+  if (running) return;
+  const f = [...(e.clipboardData?.files ?? [])].find(x => x.type.startsWith('image/'));
+  if (f) { e.preventDefault(); void useBlob(f, f.name || 'pasted image'); }
+});
 
 // Right-click "Encode this image": the URL arrives in the fragment; loading it needs the user's click
 // (and, for http(s), permission for that one origin, asked for at that moment).
 const src = new URLSearchParams(location.hash.slice(1)).get('src');
-if (src && /^(https?|data):/i.test(src)) {
+// Drop the URL from the address bar and history (signed image URLs are secrets too).
+if (location.hash) history.replaceState(null, '', location.pathname);
+const fileName = (url: string): string => { try { return decodeURIComponent(new URL(url).pathname.split('/').pop() || 'image'); } catch { return 'image'; } };
+if (src && /^(https?:\/\/|data:image\/)/i.test(src)) {
   $('src-row').hidden = false;
   $('load-src').textContent = src.startsWith('data:') ? 'Load the image you right-clicked' : `Load the image from ${new URL(src).host}`;
   $('load-src').addEventListener('click', async () => {
+    let granted: string | null = null;
     try {
       if (!src.startsWith('data:')) {
         const origin = new URL(src).origin + '/*';
-        if (!(await chrome.permissions.request({ origins: [origin] }))) { $('dims').textContent = 'Permission to read that site was not granted. Save the image and drop it here instead.'; return; }
+        // Ask only for this one origin, and give the permission back afterwards unless the user already had it.
+        if (!(await chrome.permissions.contains({ origins: [origin] }))) {
+          if (!(await chrome.permissions.request({ origins: [origin] }))) { $('dims').textContent = 'Permission to read that site was not granted. Save the image and drop it here instead.'; return; }
+          granted = origin;
+        }
       }
       const res = await fetch(src, { credentials: 'omit', referrerPolicy: 'no-referrer' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      await useBlob(await res.blob(), src.startsWith('data:') ? 'image' : decodeURIComponent(new URL(src).pathname.split('/').pop() || 'image'));
+      const type = res.headers.get('content-type') ?? '';
+      if (!src.startsWith('data:') && !/^image\//i.test(type)) throw new Error('the server did not send an image');
+      const bytes = await readCapped(res, MAX_BYTES);
+      if (!bytes) throw new Error('larger than 40 MB');
+      await useBlob(new Blob([bytes as BlobPart], { type: type.split(';')[0] }), src.startsWith('data:') ? 'image' : fileName(src));
     } catch (e) { $('dims').textContent = `Could not load that image: ${(e as Error).message}`; }
+    finally { if (granted) void chrome.permissions.remove({ origins: [granted] }); }
   });
 }
 
@@ -167,7 +211,7 @@ function candidateCard(c: Candidate): HTMLElement {
     if (r.result) {
       const url = URL.createObjectURL(new Blob([r.result.bytes as BlobPart], { type: r.result.mime }));
       objectURLs.push(url);
-      img = el('img', { src: url, alt: `Render by ${r.model}` });
+      img = el('img', { src: url, alt: `AI render of candidate ${c.id} by ${REPLICATE_MODELS.find(m => m.id === r.model)?.label ?? r.model}` });
     } else img = el('div', { className: 'err' }, 'failed');
     const label = REPLICATE_MODELS.find(m => m.id === r.model)?.label ?? r.model;
     return el('figure', {}, img, el('figcaption', {}, `${label} ${r.score.toFixed(3)}${r.judge !== null ? ` · rated ${Math.round(r.judge * 100)}` : ''}`));
@@ -180,7 +224,7 @@ function candidateCard(c: Candidate): HTMLElement {
 
 let currentGen: HTMLElement | null = null;
 function onEvent(e: EncodeEvent): void {
-  if (e.type === 'phase') { log({ describe: 'Describing the image…', evolve: 'Rendering and revising…', refine: 'Trying per-model refinements…', done: 'Done.' }[e.phase]); currentGen = null; }
+  if (e.type === 'phase') { log({ describe: 'Describing the image…', evolve: 'Rendering and revising…', refine: 'Trying per-model refinements…', done: 'Done.' }[e.phase]); currentGen = null; log(`${$('spend').textContent || 'Nothing spent yet.'}`); }
   if (e.type === 'log') log(e.message);
   if (e.type === 'spend') $('spend').textContent = `Estimated spend ${usd(e.spent)} of ${usd(e.limit)}`;
   if (e.type === 'candidate') {
@@ -204,7 +248,7 @@ $('start').addEventListener('click', async () => {
   objectURLs = [];
   $('log').textContent = ''; $('gens').textContent = ''; $('result-card').hidden = true; $('progress-card').hidden = false;
   const budget = Math.min(5, Math.max(0.05, Number($<HTMLInputElement>('budget').value) || 0.5));
-  const client = new PortClient();
+  const client = new PortClient(budget);
   const analyst = $<HTMLSelectElement>('analyst').value === 'claude' ? new ClaudeAnalyst(client, { composite }) : new GeminiAnalyst(client);
   running = new AbortController();
   refresh();
@@ -225,8 +269,10 @@ $('start').addEventListener('click', async () => {
     const reasons: Record<string, string> = { budget: 'the spending limit was reached', plateau: 'scores stopped improving', generations: 'all generations ran', time: 'the time limit was reached', canceled: 'you canceled', error: 'of an error', complete: 'it finished' };
     $('result-note').textContent = `Stopped because ${reasons[r.stopReason]}${r.error ? ` (${r.error})` : ''}. Estimated spend ${usd(r.spent)} in ${Math.round(r.seconds)} s.`;
     $('result-card').hidden = false;
+    $('result-heading').focus();
   } catch (e) {
     log(`Encoding failed: ${(e as Error).message}`);
+    $('dims').textContent = `Encoding failed: ${(e as Error).message}`;
   } finally {
     running = null;
     refresh();

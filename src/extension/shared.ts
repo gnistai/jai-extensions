@@ -70,6 +70,8 @@ export interface StateReply {
   models: ModelChoice[];
   defaultModel: string;
   usage: { today: number; maxPerDay: number; maxPerPage: number };
+  /** Elements smaller than this (CSS px, either side) are never rendered automatically. */
+  minDisplayedPx: number;
 }
 
 /** Port message (content -> background) to render one document. */
@@ -99,11 +101,33 @@ export const b64encode = (bytes: Uint8Array): string => {
 export const b64decode = (s: string): Uint8Array => Uint8Array.from(atob(s), c => c.charCodeAt(0));
 export const today = (): string => new Date().toISOString().slice(0, 10);
 
+export /** Read a response body, giving up (null) past `max` bytes without buffering the rest. */
+async function readCapped(res: Response, max: number): Promise<Uint8Array | null> {
+  const declared = Number(res.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > max) { void res.body?.cancel(); return null; }
+  if (!res.body) return new Uint8Array(0);
+  const reader = res.body.getReader();
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > max) { void reader.cancel(); return null; }
+    parts.push(value);
+  }
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const p of parts) { out.set(p, at); at += p.length; }
+  return out;
+}
+
 // ---------------------------------------------------------------- encoder port
 // The encode page runs the encoder engine; the background, which alone holds
 // the token, runs each Replicate prediction for it, for allow-listed models only.
 export interface EncodeModelRef { id: string; version?: string }
 export type EncodePortRequest =
+  | { type: 'begin'; budgetUSD: number }
   | { type: 'predict'; id: number; model: EncodeModelRef; input: Record<string, unknown> }
   | { type: 'cancel'; id: number };
 export type EncodePortReply =

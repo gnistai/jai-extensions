@@ -66,16 +66,17 @@ section [Encoding images](https://jai.gnist.ai/spec/#image-encoding):
 4. The vision model lists the differences between the best renders and the
    original and writes revised descriptions. This repeats for a number of
    generations or until scores stop improving.
-5. For models that still lag, it tries short `prompt/<target>` refinements and
+5. For models that still lag, it tries short `prompt/<family>` refinements and
    keeps one only if it raises that model's score. It skips models whose
-   prompt window the core already fills.
+   prompt window the core already fills, and models that share a family with
+   another target model.
 6. It stops at the spending limit, which it enforces from price estimates
    before every call. The result is the best document plus a report.
 
 From the command line (reads `REPLICATE_API_TOKEN`):
 
 ```sh
-npm install && npm run build
+npm install && npm run build   # Node 20.9 or later
 node bin/jai.mjs encode photo.jpg --models flux-schnell,sdxl --budget 0.50
 # writes photo.jai and photo.jai.report/ (report.json and an HTML contact sheet)
 node bin/jai.mjs render photo.jai --model sdxl --out check.webp
@@ -85,7 +86,10 @@ node bin/jai.mjs validate "jai:A castle;prompt/flux=at dusk"
 In the extension, open **Encode** from the popup or right-click an image and
 choose **Encode this image as JAI**. The page runs the same engine. Every
 provider call goes through the background worker, which holds the token and
-accepts only the encoder's allow-listed models from the encode page itself.
+accepts calls only from the encode page itself. It rebuilds each input from an
+allow-list of fields per model and accepts images only as re-encoded `data:`
+images or Replicate output URLs. It also enforces the run's spending limit,
+fixed when the run starts, and caps concurrent calls.
 
 A typical run for two models, four candidates and six generations costs
 roughly $0.20 to $0.40 and takes five to eight minutes. See the

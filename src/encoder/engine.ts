@@ -11,18 +11,18 @@ import type { Candidate, Draft, EncodeOptions, EncodeResult, Generation, RenderV
 const SEGMENT = /^[a-z0-9][a-z0-9_-]*$/;
 
 /**
- * The qualifier target for each model (spec output convention): its family
- * when no other target model shares it, else an alias that names it alone.
- * Models with neither get no entry and are not refined.
+ * The qualifier target for each model (spec output conventions): its family
+ * name, which is the only name other readers share. Models whose family is
+ * shared with another target model, or that have no family, are not refined.
  */
 export function refinementTargets(models: ModelInfo[]): Record<string, string> {
   const out: Record<string, string> = {};
   const lower = (s: string): string => s.replace(/[A-Z]/g, c => c.toLowerCase());
-  const namesOf = (m: ModelInfo): string[] => [m.family, m.id, ...m.aliases].filter(Boolean).map(lower);
   for (const m of models) {
-    const options = [m.family, ...m.aliases].filter(Boolean).map(lower).filter(t => SEGMENT.test(t));
-    const unique = options.find(t => models.every(o => o === m || !namesOf(o).includes(t)));
-    if (unique) out[m.id] = unique;
+    const fam = m.family ? lower(m.family) : '';
+    if (!SEGMENT.test(fam)) continue;
+    if (models.some(o => o !== m && o.family && lower(o.family) === fam)) continue;
+    out[m.id] = fam;
   }
   return out;
 }
@@ -72,23 +72,27 @@ export function fitnessOf(perModel: Record<string, number>): number {
 /** Words a short-window (CLIP-class, 77-token) model reliably reads. */
 const SHORT_WINDOW_WORDS = 55;
 
+/** A finite number, else the default (options may come from untrusted forms or flags). */
+const fin = (v: number | undefined, d: number): number => (typeof v === 'number' && Number.isFinite(v) ? v : d);
+
 class Stop extends Error { constructor(readonly reason: StopReason, message: string = reason) { super(message); } }
 
 export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
   const t0 = Date.now();
   const emit = opts.onEvent ?? ((): void => {});
-  const population = Math.max(1, Math.floor(opts.population ?? 4));
-  const maxGenerations = Math.max(1, Math.floor(opts.maxGenerations ?? 5));
-  const plateau = Math.max(1, Math.floor(opts.plateau ?? 2));
-  const minGain = opts.minGain ?? 0.005;
-  const seeds = opts.seeds?.length ? opts.seeds : [1];
+  const population = Math.max(1, Math.floor(fin(opts.population, 4)));
+  const maxGenerations = Math.max(1, Math.floor(fin(opts.maxGenerations, 5)));
+  const plateau = Math.max(1, Math.floor(fin(opts.plateau, 2)));
+  const minGain = fin(opts.minGain, 0.005);
+  const validSeeds = (opts.seeds ?? []).filter(x => Number.isSafeInteger(x) && x >= 0);
+  const seeds = validSeeds.length ? validSeeds : [1];
   const refine = opts.refine ?? opts.models.length > 1;
-  const refineShare = refine ? Math.min(0.9, Math.max(0, opts.refineShare ?? 0.25)) : 0;
-  const refineTries = Math.max(1, Math.floor(opts.refineTries ?? 2));
-  const pixelWeight = opts.thumbnail && opts.targetThumbnail ? Math.min(1, Math.max(0, opts.pixelWeight ?? 0.25)) : 0;
-  const judgeWeight = opts.analyst.judge ? Math.min(1, Math.max(0, opts.judgeWeight ?? 0.5)) : 0;
+  const refineShare = refine ? Math.min(0.9, Math.max(0, fin(opts.refineShare, 0.25))) : 0;
+  const refineTries = Math.max(1, Math.floor(fin(opts.refineTries, 2)));
+  const pixelWeight = opts.thumbnail && opts.targetThumbnail ? Math.min(1, Math.max(0, fin(opts.pixelWeight, 0.25))) : 0;
+  const judgeWeight = opts.analyst.judge ? Math.min(1, Math.max(0, fin(opts.judgeWeight, 0.5))) : 0;
   const judgeLimit = Math.max(2, opts.analyst.judgeLimit ?? 9);
-  const limit = pool(Math.max(1, opts.concurrency ?? 4));
+  const limit = pool(Math.max(1, Math.floor(fin(opts.concurrency, 4))));
   const budget = new Budget(opts.budgetUSD);
   const ceilingA = opts.budgetUSD * (1 - refineShare);
 
@@ -137,11 +141,15 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
     checkpoint();
     const hold = budget.hold(evalCost(models), ceiling);
     const doc = buildDocument(c.draft, c.refinements, targets, opts.models, aspect);
+    let broken = false;
     try {
-      const renders = await Promise.all(models.flatMap(model => seeds.map(seed => limit(async (): Promise<ScoredRender> => {
+      const tasks = models.flatMap(model => seeds.map(seed => limit(async (): Promise<ScoredRender> => {
+        // Never start more provider work once the run is canceled or this batch has failed.
+        if (opts.signal?.aborted) throw new Stop('canceled');
+        if (broken) throw new Stop('error', 'An earlier render in this batch failed unexpectedly.');
         const it = interpret(doc, { catalog, selected: model }).interpreted;
         const intent: RenderIntent = {
-          description: it.description, style: it.style, avoid: it.avoid,
+          description: it.modelDescription, style: it.modelStyle, avoid: it.modelAvoid,
           aspect: it.aspect ? { width: it.aspect.width, height: it.aspect.height } : null,
           mode: 'generate', strength: null, seed: String(seed), animate: false,
         };
@@ -150,12 +158,21 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
         try {
           result = await opts.renderer.render({ intent, modelId: model, inputImage: null, governingRatio: null, target: null, signal: opts.signal });
         } catch (e) {
+          // The job may have run even if it failed or was canceled: charge it either way.
+          hold.charge('render', `${c.id} ${model} (${opts.signal?.aborted ? 'canceled' : 'failed'})`, m.costHint);
           if (opts.signal?.aborted) throw new Stop('canceled');
-          hold.charge('render', `${c.id} ${model} (failed)`, m.costHint);
           return { model, seed, result: null, error: (e as Error).message, semantic: 0, pixel: null, judge: null, metric: 0, score: 0 };
         }
         hold.charge('render', `${c.id} ${model}`, m.costHint);
-        const semantic = await opts.scorer.score(imageOf(result), opts.signal);
+        let semantic: number;
+        try {
+          semantic = await opts.scorer.score(imageOf(result), opts.signal);
+          if (!Number.isFinite(semantic)) throw new Error('The scorer returned no number');
+        } catch (e) {
+          hold.charge('scorer', `${c.id} ${model} (failed)`, opts.scorer.costHint);
+          if (opts.signal?.aborted) throw new Stop('canceled');
+          return { model, seed, result, error: `Scoring failed: ${(e as Error).message}`, semantic: 0, pixel: null, judge: null, metric: 0, score: 0 };
+        }
         hold.charge('scorer', `${c.id} ${model}`, opts.scorer.costHint);
         let pixel: number | null = null;
         if (pixelWeight > 0 && opts.thumbnail && opts.targetThumbnail) {
@@ -163,7 +180,12 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
         }
         const metric = pixel === null ? semantic : (1 - pixelWeight) * semantic + pixelWeight * pixel;
         return { model, seed, result, error: null, semantic, pixel, judge: null, metric, score: metric };
-      }))));
+      }).catch(e => { broken = true; throw e; })));
+      // Wait for every task, so that nothing keeps running or goes uncharged after a failure.
+      const settled = await Promise.allSettled(tasks);
+      const failed = settled.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+      if (failed) throw failed.reason;
+      const renders = settled.map(r => (r as PromiseFulfilledResult<ScoredRender>).value);
       const cand: Candidate = { ...c, renders, perModel: {}, fitness: 0 };
       tally(cand);
       candidates.push(cand);
@@ -192,7 +214,7 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
     if (judgeWeight === 0 || !opts.analyst.judge) return '';
     const notes: string[] = [];
     for (const model of models) {
-      const entries = set.map(c => ({ c, r: c.renders.find(r => r.model === model && r.seed === seeds[0] && r.result) })).filter(e => e.r);
+      const entries = set.map(c => ({ c, r: c.renders.find(r => r.model === model && r.seed === seeds[0] && r.result && !r.error) })).filter(e => e.r);
       if (entries.length < 2) continue;
       const [anchor, ...rest] = entries;
       for (let i = 0; i < rest.length; i += judgeLimit - 1) {
@@ -208,7 +230,7 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
           emit({ type: 'log', message: `Judging ${labels[model]} failed (${(e as Error).message}); using the metric alone for these renders.` });
         }
         chunk.forEach((e, k) => {
-          for (const r of e.c.renders.filter(x => x.model === model && x.result)) {
+          for (const r of e.c.renders.filter(x => x.model === model && x.result && !x.error)) {
             r.judge = ratings ? ratings[k]! : null;
             r.score = r.judge === null ? r.metric : (1 - judgeWeight) * r.metric + judgeWeight * r.judge;
           }
@@ -232,7 +254,7 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
   }
 
   const views = (c: Candidate, models = opts.models): RenderView[] => c.renders
-    .filter(r => r.result && r.seed === seeds[0] && models.includes(r.model))
+    .filter(r => r.result && !r.error && r.seed === seeds[0] && models.includes(r.model))
     .map(r => ({ model: r.model, label: labels[r.model] ?? r.model, image: imageOf(r.result!), score: r.score }));
 
   try {
@@ -279,7 +301,8 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
       const order = [...opts.models].sort((a, b) => best!.perModel[a]! - best!.perModel[b]!);
       const leader = order[order.length - 1];
       for (const model of order) {
-        if (model === leader || !targets[model]) continue;
+        if (model === leader) continue;
+        if (!targets[model]) { emit({ type: 'log', message: `Not refining ${labels[model]}: another target model shares its family, so a refinement would reach both.` }); continue; }
         const info = all.find(m => m.id === model)!;
         const words = (best.draft.style.join(' ') + ' ' + best.draft.prompt).split(/\s+/).filter(Boolean).length;
         if (info.shortWindow && words >= SHORT_WINDOW_WORDS) {

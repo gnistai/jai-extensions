@@ -53,15 +53,19 @@ export class HttpReplicateClient implements ReplicateClient {
   async predict(model: ModelRef, input: Record<string, unknown>, opts: PredictOptions = {}): Promise<Prediction> {
     const path = model.version ? '/predictions' : `/models/${model.id}/predictions`;
     const payload = model.version ? { version: model.version, input } : { input };
+    if (opts.signal?.aborted) throw new RenderError('Canceled', 'canceled');
     opts.onStatus?.('starting');
-    let p = await this.api<Prediction>(path, { method: 'POST', body: JSON.stringify(payload), headers: { Prefer: 'wait=5' } }, opts.signal);
+    // The create request is never aborted mid-flight: aborting it would leave a
+    // prediction running whose id we never learn. Cancel by id once it is known.
+    let p = await this.api<Prediction>(path, { method: 'POST', body: JSON.stringify(payload), headers: { Prefer: 'wait=5' } });
+    if (opts.signal?.aborted) { if (!['succeeded', 'failed', 'canceled'].includes(p.status)) void this.cancel(p.id); throw new RenderError('Canceled', 'canceled', p.id); }
     const started = Date.now();
     const timeout = opts.timeoutMs ?? this.opts.timeoutMs ?? 180_000;
     const onAbort = (): void => { void this.cancel(p.id); };
     opts.signal?.addEventListener('abort', onAbort, { once: true });
     try {
       while (!['succeeded', 'failed', 'canceled'].includes(p.status)) {
-        if (opts.signal?.aborted) throw new RenderError('Canceled', 'canceled', p.id);
+        if (opts.signal?.aborted) { void this.cancel(p.id); throw new RenderError('Canceled', 'canceled', p.id); }
         if (Date.now() - started > timeout) { void this.cancel(p.id); throw new RenderError('Timed out', 'timeout', p.id); }
         opts.onStatus?.(p.status);
         await new Promise(r => setTimeout(r, this.opts.pollMs ?? 1500));

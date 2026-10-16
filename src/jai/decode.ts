@@ -116,7 +116,7 @@ export function encodeURLBody(text: string): string {
   return cps.map((ch, i) => {
     const c = ch.codePointAt(0) ?? 0;
     const last = i === cps.length - 1;
-    return c < 0x21 || c === 0x7f || c === 0x25 || c === 0x23 || c === 0x22 || c === 0x27 || c === 0x3c || c === 0x3e || (last && c === 0x2c) || (i === 0 && c === 0x2f)
+    return c < 0x21 || c === 0x7f || c === 0x25 || c === 0x23 || c === 0x22 || c === 0x26 || c === 0x27 || c === 0x3c || c === 0x3e || (last && c === 0x2c) || (i === 0 && c === 0x2f)
       ? '%' + c.toString(16).toUpperCase().padStart(2, '0')
       : ch;
   }).join('');

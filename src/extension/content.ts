@@ -49,7 +49,8 @@ function init(): void {
     .badge[data-status="failed"] { background: #b91c1c; }
     .badge:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
     .panel { position: fixed; right: 16px; top: 16px; width: min(420px, calc(100vw - 32px)); max-height: calc(100vh - 32px); overflow: auto; background: #fffdf9; color: #1d1b18; border: 1px solid #e3ddd2; border-radius: 14px; box-shadow: 0 12px 40px rgba(0,0,0,.25); padding: 14px 16px; font-size: 13px; line-height: 1.45; }
-    @media (prefers-color-scheme: dark) { .panel { background: #1c1a16; color: #ece7de; border-color: #2f2b25; } .muted { color: #a69f93 !important; } pre, .vals span { background: #14120f !important; border-color: #2f2b25 !important; } }
+    @media (prefers-color-scheme: dark) { .panel { background: #1c1a16; color: #ece7de; border-color: #2f2b25; } .muted, h3 { color: #a69f93 !important; } pre, .vals span { background: #14120f !important; border-color: #2f2b25 !important; } a, button.act.secondary { color: #fb923c !important; border-color: #fb923c !important; } button.act:not(.secondary) { background: #fb923c !important; border-color: #fb923c !important; color: #1d1b18 !important; } .notice { background: #2a1a10 !important; color: #fdba74 !important; } }
+    .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
     h2 { font-size: 15px; margin: 0 0 8px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
     h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #5f5a52; margin: 12px 0 4px; }
     pre { background: #f4f1ea; border: 1px solid #e3ddd2; border-radius: 8px; padding: 8px; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; font: 12px/1.45 ui-monospace, monospace; unicode-bidi: plaintext; }
@@ -71,6 +72,28 @@ function init(): void {
   shadow.adoptedStyleSheets = [sheet];
   const layer = document.createElement('div');
   shadow.append(layer);
+  // One live region that survives panel rebuilds, so status changes are always announced.
+  const announcer = document.createElement('div');
+  announcer.className = 'sr';
+  announcer.setAttribute('role', 'status');
+  shadow.append(announcer);
+  const announce = (t: string): void => { announcer.textContent = t; };
+
+  /**
+   * Clickjacking guard (spec: Viewer UI hygiene): a consent or paid action counts
+   * only if its button has been on screen for a moment and is actually visible,
+   * not covered by page content (IntersectionObserver v2 where available).
+   */
+  function arm(btn: HTMLElement): () => boolean {
+    const shownAt = performance.now();
+    let visible = false;
+    try {
+      const o = new IntersectionObserver(es => { for (const e of es) visible = (e as IntersectionObserverEntry & { isVisible?: boolean }).isVisible ?? e.isIntersecting; },
+        { threshold: [1], trackVisibility: true, delay: 100 } as IntersectionObserverInit);
+      o.observe(btn);
+    } catch { visible = true; }
+    return () => visible && performance.now() - shownAt > 400;
+  }
   ours.add(host);
   document.documentElement.append(host);
 
@@ -141,8 +164,9 @@ function init(): void {
 
   // ------------------------------------------------------------ panel
   let panel: HTMLElement | null = null;
-  async function openPanel(item: Item): Promise<void> {
+  async function openPanel(item: Item, refocus = false): Promise<void> {
     state = await send<StateReply>({ type: 'state', origin });
+    const focusedRole = refocus ? (shadow.activeElement as HTMLElement | null)?.dataset.role ?? null : null;
     panel?.remove();
     const p = el('div', { className: 'panel' });
     p.setAttribute('role', 'dialog'); p.setAttribute('aria-label', 'JAI image');
@@ -202,14 +226,25 @@ function init(): void {
           'Rendering sends this description', it.mode === 'transform' ? ' and the image shown here' : '', ` to Replicate under your account. It costs money (about $${enabled[0]?.costHint ?? 0.003} per image) and Replicate's terms apply. `,
           el('br'));
         const ok = el('button', { className: 'act', type: 'button', textContent: `Allow on ${origin}` });
-        ok.addEventListener('click', async e => { if (!e.isTrusted) return; await send({ type: 'acceptDisclosure', origin }); void openPanel(item); });
+        const okArmed = arm(ok);
+        ok.addEventListener('click', async e => {
+          if (!e.isTrusted) return;
+          if (!okArmed()) { announce('Click again: the button was not fully visible.'); return; }
+          await send({ type: 'acceptDisclosure', origin }); void openPanel(item);
+        });
         notice.append(ok);
         p.append(notice);
         renderBtn.disabled = true;
       }
-      renderBtn.addEventListener('click', e => { if (e.isTrusted) void render(item, sel.value || null, false, status); });
+      const renderArmed = arm(renderBtn);
+      renderBtn.dataset.role = 'render'; cancelBtn.dataset.role = 'cancel'; toggleBtn.dataset.role = 'toggle';
+      renderBtn.addEventListener('click', e => {
+        if (!e.isTrusted) return;
+        if (!renderArmed()) { status.textContent = 'Click again: the button was not fully visible.'; return; }
+        void render(item, sel.value || null, false, status);
+      });
       cancelBtn.addEventListener('click', () => item.port?.postMessage({ type: 'cancel' }));
-      toggleBtn.addEventListener('click', () => { if (item.status === 'rendered') restore(item, true); else if (item.render) void apply(item, item.render); void openPanel(item); });
+      toggleBtn.addEventListener('click', () => { if (item.status === 'rendered') restore(item, true); else if (item.render) void apply(item, item.render); void openPanel(item, true); });
       if (item.render) {
         p.append(el('h3', {}, 'Sent to the model'), el('pre', {}, `${item.render.modelLabel}${item.render.cached ? ' (cached)' : ` · ${item.render.seconds}s`}\n\n${item.render.sentPrompt}${item.render.sentNegative ? `\n\nNegative prompt: ${item.render.sentNegative}` : ''}`));
         if (item.render.diagnostics.length) {
@@ -220,7 +255,8 @@ function init(): void {
       }
     }
     layer.append(p);
-    close.focus();
+    const again = focusedRole ? p.querySelector<HTMLElement>(`[data-role="${focusedRole}"]`) : null;
+    (again && !(again as HTMLButtonElement).disabled ? again : close).focus();
   }
 
   function statusText(item: Item): string {
@@ -261,25 +297,26 @@ function init(): void {
     item.img.setAttribute('aria-busy', 'true');
     const port = chrome.runtime.connect({ name: 'render' });
     item.port = port;
-    const setStatus = (t: string): void => { if (statusEl) statusEl.textContent = t; };
+    const setStatus = (t: string): void => { if (statusEl) statusEl.textContent = t; announce(t); };
     setStatus('Rendering…');
     port.onMessage.addListener((m: RenderPortReply) => {
       if (m.type === 'status') setStatus(`Rendering… (${m.status})`);
-      else if (m.type === 'done') { item.render = m; void apply(item, m).then(() => { if (panel?.isConnected && statusEl) void openPanel(item); }); port.disconnect(); }
+      else if (m.type === 'done') { item.render = m; void apply(item, m).then(() => { announce(statusText(item)); if (panel?.isConnected && statusEl) void openPanel(item, true); }); port.disconnect(); }
       else { item.status = 'failed'; item.error = m.message; restore(item, false); setStatus(m.message); placeBadge(item); port.disconnect(); }
     });
     port.onDisconnect.addListener(() => { item.port = undefined; if (item.status === 'rendering') { item.status = 'failed'; restore(item, false); placeBadge(item); } });
     port.postMessage(req);
   }
 
-  /** Spec §Size and aspect: the original's ratio, else an author-sized box (width+height or CSS aspect-ratio). */
+  /** Spec §Size and aspect: an author-sized box (width+height or CSS aspect-ratio) first, else the original's ratio. */
   function governingRatio(img: HTMLImageElement, hasOriginal: boolean): number | null {
-    if (hasOriginal) return img.naturalWidth / img.naturalHeight;
     const w = Number(img.getAttribute('width')), h = Number(img.getAttribute('height'));
     if (w > 0 && h > 0) return w / h;
     const ar = getComputedStyle(img).aspectRatio; // "16 / 9", "auto 4 / 3", "1.5" or "auto"
-    const m = /([0-9.]+)\s*(?:\/\s*([0-9.]+))?\s*$/.exec(ar);
-    if (m && ar.trim() !== 'auto') { const a = Number(m[1]), b = m[2] ? Number(m[2]) : 1; if (a > 0 && b > 0) return a / b; }
+    // "auto w / h" comes from the image's own size, not from the author; only an explicit ratio counts.
+    const m = /^\s*([0-9.]+)\s*(?:\/\s*([0-9.]+))?\s*$/.exec(ar);
+    if (m) { const a = Number(m[1]), b = m[2] ? Number(m[2]) : 1; if (a > 0 && b > 0) return a / b; }
+    if (hasOriginal && img.naturalWidth && img.naturalHeight) return img.naturalWidth / img.naturalHeight;
     return null;
   }
 
@@ -378,19 +415,26 @@ function init(): void {
 
   // ------------------------------------------------------------ automatic mode (per-site opt-in, budgets in background)
   let autoOn = false;
+  // Spec (Consent, budgets and cancellation): elements not displayed to the user MUST NOT be rendered.
+  // So: inside the viewport (no margin), visible and not covered (IntersectionObserver v2 where available),
+  // not transparent or hidden, and at least the configured size.
   const io = new IntersectionObserver(entries => {
     for (const e of entries) {
-      if (!e.isIntersecting) continue;
-      const item = items.get(e.target as HTMLImageElement);
+      const v = (e as IntersectionObserverEntry & { isVisible?: boolean }).isVisible;
+      if (!e.isIntersecting || v === false) continue;
+      const img = e.target as HTMLImageElement;
+      const item = items.get(img);
       if (!item || !item.doc || item.status !== 'found' || item.render) continue;
       const it = interpret(item.doc).interpreted;
       if (it.mode === 'keep' || item.disc.carrier === 4) continue; // never automatic for keep or the alt carrier
-      const r = e.boundingClientRect;
-      if (r.width < 48 || r.height < 48) continue;
-      io.unobserve(e.target);
+      const min = state?.minDisplayedPx ?? 48;
+      const r = e.intersectionRect;
+      if (r.width < min || r.height < min) continue;
+      if (typeof img.checkVisibility === 'function' && !img.checkVisibility({ opacityProperty: true, visibilityProperty: true } as CheckVisibilityOptions)) continue;
+      io.unobserve(img);
       void render(item, null, true);
     }
-  }, { rootMargin: '200px' });
+  }, { rootMargin: '0px', threshold: [0.5], trackVisibility: true, delay: 100 } as IntersectionObserverInit);
   function maybeAuto(item: Item): void { if (autoOn) io.observe(item.img); }
 
   // ------------------------------------------------------------ mutations: new images, external src changes
