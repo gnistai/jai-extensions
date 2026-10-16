@@ -175,7 +175,7 @@ function init(): void {
     close.setAttribute('aria-label', 'Close');
     close.addEventListener('click', () => { p.remove(); item.badge?.focus(); });
     p.addEventListener('keydown', e => { if (e.key === 'Escape') { p.remove(); item.badge?.focus(); } });
-    const carriers = { 1: '<picture><source type="image/jai">', 2: 'data-jai', 3: 'data:image/jai in src', 4: 'jai: in alt (deprecated)' };
+    const carriers: Record<number, string> = { 1: '<picture><source type="image/jai">', 2: 'data-jai', 3: 'data:image/jai in src' };
     p.append(el('h2', {}, el('span', {}, 'JAI image'), close));
     p.append(el('div', { className: 'muted' }, `Found via ${carriers[item.disc.carrier]} on ${origin}`));
     if (item.error) p.append(el('div', { className: 'notice' }, item.error));
@@ -386,8 +386,9 @@ function init(): void {
   /** Accessible name and the AI-rendered state (spec §Accessibility). */
   function describe(target: Element, item: Item): void {
     const saved = item.saved;
-    const altWasJai = item.disc.carrier === 4 || saved?.alt === null;
-    const name = altWasJai ? (item.doc?.get('prompt')?.[0] ?? 'Image').replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 250) : saved?.alt ?? '';
+    const noAlt = saved?.alt === null;
+    // Spec §Accessibility: no alt → the description, in full (no length limit), control characters removed.
+    const name = noAlt ? ((item.doc?.get('prompt') ?? []).join('\n') || 'Image').replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, ' ') : saved?.alt ?? '';
     target.setAttribute(target === item.img ? 'alt' : 'aria-label', name);
     target.setAttribute('aria-description', 'Rendered by an AI model from its description; it may differ from the publisher’s image. The original is available from the JAI control.');
   }
@@ -426,7 +427,7 @@ function init(): void {
       const item = items.get(img);
       if (!item || !item.doc || item.status !== 'found' || item.render) continue;
       const it = interpret(item.doc).interpreted;
-      if (it.mode === 'keep' || item.disc.carrier === 4) continue; // never automatic for keep or the alt carrier
+      if (it.mode === 'keep') continue; // never automatic for keep
       const min = state?.minDisplayedPx ?? 48;
       const r = e.intersectionRect;
       if (r.width < min || r.height < min) continue;

@@ -95,11 +95,8 @@ export function validateDelivery({ decoded, carrier, element, viaDataURL = false
   const d: Diagnostic[] = [];
   if (decoded && !viaDataURL && (decoded.form === 'json' || decoded.form === 'text')) d.push(diag('non-canonical-encoding'));
   const doc = decoded?.document;
-  if (carrier === 4) {
-    d.push(diag('alt-carrier'));
-    if (doc) for (const vals of doc.values()) if (vals.some(v => /data:/i.test(v))) { d.push(diag('alt-carrier-payload')); break; }
-  }
   if (carrier === 3 && element && !(element.getAttribute('width') && element.getAttribute('height'))) d.push(diag('missing-size'));
+  if (carrier === 2 && doc) { const p = doc.get('prompt'); if (p && p.length > 1 && p[0] === p[1] && element && element.getAttribute('alt') !== null) d.push(diag('alt-repeated')); }
   if (carrier === 1 && doc) { const m = doc.get('mode'); if (m && asciiLower(trim(m[m.length - 1] ?? '')) === 'keep') d.push(diag('keep-in-source')); }
   if (element) {
     const names = typeof element.getAttributeNames === 'function' ? element.getAttributeNames() : [];

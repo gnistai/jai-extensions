@@ -30,7 +30,7 @@ async function main(): Promise<void> {
       const li = document.createElement('li');
       const code = document.createElement('code');
       code.textContent = i.jai ?? '(loading .jai file)';
-      li.append(code, document.createTextNode(` — ${i.status}${i.carrier === 4 ? ' · alt carrier' : ''}`));
+      li.append(code, document.createTextNode(` — ${i.status}`));
       if (i.error) { const e = document.createElement('div'); e.className = 'err'; e.textContent = i.error; li.append(e); }
       ol.append(li);
     }

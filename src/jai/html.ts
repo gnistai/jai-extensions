@@ -1,6 +1,6 @@
 // HTML discovery (spec §Discovery). Works on a minimal element interface so it
 // runs on real DOM elements and on hand-made trees alike.
-import { LEADING_WS_RE, MEDIA_TYPE, asciiLower, type Diagnostic, type JaiDocument } from './chars.ts';
+import { LEADING_WS_RE, MEDIA_TYPE, asciiLower, normalizeValue, type Diagnostic, type JaiDocument } from './chars.ts';
 import { decodeDataURL } from './decode.ts';
 import { parse, type ParseInfo } from './text.ts';
 
@@ -115,18 +115,14 @@ export function discover(img: ElementLike, { baseURL }: { baseURL?: string } = {
   const dj = img.getAttribute('data-jai');
   if (dj !== null) {
     const r = parse(dj);
-    return { carrier: 2, kind: 'inline', document: r.document, diagnostics: r.diagnostics, info: r.info };
+    return { carrier: 2, kind: 'inline', document: withAltPrompt(r.document, img.getAttribute('alt')), diagnostics: r.diagnostics, info: r.info };
   }
   const src = img.getAttribute('src');
   if (src !== null) {
     const r = decodeDataURL(src);
     if (r) return { carrier: 3, kind: 'inline', document: r.document, diagnostics: r.diagnostics };
   }
-  const alt = img.getAttribute('alt');
-  if (alt !== null && /^jai:/i.test(alt.replace(LEADING_WS_RE, ''))) {
-    const r = parse(alt);
-    return { carrier: 4, kind: 'inline', document: r.document, diagnostics: r.diagnostics, info: r.info };
-  }
+  // `alt` is never a carrier: it is the image's text for screen readers.
   return null;
 }
 
@@ -141,5 +137,17 @@ export function discoverAll(root: RootLike, opts?: { baseURL?: string }): Array<
     }
   };
   visit(root);
+  return out;
+}
+
+/**
+ * Carrier 2 (spec §Carriers): the element's alt text, taken literally and never
+ * parsed, is the first prompt value; the prose in data-jai follows it.
+ */
+export function withAltPrompt(doc: JaiDocument, alt: string | null | undefined): JaiDocument {
+  const a = alt === null || alt === undefined ? null : normalizeValue(alt);
+  if (!a) return doc;
+  const out: JaiDocument = new Map([['prompt', [a, ...(doc.get('prompt') ?? [])]]]);
+  for (const [k, v] of doc) if (k !== 'prompt') out.set(k, v);
   return out;
 }

@@ -36,7 +36,8 @@ the definition of the format.
 
 1. Click the toolbar button on a page. The extension scans it for images that
    explicitly carry JAI: `<picture><source type="image/jai">`, `data-jai`,
-   `data:image/jai` in `src`, or the deprecated `jai:` prefix in `alt`.
+   or `data:image/jai` in `src`. `alt` is never read as JAI: it stays the
+   screen-reader text.
    Ordinary images are never touched.
 2. Each JAI image gets a small **JAI** control. It opens a panel with the raw and
    parsed description, diagnostics, the canonical form, and a choice of renderer.

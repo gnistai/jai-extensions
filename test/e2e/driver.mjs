@@ -53,36 +53,38 @@ try {
   await sw.evaluate(async id => { await chrome.scripting.executeScript({ target: { tabId: id }, files: ['content.js'] }); }, tabId);
   await sleep(500);
   const list = await sw.evaluate(async id => chrome.tabs.sendMessage(id, { type: 'list' }), tabId);
-  check('discovers the five carriers', list.length === 5 && [1, 2, 3, 4].every(c => list.some(i => i.carrier === c)), JSON.stringify(list.map(i => i.carrier)));
-  check('documents parsed', list.filter(i => i.jai === 'jai:A red lighthouse on a rocky island at sunset;style=watercolor').length === 4 && list.some(i => i.jai === 'jai:A red lighthouse on a rocky island at sunset;prompt/flux=seen from the sea;prompt/sdxl=from a cliff top;aspect=1:1;style=watercolor'));
+  check('discovers the three carriers and ignores alt', list.length === 4 && [1, 2, 3].every(c => list.some(i => i.carrier === c)) && !list.some(i => i.carrier === 4), JSON.stringify(list.map(i => i.carrier)));
+  check('documents parsed', list.filter(i => i.jai === 'jai:A red lighthouse on a rocky island at sunset;style=watercolor').length === 3 && list.some(i => i.jai === 'jai:A red lighthouse on a rocky island at sunset;prompt/flux=seen from the sea;prompt/sdxl=from a cliff top;aspect=1:1;style=watercolor'));
   check('no image changed before the user asks', await page.evaluate(() => [...document.images].every(i => !i.getAttribute('srcset') && !i.currentSrc.startsWith('data:image/webp'))));
 
   // Rendering is refused until the provider notice is accepted for the site.
   await sw.evaluate(async o => { const { settings = {} } = await chrome.storage.local.get('settings'); settings.disclosed = { ...(settings.disclosed || {}), [o]: true }; await chrome.storage.local.set({ settings }); }, origin);
   await sw.evaluate(async id => chrome.tabs.sendMessage(id, { type: 'renderAll' }), tabId);
   const t0 = Date.now();
-  const ok = await page.waitForFunction(() => ['c1', 'c2', 'c3', 'c4', 'c5'].every(id => { const i = document.getElementById(id); return /^data:image\/(webp|png|jpeg)/.test(i.currentSrc) && i.complete && i.naturalWidth > 0; }), { timeout: 120000, polling: 500 }).then(() => true, () => false);
+  const ok = await page.waitForFunction(() => ['c1', 'c2', 'c3', 'c5'].every(id => { const i = document.getElementById(id); return /^data:image\/(webp|png|jpeg)/.test(i.currentSrc) && i.complete && i.naturalWidth > 0; }), { timeout: 120000, polling: 500 }).then(() => true, () => false);
   if (!ok) {
     const l2 = await sw.evaluate(async id => chrome.tabs.sendMessage(id, { type: 'list' }), tabId);
-    const imgs = await page.evaluate(() => ['c1', 'c2', 'c3', 'c4', 'c5'].map(id => { const i = document.getElementById(id); return { id, currentSrc: i.currentSrc.slice(0, 40), srcset: (i.getAttribute('srcset') || '').slice(0, 30), complete: i.complete, w: i.naturalWidth }; }));
+    const imgs = await page.evaluate(() => ['c1', 'c2', 'c3', 'c5'].map(id => { const i = document.getElementById(id); return { id, currentSrc: i.currentSrc.slice(0, 40), srcset: (i.getAttribute('srcset') || '').slice(0, 30), complete: i.complete, w: i.naturalWidth }; }));
     throw new Error('render did not appear: ' + JSON.stringify({ list: l2, imgs }));
   }
-  check('all five images replaced', true, `${Math.round((Date.now() - t0) / 1000)}s`);
+  check('all four JAI images replaced', true, `${Math.round((Date.now() - t0) / 1000)}s`);
   const st = await page.evaluate(() => ({
     p1First: document.getElementById('p1').firstElementChild.localName === 'source' && document.getElementById('p1').firstElementChild.srcset.startsWith('data:image/'),
     c1src: document.getElementById('c1').getAttribute('src'),
     alts: ['c1', 'c2', 'c3', 'c4'].map(id => document.getElementById(id).getAttribute('alt')),
-    desc: ['c1', 'c2', 'c3', 'c4'].map(id => !!document.getElementById(id).getAttribute('aria-description')),
+    desc: ['c1', 'c2', 'c3'].map(id => !!document.getElementById(id).getAttribute('aria-description')),
+    c4: { src: document.getElementById('c4').currentSrc.endsWith('original.png'), srcset: document.getElementById('c4').hasAttribute('srcset'), desc: document.getElementById('c4').hasAttribute('aria-description') },
     plain: document.getElementById('plain').currentSrc.endsWith('original.png') && !document.getElementById('plain').getAttribute('srcset'),
     sizes: ['c1', 'c2', 'c3', 'c4'].map(id => { const r = document.getElementById(id).getBoundingClientRect(); return `${r.width}x${r.height}`; }),
   }));
   check('carrier 1 replaced by a viewer <source>, src untouched', st.p1First && st.c1src === 'original.png');
-  check('human alt kept; alt carrier replaced by the description', st.alts[0] === 'A placeholder' && st.alts[1] === 'A placeholder' && st.alts[3] === 'A red lighthouse on a rocky island at sunset', JSON.stringify(st.alts));
+  check('human alt kept everywhere', st.alts[0] === 'A placeholder' && st.alts[1] === 'A red lighthouse on a rocky island at sunset' && st.alts[2] === 'A red lighthouse on a rocky island at sunset' && st.alts[3].startsWith('jai:'), JSON.stringify(st.alts));
+  check('alt beginning with jai: is never rendered', st.c4.src && !st.c4.srcset && !st.c4.desc, JSON.stringify(st.c4));
   check('AI-rendered state exposed', st.desc.every(Boolean));
   check('plain image untouched', st.plain);
   check('layout boxes preserved', st.sizes.join() === sizesBefore.join(), `${sizesBefore.join(' ')} -> ${st.sizes.join(' ')}`);
   const history = await sw.evaluate(async () => new Promise(r => { const q = indexedDB.open('jai-viewer'); q.onsuccess = () => { const g = q.result.transaction('history').objectStore('history').getAll(); g.onsuccess = () => r(g.result); }; }));
-  check('identical documents shared one prediction', history.length <= 2, `${history.length} provider job(s) in this profile (4 identical + 1 distinct document)`);
+  check('identical documents shared one prediction', history.length <= 2, `${history.length} provider job(s) in this profile (3 identical + 1 distinct document)`);
   const c5 = await page.evaluate(() => { const i = document.getElementById('c5'); const r = i.getBoundingClientRect(); return { natural: i.naturalWidth / i.naturalHeight, fit: getComputedStyle(i).objectFit, box: `${r.width}x${r.height}` }; });
   check('sized 3:2 box with aspect=1:1: rendered near 3:2 and never stretched', Math.abs(Math.log(c5.natural / 1.5)) < 0.08 && c5.fit !== 'fill', JSON.stringify(c5));
   const sent = await sw.evaluate(async () => new Promise(r => { const q = indexedDB.open('jai-viewer'); q.onsuccess = () => { const g = q.result.transaction('cache').objectStore('cache').getAll(); g.onsuccess = () => r(g.result.map(e => e.sentPrompt)); }; }));
