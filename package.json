@@ -1,5 +1,5 @@
 {
-  "name": "jai-extensions",
+  "name": "jai-tools",
   "private": true,
   "version": "0.1.0",
   "description": "Reference viewer for JAI (Just AI Images): a Chrome MV3 extension, a TypeScript JAI library, and a Replicate renderer",
