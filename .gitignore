@@ -1,0 +1,15 @@
+# secrets
+.env
+.env.*
+
+# node / build
+node_modules/
+dist/
+.cache/
+*.zip
+npm-debug.log*
+
+# editor / OS
+.DS_Store
+Thumbs.db
+*.swp

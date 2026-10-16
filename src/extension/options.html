@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>JAI Viewer options</title><link rel="stylesheet" href="ui.css">
+<style>main{max-width:760px;margin:0 auto;padding:24px 16px 64px}</style></head>
+<body><main>
+  <h1>JAI Viewer</h1>
+  <p class="muted">The reference viewer for <a href="https://gnistai.github.io/jai/">JAI (Just AI Images)</a>. It renders JAI images only when you ask, with the provider and models you choose here.</p>
+
+  <div class="card notice">
+    <strong>How rendering works.</strong> When you render a JAI image, this extension sends its description, and for "transform" images the picture shown on the page, to <strong>Replicate</strong>, using your own API token. Replicate processes and may log what you send under <a href="https://replicate.com/terms">its terms</a>, and charges your account per image. Nothing is sent to any other server, and nothing is rendered until you allow it for a site.
+  </div>
+
+  <h2>Replicate API token</h2>
+  <div class="card">
+    <div id="token-status" class="muted">Checking…</div>
+    <label>Token <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="r8_…" style="width:100%"></label>
+    <div class="row"><button id="save-token" type="button">Save</button><button id="test-token" type="button" class="secondary">Test</button><button id="clear-token" type="button" class="secondary">Remove</button></div>
+    <p class="muted" style="margin-bottom:0">Create one at <a href="https://replicate.com/account/api-tokens">replicate.com/account/api-tokens</a>. It is stored only in this browser profile, in the extension's private storage, and is used only by the extension's background worker to call api.replicate.com. Web pages and the extension's in-page code never see it.</p>
+  </div>
+
+  <h2>Models</h2>
+  <div class="card">
+    <p class="muted" style="margin-top:0">A JAI document can name preferred models, but only models enabled here are ever used. A document can never make the extension download or run anything else.</p>
+    <table><thead><tr><th>Use</th><th>Model</th><th>Default</th><th>Approx. cost</th></tr></thead><tbody id="models"></tbody></table>
+    <label style="margin-top:12px"><input type="checkbox" id="fold-avoid"> When a model has no negative prompt, add "avoid" items to the prompt (otherwise they are left out and reported)</label>
+  </div>
+
+  <h2>Limits</h2>
+  <div class="card">
+    <div class="row">
+      <label>At most <input id="max-page" type="number" min="1" max="200" style="width:5em"> renders per page</label>
+      <label>At most <input id="max-day" type="number" min="1" max="2000" style="width:5em"> renders per day</label>
+      <label><input id="max-conc" type="number" min="1" max="4" style="width:4em"> at a time</label>
+    </div>
+    <div class="row"><button id="save-limits" type="button">Save limits</button><span id="limits-saved" class="ok" hidden>Saved</span></div>
+  </div>
+
+  <h2>Sites</h2>
+  <div class="card">
+    <p class="muted" style="margin-top:0">Every site starts at "render only when I ask". Automatic rendering is per site and still respects the limits above. Choose per site from the toolbar button.</p>
+    <table><thead><tr><th>Site</th><th>Mode</th><th>Provider notice accepted</th><th></th></tr></thead><tbody id="sites"></tbody></table>
+  </div>
+
+  <h2>History and cache</h2>
+  <div class="card">
+    <label><input type="checkbox" id="keep-history"> Keep a local list of renders (never synchronised; it is a browsing history)</label>
+    <div class="row"><button id="show-history" type="button" class="secondary">Show history</button><button id="clear-history" type="button" class="secondary">Clear history</button><button id="clear-cache" type="button" class="secondary">Clear cached renders</button></div>
+    <div id="history"></div>
+  </div>
+  <script type="module" src="options.js"></script>
+</main></body>
+</html>

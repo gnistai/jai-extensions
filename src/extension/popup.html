@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>JAI Viewer</title><link rel="stylesheet" href="ui.css">
+<style>body{width:380px;padding:14px}li{margin:6px 0}ol{padding-left:18px;margin:6px 0}</style></head>
+<body>
+  <h1>JAI Viewer</h1>
+  <div class="muted" id="site"></div>
+  <div id="token-note" class="notice" hidden style="margin-top:8px">No Replicate token yet. <a href="#" id="open-options">Open options</a> to add one. Without it, nothing is ever rendered.</div>
+  <h2>JAI images on this page</h2>
+  <div id="list" class="muted">Scanning…</div>
+  <div class="row" style="margin-top:10px">
+    <button id="render-all" type="button" disabled>Render all</button>
+    <button id="restore-all" type="button" class="secondary" disabled>Show originals</button>
+  </div>
+  <h2>On this site</h2>
+  <label><select id="mode">
+    <option value="on-request">Render only when I ask (default)</option>
+    <option value="auto">Render visible JAI images automatically</option>
+    <option value="never">Ignore JAI on this site</option>
+  </select></label>
+  <div class="muted" id="usage"></div>
+  <p class="muted" style="margin-top:12px">Renders are made by Replicate under your account and cost money. <a href="#" id="options-link">Options</a></p>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

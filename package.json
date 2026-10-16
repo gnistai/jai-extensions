@@ -1,0 +1,23 @@
+{
+  "name": "jai-extensions",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Reference viewer for JAI (Just AI Images): a Chrome MV3 extension, a TypeScript JAI library, and a Replicate renderer",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs && npm run conformance",
+    "conformance": "node scripts/conformance.mjs",
+    "package": "npm run build && node scripts/package.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.287",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.6.3"
+  }
+}
