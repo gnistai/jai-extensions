@@ -1,6 +1,6 @@
 # JAI tools — reference viewer and TypeScript library
 
-The reference viewer for [JAI (Just AI Images)](https://gnistai.github.io/jai/), an
+The reference viewer for [JAI (Just AI Images)](https://jai.gnist.ai/), an
 open standard for images stored as a description instead of pixels. This
 repository holds:
 
