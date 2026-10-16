@@ -1,6 +1,6 @@
 // Advisory validator (spec §Diagnostics, validator codes).
 import { MEDIA_TYPE, QUALIFIABLE, SINGLE_VALUED, STANDARD_KEYS, WS_CLASS, asciiLower, diag, trim, type Diagnostic, type JaiDocument } from './chars.ts';
-import { srcsetCandidates } from './html.ts';
+import { srcIsSelected, srcsetCandidates, type Carrier } from './html.ts';
 import { canonicalJSON } from './json.ts';
 import type { DecodeResult } from './decode.ts';
 import type { ElementLike } from './html.ts';
@@ -91,18 +91,20 @@ function dataURLAdvisories(url: string): Diagnostic[] {
  * Advisories about delivery: a decode() result (bytes from a file or fetched
  * resource; viaDataURL for a data: body) and/or a discovery carrier and element.
  */
-export function validateDelivery({ decoded, carrier, element, viaDataURL = false }: { decoded?: (Pick<DecodeResult, 'document'> & Partial<Pick<DecodeResult, 'form'>>) | null; carrier?: number; element?: ElementLike; viaDataURL?: boolean } = {}): Diagnostic[] {
+export function validateDelivery({ decoded, carrier, element, viaDataURL = false }: { decoded?: (Pick<DecodeResult, 'document'> & Partial<Pick<DecodeResult, 'form'>>) | null; carrier?: Carrier; element?: ElementLike; viaDataURL?: boolean } = {}): Diagnostic[] {
   const d: Diagnostic[] = [];
   if (decoded && !viaDataURL && (decoded.form === 'json' || decoded.form === 'text')) d.push(diag('non-canonical-encoding'));
   const doc = decoded?.document;
-  if (carrier === 3 && element && !(element.getAttribute('width') && element.getAttribute('height'))) d.push(diag('missing-size'));
-  if (carrier === 2 && doc) { const p = doc.get('prompt'); if (p && p.length > 1 && p[0] === p[1] && element && element.getAttribute('alt') !== null) d.push(diag('alt-repeated')); }
-  if (carrier === 1 && doc) { const m = doc.get('mode'); if (m && asciiLower(trim(m[m.length - 1] ?? '')) === 'keep') d.push(diag('keep-in-source')); }
+  if (carrier === 'src' && element && !(element.getAttribute('width') && element.getAttribute('height'))) d.push(diag('missing-size'));
+  if (carrier === 'attribute' && doc) { const p = doc.get('prompt'); if (p && p.length > 1 && p[0] === p[1] && element && element.getAttribute('alt') !== null) d.push(diag('alt-repeated')); }
+  if ((carrier === 'picture' || carrier === 'src') && doc) { const m = doc.get('mode'); if (m && asciiLower(trim(m[m.length - 1] ?? '')) === 'keep') d.push(diag('keep-in-source')); }
   if (element) {
     const names = typeof element.getAttributeNames === 'function' ? element.getAttributeNames() : [];
     if (names.some(n => /["';=]/.test(n))) d.push(diag('attribute-split'));
     const src = element.getAttribute('src');
     if (src) d.push(...dataURLAdvisories(src));
+    // A JAI src that HTML's image selection would never use (own srcset, or a preceding <source>).
+    if (src && !srcIsSelected(element) && (/^\s*data:image\/jai(?=[;,]|$)/i.test(src) || /\.jai(?:[?#]|$)/i.test(src))) d.push(diag('src-shadowed'));
     const parent = element.parentElement;
     if (parent && parent.localName === 'picture') {
       let after = false;

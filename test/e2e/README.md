@@ -5,8 +5,11 @@ Loads the built extension into Chrome for Testing (branded Chrome ignores
 
 1. saves the Replicate token through the options page and checks it is not in
    `chrome.storage`, and tests it against Replicate;
-2. opens `page.html` (all four carriers and one plain image), injects the
-   content script as the popup would, and checks discovery;
+2. opens `page.html` (all three carriers, including a `.jai` file in `src`,
+   an `alt` beginning with `jai:` that must be ignored, and one plain image),
+   injects the content script as the popup would, and checks discovery, that
+   the `.jai` file is not fetched before use, and that the privileged fetch
+   refuses anything but a `.jai` path;
 3. checks nothing changes before the user asks, accepts the provider notice,
    renders everything, and checks replacement mechanics, accessible names,
    the AI-rendered description, layout boxes, that the plain image is untouched,

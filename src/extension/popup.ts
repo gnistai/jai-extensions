@@ -20,7 +20,7 @@ async function main(): Promise<void> {
 
   try { await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] }); }
   catch { $('list').textContent = 'This page cannot be scanned.'; return; }
-  const items = (await chrome.tabs.sendMessage(tab.id, { type: 'list' })) as Array<{ carrier: number; status: string; jai: string | null; error: string | null }>;
+  const items = (await chrome.tabs.sendMessage(tab.id, { type: 'list' })) as Array<{ carrier: string; status: string; jai: string | null; error: string | null }>;
   const list = $('list');
   list.textContent = '';
   if (!items?.length) { list.textContent = 'No JAI images found. Ordinary images are never touched.'; }
@@ -29,7 +29,7 @@ async function main(): Promise<void> {
     for (const i of items) {
       const li = document.createElement('li');
       const code = document.createElement('code');
-      code.textContent = i.jai ?? '(loading .jai file)';
+      code.textContent = i.jai ?? '(.jai file, read when you open or render it)';
       li.append(code, document.createTextNode(` — ${i.status}`));
       if (i.error) { const e = document.createElement('div'); e.className = 'err'; e.textContent = i.error; li.append(e); }
       ol.append(li);

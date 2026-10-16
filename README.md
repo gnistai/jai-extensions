@@ -35,9 +35,11 @@ the definition of the format.
 ## What it does
 
 1. Click the toolbar button on a page. The extension scans it for images that
-   explicitly carry JAI: `<picture><source type="image/jai">`, `data-jai`,
-   or `data:image/jai` in `src`. `alt` is never read as JAI: it stays the
-   screen-reader text.
+   explicitly carry JAI: the attribute form (`alt` as the description plus
+   `data-jai`), the picture form (`<source type="image/jai">`), or the src
+   form (a `.jai` file or `data:image/jai` URL in `src`). `.jai` files are
+   fetched only when you open an image's controls or render it. A plain `alt`
+   is never read as JAI.
    Ordinary images are never touched.
 2. Each JAI image gets a small **JAI** control. It opens a panel with the raw and
    parsed description, diagnostics, the canonical form, and a choice of renderer.
@@ -165,7 +167,7 @@ npm run conformance    # conformance only; uses ../jai, $JAI_SPEC_DIR, or clones
 
 `test/e2e/` contains an end-to-end test that loads the built extension into
 Chrome for Testing, saves a token through the options page, renders a test
-page with all four carriers, and checks replacement, accessibility, restore,
+page with all three carriers (including a `.jai` file in `src`), and checks replacement, accessibility, restore,
 de-duplication and a strict-CSP page, checks that content scripts cannot use
 the encoder's port, and runs a tiny real encode on the encode page. It costs
 about $0.03. See [`test/e2e/README.md`](test/e2e/README.md).

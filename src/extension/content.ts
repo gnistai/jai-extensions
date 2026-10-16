@@ -29,7 +29,7 @@ function init(): void {
     render?: Extract<RenderPortReply, { type: 'done' }>;
     badge?: HTMLButtonElement;
   }
-  interface SavedState { srcset: string | null; sizes: string | null; alt: string | null; ariaDescription: string | null; ariaBusy: string | null; insertedSource: HTMLSourceElement | null; canvas: HTMLCanvasElement | null; display: string; objectFit: string | null }
+  interface SavedState { srcset: string | null; sizes: string | null; alt: string | null; ariaDescription: string | null; ariaBusy: string | null; insertedSource: HTMLSourceElement | null; canvas: HTMLCanvasElement | null; display: string; objectFit: string | null; sizeStyle: { width: string; aspectRatio: string } | null }
 
   const items = new Map<HTMLImageElement, Item>();
   const ours = new WeakSet<Element>();
@@ -105,25 +105,61 @@ function init(): void {
   };
 
   // ------------------------------------------------------------ discovery
-  async function resolve(item: Item): Promise<void> {
-    if (item.disc.kind === 'inline') { item.doc = item.disc.document ?? null; item.diagnostics = item.disc.diagnostics ?? []; return; }
-    item.status = 'loading';
+  // .jai resources (picture or src carrier) are fetched on use only: when the user opens the
+  // panel or a render starts, never during discovery (spec §Replacement, §Permitted inputs).
+  const fetches = new Map<string, Promise<{ bytes: Uint8Array | null; notJai: boolean; error: string | null }>>();
+  function fetchJai(url: string): Promise<{ bytes: Uint8Array | null; notJai: boolean; error: string | null }> {
+    let p = fetches.get(url);
+    if (!p) {
+      p = (async () => {
+        try {
+          const res = await fetch(url, { mode: 'cors', credentials: 'omit', redirect: 'error' });
+          if (res.ok) {
+            if (/^text\/html\b/i.test(res.headers.get('content-type') ?? '')) return { bytes: null, notJai: true, error: null };
+            return { bytes: new Uint8Array(await res.arrayBuffer()), notJai: false, error: null };
+          }
+        } catch { /* fall back to the background, which applies its own checks */ }
+        const r = await send<{ b64?: string; error?: string; notJai?: boolean }>({ type: 'fetchJai', url });
+        if (r?.b64) return { bytes: b64decode(r.b64), notJai: false, error: null };
+        return { bytes: null, notJai: !!r?.notJai, error: r?.error ?? 'blocked' };
+      })();
+      fetches.set(url, p);
+    }
+    return p;
+  }
+
+  /** Load the document of an item; false when the resource turned out not to be JAI (the item is dropped quietly). */
+  async function resolve(item: Item): Promise<boolean> {
+    if (item.doc) return true;
+    if (item.disc.kind === 'inline') { item.doc = item.disc.document ?? null; item.diagnostics = item.disc.diagnostics ?? []; return true; }
+    item.status = 'loading'; placeBadge(item);
     const url = item.disc.url ?? '';
-    let bytes: Uint8Array | null = null;
-    try {
-      const res = await fetch(url, { mode: 'cors', credentials: 'omit' });
-      if (res.ok) bytes = new Uint8Array(await res.arrayBuffer());
-    } catch { /* fall back */ }
-    if (!bytes) {
-      const r = await send<{ b64?: string; error?: string }>({ type: 'fetchJai', url });
-      if (r?.b64) bytes = b64decode(r.b64);
-      else item.error = `Could not fetch ${url}: ${r?.error ?? 'blocked'}`;
-    }
-    if (bytes) {
-      const d = decode(bytes, { inContext: true });
-      item.doc = d.document; item.diagnostics = [...d.diagnostics, ...validateDelivery({ decoded: d })];
-    }
+    const r = await fetchJai(url);
     item.status = 'found';
+    if (r.bytes) {
+      const d = decode(r.bytes, { inContext: true });
+      if (d.diagnostics.some(x => ['undecodable', 'malformed-container', 'invalid-json'].includes(x.code))) { drop(item); return false; }
+      item.doc = d.document; item.diagnostics = [...d.diagnostics, ...validateDelivery({ decoded: d })];
+      placeBadge(item);
+      return true;
+    }
+    if (r.notJai) { drop(item); return false; }
+    item.error = `Could not fetch ${url}: ${r.error}`;
+    placeBadge(item);
+    return false;
+  }
+
+  /** Not a JAI image after all (an HTML page or pixels at a .jai address): remove our control, leave the page alone. */
+  function drop(item: Item): void {
+    item.badge?.remove();
+    if (panel?.isConnected && panelItem === item) panel.remove();
+    items.delete(item.img);
+    void send({ type: 'found', count: items.size });
+  }
+
+  /** Spec §Discovery: a src .jai address that delivered pixels (service worker, gateway) is the page's image. */
+  function pixelsArrived(item: Item): boolean {
+    return item.disc.carrier === 'src' && item.disc.kind === 'url' && item.img.currentSrc === item.disc.url && item.img.complete && item.img.naturalWidth > 0;
   }
 
   function scan(): void {
@@ -133,8 +169,9 @@ function init(): void {
       if (!disc) continue;
       const item: Item = { img, disc, doc: null, diagnostics: [], status: 'found' };
       items.set(img, item);
-      void resolve(item).then(() => { placeBadge(item); maybeAuto(item); });
+      if (disc.kind === 'inline') { item.doc = disc.document ?? null; item.diagnostics = disc.diagnostics ?? []; }
       placeBadge(item);
+      maybeAuto(item);
     }
     void send({ type: 'found', count: items.size });
   }
@@ -152,7 +189,8 @@ function init(): void {
     b.dataset.status = item.status;
     b.setAttribute('aria-label', `JAI image${prompt ? ': ' + prompt.slice(0, 80) : ''}. Open JAI controls. Status: ${item.status}`);
     const r = (item.saved?.canvas ?? item.img).getBoundingClientRect();
-    const visible = r.width >= 24 && r.height >= 16 && item.img.isConnected;
+    // A src image without pixels may have no size (Markdown output): keep its control reachable.
+    const visible = item.img.isConnected && ((r.width >= 24 && r.height >= 16) || item.disc.carrier === 'src');
     b.hidden = !visible;
     b.style.left = `${r.right + window.scrollX - 40}px`;
     b.style.top = `${r.top + window.scrollY + 6}px`;
@@ -164,7 +202,11 @@ function init(): void {
 
   // ------------------------------------------------------------ panel
   let panel: HTMLElement | null = null;
+  let panelItem: Item | null = null;
   async function openPanel(item: Item, refocus = false): Promise<void> {
+    if (pixelsArrived(item)) { drop(item); return; }
+    if (!(await resolve(item)) && !items.has(item.img)) return;
+    panelItem = item;
     state = await send<StateReply>({ type: 'state', origin });
     const focusedRole = refocus ? (shadow.activeElement as HTMLElement | null)?.dataset.role ?? null : null;
     panel?.remove();
@@ -175,7 +217,7 @@ function init(): void {
     close.setAttribute('aria-label', 'Close');
     close.addEventListener('click', () => { p.remove(); item.badge?.focus(); });
     p.addEventListener('keydown', e => { if (e.key === 'Escape') { p.remove(); item.badge?.focus(); } });
-    const carriers: Record<number, string> = { 1: '<picture><source type="image/jai">', 2: 'data-jai', 3: 'data:image/jai in src' };
+    const carriers: Record<string, string> = { picture: '<picture><source type="image/jai">', attribute: 'alt + data-jai', src: item.disc.kind === 'url' ? 'a .jai file in src' : 'data:image/jai in src' };
     p.append(el('h2', {}, el('span', {}, 'JAI image'), close));
     p.append(el('div', { className: 'muted' }, `Found via ${carriers[item.disc.carrier]} on ${origin}`));
     if (item.error) p.append(el('div', { className: 'notice' }, item.error));
@@ -282,9 +324,12 @@ function init(): void {
 
   // ------------------------------------------------------------ render and replace
   async function render(item: Item, modelId: string | null, automatic: boolean, statusEl?: HTMLElement): Promise<void> {
-    if (!item.doc || item.status === 'rendering') return;
+    if (item.status === 'rendering') return;
+    if (pixelsArrived(item)) { drop(item); return; }
+    if (!(await resolve(item)) || !item.doc) return;
     const it = interpret(item.doc).interpreted;
-    const hasOriginal = item.disc.carrier !== 3 && item.img.naturalWidth > 0;
+    // The src carrier has no original pixels (spec §Modes and the original image).
+    const hasOriginal = item.disc.carrier !== 'src' && item.img.naturalWidth > 0;
     const input = it.mode === 'transform' && hasOriginal ? await readableInput(item.img) : null;
     const rect = item.img.getBoundingClientRect();
     const req: RenderPortRequest = {
@@ -321,7 +366,7 @@ function init(): void {
   }
 
   function save(img: HTMLImageElement): SavedState {
-    return { srcset: img.getAttribute('srcset'), sizes: img.getAttribute('sizes'), alt: img.getAttribute('alt'), ariaDescription: img.getAttribute('aria-description'), ariaBusy: img.getAttribute('aria-busy'), insertedSource: null, canvas: null, display: img.style.display, objectFit: null };
+    return { srcset: img.getAttribute('srcset'), sizes: img.getAttribute('sizes'), alt: img.getAttribute('alt'), ariaDescription: img.getAttribute('aria-description'), ariaBusy: img.getAttribute('aria-busy'), insertedSource: null, canvas: null, display: img.style.display, objectFit: null, sizeStyle: null };
   }
 
   async function apply(item: Item, r: Extract<RenderPortReply, { type: 'done' }>): Promise<void> {
@@ -329,6 +374,14 @@ function init(): void {
     item.saved ??= save(img);
     const saved = item.saved;
     const picture = img.parentElement?.localName === 'picture' ? img.parentElement : null;
+    // A src image with no size (for example Markdown output) gets the document's shape at the available width.
+    const box = img.getBoundingClientRect();
+    if (item.disc.carrier === 'src' && (box.width < 2 || box.height < 2) && saved.sizeStyle === null) {
+      saved.sizeStyle = { width: img.style.width, aspectRatio: img.style.aspectRatio };
+      const a = item.doc ? interpret(item.doc).interpreted.aspect : null;
+      img.style.width = '100%';
+      img.style.aspectRatio = a ? `${a.width} / ${a.height}` : '1 / 1';
+    }
     // Spec §Replacement: setting src alone is a no-op under srcset or a matching <source>.
     if (picture) {
       if (!saved.insertedSource) {
@@ -346,7 +399,8 @@ function init(): void {
       if (img.currentSrc === r.dataURL && img.complete && img.naturalWidth > 0) return res(true);
       const done = (ok: boolean): void => { img.removeEventListener('load', onLoad); img.removeEventListener('error', onErr); res(ok); };
       const onLoad = (): void => done(img.currentSrc === r.dataURL);
-      const onErr = (): void => done(false);
+      // Only an error about our own image counts; a late error from the original .jai load does not.
+      const onErr = (): void => { if (img.currentSrc === r.dataURL) done(false); };
       img.addEventListener('load', onLoad); img.addEventListener('error', onErr);
       setTimeout(() => done(img.currentSrc === r.dataURL && img.naturalWidth > 0), 4000);
     });
@@ -407,6 +461,7 @@ function init(): void {
     saved.canvas?.remove(); saved.canvas = null;
     img.style.display = saved.display;
     if (saved.objectFit !== null) img.style.objectFit = saved.objectFit;
+    if (saved.sizeStyle) { img.style.width = saved.sizeStyle.width; img.style.aspectRatio = saved.sizeStyle.aspectRatio; }
     if (saved.alt === null) img.removeAttribute('alt'); else img.setAttribute('alt', saved.alt);
     if (saved.ariaDescription === null) img.removeAttribute('aria-description'); else img.setAttribute('aria-description', saved.ariaDescription);
     item.saved = undefined;
@@ -425,15 +480,18 @@ function init(): void {
       if (!e.isIntersecting || v === false) continue;
       const img = e.target as HTMLImageElement;
       const item = items.get(img);
-      if (!item || !item.doc || item.status !== 'found' || item.render) continue;
-      const it = interpret(item.doc).interpreted;
-      if (it.mode === 'keep') continue; // never automatic for keep
+      if (!item || item.status !== 'found' || item.render) continue;
       const min = state?.minDisplayedPx ?? 48;
       const r = e.intersectionRect;
       if (r.width < min || r.height < min) continue;
       if (typeof img.checkVisibility === 'function' && !img.checkVisibility({ opacityProperty: true, visibilityProperty: true } as CheckVisibilityOptions)) continue;
       io.unobserve(img);
-      void render(item, null, true);
+      // A .jai resource is fetched now: the image is on screen and the user enabled automatic rendering for this site.
+      void (async () => {
+        if (!(await resolve(item)) || !item.doc) return;
+        if (interpret(item.doc).interpreted.mode === 'keep') return; // never automatic for keep
+        await render(item, null, true);
+      })();
     }
   }, { rootMargin: '0px', threshold: [0.5], trackVisibility: true, delay: 100 } as IntersectionObserverInit);
   function maybeAuto(item: Item): void { if (autoOn) io.observe(item.img); }
@@ -457,7 +515,7 @@ function init(): void {
   window.__jaiViewer = {
     rescan: scan,
     list: () => [...items.values()].map(i => ({ carrier: i.disc.carrier, status: i.status, jai: i.doc ? serialize(i.doc) : null, error: i.error ?? null })),
-    renderAll: () => { for (const i of items.values()) if (i.status === 'found' && i.doc) void render(i, null, false); },
+    renderAll: () => { for (const i of items.values()) if (i.status === 'found') void render(i, null, false); },
     restoreAll: () => { for (const i of items.values()) if (i.status === 'rendered') restore(i, true); },
   };
   chrome.runtime.onMessage.addListener((msg: { type: string }, _s, reply) => {

@@ -8,6 +8,7 @@ import { identity, interpret, readJSON, sha256Hex, type CatalogModel } from '../
 import { FAMILIES, REPLICATE_MODELS, ReplicateRenderer } from '../renderers/replicate.ts';
 import { HttpReplicateClient } from '../providers/replicate-client.ts';
 import { PortLedger, allowedModel, sanitizeInput } from './encode-guard.ts';
+import { RateLimit, refuseJaiFetch } from './fetch-guard.ts';
 import { RenderError, type RenderIntent } from '../renderers/types.ts';
 import { idbAll, idbClear, idbDelete, idbGet, idbSet } from './idb.ts';
 import { b64decode, b64encode, getSettings, readCapped, saveSettings, siteMode, today, type BgRequest, type EncodePortReply, type EncodePortRequest, type RenderPortReply, type RenderPortRequest, type Settings, type StateReply } from './shared.ts';
@@ -17,6 +18,8 @@ import { b64decode, b64encode, getSettings, readCapped, saveSettings, siteMode, 
 const getToken = (): Promise<string | undefined> => idbGet<string>('secrets', 'replicate');
 
 // ---------------------------------------------------------------- budgets and queue
+
+const fetchLimit = new RateLimit(20, 60_000);
 
 const perPage = new Map<string, number>();
 const inflight = new Map<string, Promise<Extract<RenderPortReply, { type: 'done' }> | null>>();
@@ -300,12 +303,18 @@ async function onRequest(msg: BgRequest | { type: 'found'; count: number }, send
       return true;
     }
     case 'fetchJai': {
-      // Privileged fallback for carrier 1 resources when the page's CORS fetch fails.
+      // Privileged fallback for .jai resources (picture or src carrier) when the page's CORS fetch fails.
       // Works only where the user granted host permission; returns bytes, never executes anything.
-      if (!/^https?:\/\//i.test(msg.url)) return { error: 'Only http(s) URLs' };
+      // It must not let a page probe other servers (spec §Permitted inputs).
+      const pageOrigin = senderOrigin(sender);
+      const refused = refuseJaiFetch(msg.url, pageOrigin);
+      if (refused) return { error: refused };
+      if (!sender.tab?.id || !fetchLimit.allow(String(sender.tab.id))) return { error: 'Too many .jai requests from this page' };
+      if (pageOrigin && siteMode(await getSettings(), pageOrigin) === 'never') return { error: 'JAI is turned off for this site' };
       try {
-        const res = await fetch(msg.url, { credentials: 'omit', referrerPolicy: 'no-referrer' });
+        const res = await fetch(msg.url, { credentials: 'omit', referrerPolicy: 'no-referrer', redirect: 'error' });
         if (!res.ok) return { error: `HTTP ${res.status}` };
+        if (/^text\/html\b/i.test(res.headers.get('content-type') ?? '')) { void res.body?.cancel(); return { notJai: true }; }
         const buf = await readCapped(res, 16 * 1024 * 1024);
         if (!buf) return { error: 'Too large' };
         return { b64: b64encode(buf) };

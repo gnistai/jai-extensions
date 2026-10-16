@@ -15,8 +15,10 @@ export interface ElementLike {
 }
 export interface RootLike { children?: ArrayLike<ElementLike> | Iterable<ElementLike>; querySelectorAll?(selector: string): ArrayLike<ElementLike> | Iterable<ElementLike> }
 
+export type Carrier = 'picture' | 'attribute' | 'src';
+
 export interface Discovery {
-  carrier: 1 | 2 | 3 | 4;
+  carrier: Carrier;
   kind: 'inline' | 'url';
   document?: JaiDocument;
   diagnostics?: Diagnostic[];
@@ -89,7 +91,33 @@ export function firstSrcsetURL(srcset: string | null): string | null {
 
 const toArray = <T>(x: ArrayLike<T> | Iterable<T>): T[] => Array.from(x as ArrayLike<T>);
 
-/** Discovery for one <img>. For carrier 1 with a resource URL the caller fetches and decodes it. */
+/**
+ * A .jai resource URL for the src carrier (spec §Carriers): an http(s) URL, after
+ * resolving against the base, whose path ends in ".jai" (ASCII case-insensitive;
+ * query and fragment ignored). Returns the absolute URL or null.
+ */
+export function jaiResourceURL(value: string | null | undefined, baseURL?: string): string | null {
+  if (value == null) return null;
+  let u: URL;
+  try { u = new URL(value, baseURL || undefined); } catch { return null; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+  return /\.jai$/i.test(u.pathname) ? u.href : null;
+}
+
+/** Whether HTML's image source selection would use the element's src at all (no own srcset, no preceding <source>). */
+export function srcIsSelected(img: ElementLike): boolean {
+  if (img.getAttribute('srcset') !== null) return false;
+  const parent = img.parentElement;
+  if (parent && parent.localName === 'picture') {
+    for (const child of toArray(parent.children)) {
+      if (child === img) break;
+      if (child.localName === 'source') return false;
+    }
+  }
+  return true;
+}
+
+/** Discovery for one <img>. For a 'url' kind (picture or src carrier) the caller fetches and decodes it, only when rendering. */
 export function discover(img: ElementLike, { baseURL }: { baseURL?: string } = {}): Discovery | null {
   const parent = img.parentElement;
   if (parent && parent.localName === 'picture') {
@@ -105,22 +133,24 @@ export function discover(img: ElementLike, { baseURL }: { baseURL?: string } = {
       if (/^data:/i.test(url)) {
         const r = decodeDataURL(url);
         if (!r) continue;
-        return { carrier: 1, kind: 'inline', document: r.document, diagnostics: r.diagnostics, source: child };
+        return { carrier: 'picture', kind: 'inline', document: r.document, diagnostics: r.diagnostics, source: child };
       }
       let abs = url;
       try { abs = new URL(url, baseURL || img.ownerDocument?.baseURI || undefined).href; } catch { /* keep as written */ }
-      return { carrier: 1, kind: 'url', url: abs, source: child };
+      return { carrier: 'picture', kind: 'url', url: abs, source: child };
     }
   }
   const dj = img.getAttribute('data-jai');
   if (dj !== null) {
     const r = parse(dj);
-    return { carrier: 2, kind: 'inline', document: withAltPrompt(r.document, img.getAttribute('alt')), diagnostics: r.diagnostics, info: r.info };
+    return { carrier: 'attribute', kind: 'inline', document: withAltPrompt(r.document, img.getAttribute('alt')), diagnostics: r.diagnostics, info: r.info };
   }
   const src = img.getAttribute('src');
-  if (src !== null) {
+  if (src !== null && srcIsSelected(img)) {
     const r = decodeDataURL(src);
-    if (r) return { carrier: 3, kind: 'inline', document: r.document, diagnostics: r.diagnostics };
+    if (r) return { carrier: 'src', kind: 'inline', document: r.document, diagnostics: r.diagnostics };
+    const url = jaiResourceURL(src, baseURL || img.ownerDocument?.baseURI);
+    if (url) return { carrier: 'src', kind: 'url', url };
   }
   // `alt` is never a carrier: it is the image's text for screen readers.
   return null;
@@ -141,7 +171,7 @@ export function discoverAll(root: RootLike, opts?: { baseURL?: string }): Array<
 }
 
 /**
- * Carrier 2 (spec §Carriers): the element's alt text, taken literally and never
+ * Attribute carrier (spec §Carriers): the element's alt text, taken literally and never
  * parsed, is the first prompt value; the prose in data-jai follows it.
  */
 export function withAltPrompt(doc: JaiDocument, alt: string | null | undefined): JaiDocument {
