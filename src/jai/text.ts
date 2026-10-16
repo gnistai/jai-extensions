@@ -1,5 +1,5 @@
 // The text form: parsing algorithm and canonical serialisation.
-import { KEY_SRC, LEADING_WS_RE, WS_CLASS, WS_ONLY_RE, asciiLower, byCodePoint, diag, isKey, normalizeValue, toScalarValueString, trim, type Diagnostic, type JaiDocument } from './chars.ts';
+import { KEY_SRC, LEADING_WS_RE, WS_CLASS, WS_ONLY_RE, asciiLower, byCodePoint, orderedKeys, diag, isKey, normalizeValue, toScalarValueString, trim, type Diagnostic, type JaiDocument } from './chars.ts';
 import { addValue, createDocument } from './document.ts';
 
 const ASSIGNMENT_PATTERN_RE = new RegExp(`^[${WS_CLASS}]*${KEY_SRC}[${WS_CLASS}]*=`, 'i');
@@ -116,7 +116,7 @@ export function serialize(doc: JaiDocument, { bare = false }: { bare?: boolean }
     if (!promptForm && bare && (/^jai:/i.test(v) || v.charCodeAt(0) === 0xfeff || v.charAt(0) === '{')) promptForm = true;
     segments.push(promptForm ? 'prompt=' + escapeValue(v) : escapeValue(v));
   });
-  const keys = [...doc.keys()].filter(k => k !== 'prompt').sort(byCodePoint);
+  const keys = orderedKeys(doc);
   for (const k of keys) for (const v of doc.get(k) ?? []) segments.push(k + '=' + escapeValue(v));
   return (bare ? '' : 'jai:') + segments.join(';');
 }

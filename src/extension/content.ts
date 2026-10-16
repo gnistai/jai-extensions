@@ -4,7 +4,7 @@
 // small control, and on the user's request renders and replaces the image
 // (spec §Replacement) while keeping the original one click away. All UI lives
 // in a closed shadow root; every document value is written as text.
-import { canonicalJSON, decode, discover, interpret, serialize, validate, validateDelivery, type Diagnostic, type Discovery, type JaiDocument } from '../jai/index.ts';
+import { QUALIFIABLE, canonicalJSON, decode, discover, interpret, serialize, validate, validateDelivery, type Diagnostic, type Discovery, type JaiDocument } from '../jai/index.ts';
 import { b64decode, b64encode, type RenderPortReply, type RenderPortRequest, type StateReply } from './shared.ts';
 
 declare global { interface Window { __jaiViewer?: { rescan(): void; list(): unknown[]; renderAll(): void; restoreAll(): void } } }
@@ -161,6 +161,9 @@ function init(): void {
       p.append(el('h3', {}, 'Shows'), el('pre', {}, it.description || '(no description)'));
       const vals = (label: string, v: string[]): void => { if (v.length) { const w = el('div', { className: 'vals' }); v.forEach(x => w.append(el('span', {}, x))); p.append(el('h3', {}, label), w); } };
       vals('Style', it.style); vals('Avoid', it.avoid); vals('Model preferences (advisory)', it.model);
+      // Per-model refinements: added only when the render uses a matching model.
+      const refinements = [...doc].filter(([k]) => k.includes('/') && QUALIFIABLE.has(k.split('/')[0] ?? '')).map(([k, v]) => `${k.replace('/', ' for ')}: ${v.join(' | ')}`);
+      vals('Only for matching models', refinements);
       const settings: string[] = [];
       if (it.aspect) settings.push(`aspect ${it.aspect.width}:${it.aspect.height}`);
       if (doc.has('mode')) settings.push(`mode ${it.mode}`);

@@ -19,7 +19,9 @@ export const WS_ONLY_RE = new RegExp(`^[${WS_CLASS}]*$`);
 const TRIM_RE = new RegExp(`^[${WS_CLASS}]+|[${WS_CLASS}]+$`, 'g');
 export const LEADING_WS_RE = new RegExp(`^[${WS_CLASS}]*`);
 
-export const KEY_SRC = '[a-z0-9][a-z0-9_-]*(?:\\.[a-z0-9][a-z0-9_-]*)*';
+export const KEY_SRC = '[a-z0-9][a-z0-9_-]*(?:\\.[a-z0-9][a-z0-9_-]*)*(?:/[a-z0-9][a-z0-9_-]*)?';
+/** Names that take a per-model target (spec §Per-model refinements). */
+export const QUALIFIABLE: ReadonlySet<string> = new Set(['prompt', 'style', 'avoid']);
 /** The key grammar (lowercase). */
 export const KEY_RE = new RegExp(`^${KEY_SRC}$`);
 
@@ -68,3 +70,8 @@ export function normalizeValue(s: string): string | null {
 }
 
 export const byCodePoint = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+/** Canonical key order after `prompt`: the qualified prompt keys, then every other key, each by code point. */
+export function orderedKeys(doc: JaiDocument): string[] {
+  const rest = [...doc.keys()].filter(k => k !== 'prompt');
+  return [...rest.filter(k => k.startsWith('prompt/')).sort(byCodePoint), ...rest.filter(k => !k.startsWith('prompt/')).sort(byCodePoint)];
+}

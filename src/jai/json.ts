@@ -1,5 +1,5 @@
 // The JSON form: reading, canonical JSON and identity.
-import { asciiLower, byCodePoint, diag, isKey, normalizeValue, type Diagnostic, type JaiDocument } from './chars.ts';
+import { asciiLower, byCodePoint, orderedKeys, diag, isKey, normalizeValue, type Diagnostic, type JaiDocument } from './chars.ts';
 import { addValue, createDocument } from './document.ts';
 
 /** ECMAScript Number::toString, as RFC 8785 §3.2.2.3 requires. */
@@ -73,7 +73,7 @@ export function canonicalJSON(doc: JaiDocument): string {
   const enc = (v: string[]): string => (v.length === 1 ? JSON.stringify(v[0]) : JSON.stringify(v));
   const prompt = doc.get('prompt');
   if (prompt) parts.push('"prompt":' + enc(prompt));
-  const keys = [...doc.keys()].filter(k => k !== 'prompt').sort(byCodePoint);
+  const keys = orderedKeys(doc);
   for (const k of keys) parts.push(JSON.stringify(k) + ':' + enc(doc.get(k) ?? []));
   return '{' + parts.join(',') + '}';
 }

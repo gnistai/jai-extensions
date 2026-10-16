@@ -11,11 +11,13 @@ Loads the built extension into Chrome for Testing (branded Chrome ignores
    renders everything, and checks replacement mechanics, accessible names,
    the AI-rendered description, layout boxes, that the plain image is untouched,
    and that the four identical documents shared **one** provider job;
+   checks that a sized box with a different `aspect` is not stretched and that
+   the flux render received only the `prompt/flux` refinement;
 4. restores originals and checks every recorded state came back;
 5. renders on `csp.html` (`img-src 'self'`) from the cache and checks the render
    is visible either in the image or through the canvas fallback.
 
-It costs one prediction (about $0.003 with FLUX.1 schnell).
+It costs two predictions on a fresh profile (about $0.006 with FLUX.1 schnell).
 
 ```sh
 npm run build

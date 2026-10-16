@@ -75,6 +75,9 @@ async function handleRender(req: RenderPortRequest, post: (m: RenderPortReply) =
     if (alt && !req.modelId) modelId = alt.id;
   }
 
+  // Per-model refinements follow the model actually used, which may differ from the matched one.
+  const merged = modelId === it.matched ? it : interpret(read.document, { catalog: catalog(s), families: FAMILIES, hasOriginal: hasInput, governingRatio: req.governingRatio, selected: modelId }).interpreted;
+
   // Cache: identity + renderer configuration + input image + top-level site (spec: Caches).
   const inputHash = req.inputImage ? await sha256Hex(b64decode(req.inputImage.b64)) : '-';
   // The ratio actually requested is part of the render configuration (spec: render cache key).
@@ -117,7 +120,7 @@ async function handleRender(req: RenderPortRequest, post: (m: RenderPortReply) =
   try {
     await countUsage();
     const intent: RenderIntent = {
-      description: it.description, style: it.style, avoid: it.avoid,
+      description: merged.description, style: merged.style, avoid: merged.avoid,
       aspect: it.aspect ? { width: it.aspect.width, height: it.aspect.height } : null,
       mode: it.mode, strength: it.strength, seed: it.seed, animate: it.animate,
     };

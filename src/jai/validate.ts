@@ -1,5 +1,5 @@
 // Advisory validator (spec §Diagnostics, validator codes).
-import { MEDIA_TYPE, SINGLE_VALUED, STANDARD_KEYS, WS_CLASS, asciiLower, diag, trim, type Diagnostic, type JaiDocument } from './chars.ts';
+import { MEDIA_TYPE, QUALIFIABLE, SINGLE_VALUED, STANDARD_KEYS, WS_CLASS, asciiLower, diag, trim, type Diagnostic, type JaiDocument } from './chars.ts';
 import { srcsetCandidates } from './html.ts';
 import { canonicalJSON } from './json.ts';
 import type { DecodeResult } from './decode.ts';
@@ -16,7 +16,9 @@ export function validate(doc: JaiDocument, info?: ParseInfo | null): Diagnostic[
   const stdset = new Set(STANDARD_KEYS);
   const utf8 = (s: string): number => new TextEncoder().encode(s).length;
   for (const [k, vals] of doc) {
-    if (!k.includes('.') && !stdset.has(k)) d.push(diag('unknown-key', k));
+    const base = k.split('/')[0] ?? k;
+    if (!base.includes('.') && !stdset.has(base)) d.push(diag('unknown-key', k));
+    if (k.includes('/') && !QUALIFIABLE.has(base)) d.push(diag('invalid-qualifier', k));
     for (const v of vals) {
       if (/[\u0000-\u0008\u000b\u000e-\u001f\u007f-\u009f]/.test(v)) d.push(diag('control-character', k));
       if (/[​-‍⁠]|.﻿/s.test(v)) d.push(diag('invisible-char', k));

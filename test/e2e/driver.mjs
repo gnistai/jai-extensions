@@ -53,7 +53,7 @@ try {
   await sleep(500);
   const list = await sw.evaluate(async id => chrome.tabs.sendMessage(id, { type: 'list' }), tabId);
   check('discovers the five carriers', list.length === 5 && [1, 2, 3, 4].every(c => list.some(i => i.carrier === c)), JSON.stringify(list.map(i => i.carrier)));
-  check('documents parsed', list.filter(i => i.jai === 'jai:A red lighthouse on a rocky island at sunset;style=watercolor').length === 4 && list.some(i => i.jai === 'jai:A red lighthouse on a rocky island at sunset;aspect=1:1;style=watercolor'));
+  check('documents parsed', list.filter(i => i.jai === 'jai:A red lighthouse on a rocky island at sunset;style=watercolor').length === 4 && list.some(i => i.jai === 'jai:A red lighthouse on a rocky island at sunset;prompt/flux=seen from the sea;prompt/sdxl=from a cliff top;aspect=1:1;style=watercolor'));
   check('no image changed before the user asks', await page.evaluate(() => [...document.images].every(i => !i.getAttribute('srcset') && !i.currentSrc.startsWith('data:image/webp'))));
 
   // Rendering is refused until the provider notice is accepted for the site.
@@ -84,6 +84,8 @@ try {
   check('identical documents shared one prediction', history.length <= 2, `${history.length} provider job(s) in this profile (4 identical + 1 distinct document)`);
   const c5 = await page.evaluate(() => { const i = document.getElementById('c5'); const r = i.getBoundingClientRect(); return { natural: i.naturalWidth / i.naturalHeight, fit: getComputedStyle(i).objectFit, box: `${r.width}x${r.height}` }; });
   check('sized 3:2 box with aspect=1:1: rendered near 3:2 and never stretched', Math.abs(Math.log(c5.natural / 1.5)) < 0.08 && c5.fit !== 'fill', JSON.stringify(c5));
+  const sent = await sw.evaluate(async () => new Promise(r => { const q = indexedDB.open('jai-viewer'); q.onsuccess = () => { const g = q.result.transaction('cache').objectStore('cache').getAll(); g.onsuccess = () => r(g.result.map(e => e.sentPrompt)); }; }));
+  check('flux render got the flux refinement only', sent.some(p => p.includes('seen from the sea')) && !sent.some(p => p.includes('cliff top')), JSON.stringify(sent));
   await page.screenshot({ path: join(out, 'after.png'), fullPage: true });
 
   await sw.evaluate(async id => chrome.tabs.sendMessage(id, { type: 'restoreAll' }), tabId);

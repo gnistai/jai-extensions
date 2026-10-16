@@ -1,5 +1,5 @@
 // Interpretation of the standard keys and model matching (spec §Interpretation, §Model matching).
-import { RASTER_TYPES, WS_CLASS, asciiLower, diag, trim, type Diagnostic, type JaiDocument } from './chars.ts';
+import { QUALIFIABLE, RASTER_TYPES, WS_CLASS, asciiLower, byCodePoint, diag, trim, type Diagnostic, type JaiDocument } from './chars.ts';
 import { parseDataURL } from './decode.ts';
 
 export interface Aspect { kind: 'ratio' | 'keyword'; width: number; height: number; keyword?: string; ratio?: number }
@@ -66,9 +66,9 @@ export function parseAspect(v: string): Aspect | null {
   return { kind: 'ratio', width: rw, height: rh, ratio: r };
 }
 
-export interface InterpretOptions { catalog?: CatalogModel[]; families?: Record<string, string[]>; hasOriginal?: boolean; governingRatio?: number | null }
+export interface InterpretOptions { catalog?: CatalogModel[]; families?: Record<string, string[]>; hasOriginal?: boolean; governingRatio?: number | null; /** A catalog id the user chose; it replaces model matching. */ selected?: string | null }
 
-export function interpret(doc: JaiDocument, { catalog = [], families = {}, hasOriginal = false, governingRatio = null }: InterpretOptions = {}): { interpreted: Interpreted; diagnostics: Diagnostic[] } {
+export function interpret(doc: JaiDocument, { catalog = [], families = {}, hasOriginal = false, governingRatio = null, selected = null }: InterpretOptions = {}): { interpreted: Interpreted; diagnostics: Diagnostic[] } {
   const diagnostics: Diagnostic[] = [];
   const out: Interpreted = { prompt: null, description: '', style: [], avoid: [], model: [], aspect: null, mode: 'generate', strength: null, seed: null, source: null, preview: null, animate: false };
   const single = (key: string): string | null => {
@@ -137,12 +137,28 @@ export function interpret(doc: JaiDocument, { catalog = [], families = {}, hasOr
     }
     out.ratio = governingRatio;
   }
+  let chosen: CatalogModel | null = null;
   if (catalog.length) {
     const needsImage = out.mode === 'transform' && (hasOriginal || out.source !== null);
-    const m = matchModel(out.model, { catalog, families, needsImage });
+    // `selected` lets a viewer impose the model the user picked; otherwise model matching decides.
+    const forced = selected ? catalog.find(m => m.id === selected) ?? null : null;
+    const m = forced ? { model: forced, diagnostics: [] as Diagnostic[] } : matchModel(out.model, { catalog, families, needsImage });
+    chosen = m.model;
     out.matched = m.model ? m.model.id : null;
     diagnostics.push(...m.diagnostics);
     if (needsImage && m.model && !(m.model.imageInput || m.model.image_input)) diagnostics.push(diag('mode-degraded', 'mode'));
+  }
+  // Per-model refinements (spec §Per-model refinements): core values, then matching qualified values.
+  if (chosen) {
+    const names = [chosen.family, chosen.id, ...(chosen.aliases ?? [])].filter((x): x is string => !!x).map(asciiLower);
+    const qualified = [...doc.keys()].filter(k => k.includes('/')).sort(byCodePoint);
+    for (const base of QUALIFIABLE) {
+      const extra = qualified.filter(k => k.startsWith(base + '/') && names.includes(k.slice(base.length + 1))).flatMap(k => doc.get(k) ?? []);
+      if (!extra.length) continue;
+      if (base === 'prompt') { out.prompt = [...(out.prompt ?? []), ...extra]; out.description = out.prompt.join('\n'); }
+      else if (base === 'style') out.style = [...out.style, ...extra];
+      else out.avoid = [...out.avoid, ...extra];
+    }
   }
   return { interpreted: out, diagnostics };
 }
