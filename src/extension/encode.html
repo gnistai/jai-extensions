@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JAI encoder</title>
+<link rel="stylesheet" href="ui.css">
+<style>
+body{max-width:980px;margin:0 auto;padding:20px 16px 60px}
+.drop{border:2px dashed var(--border);border-radius:12px;padding:18px;text-align:center}
+.drop.over{border-color:var(--accent);background:var(--accent-soft)}
+#preview{max-width:240px;max-height:240px;border-radius:8px;display:block;margin:10px auto 0}
+fieldset{border:0;padding:0;margin:8px 0}
+legend{font-weight:600;margin-bottom:4px}
+.models label{display:flex;gap:8px;align-items:baseline;margin:4px 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:4px 16px}
+.gen{margin:14px 0}
+.gen h3{font-size:14px;margin:0 0 6px}
+.cands{display:flex;flex-wrap:wrap;gap:10px}
+.cand{background:var(--raised);border:1px solid var(--border);border-radius:10px;padding:6px;width:min(100%,300px)}
+.cand.best{border:2px solid var(--accent)}
+.cand .imgs{display:flex;gap:4px}
+.cand figure{margin:0;flex:1;min-width:0}
+.cand img{width:100%;border-radius:6px;display:block}
+.cand figcaption{font-size:12px;color:var(--muted)}
+.cand p{font-size:12px;margin:4px 0 0;max-height:7.5em;overflow:auto}
+#log{max-height:180px;overflow:auto;font-size:13px;margin:0;padding-left:18px}
+#spend{font-variant-numeric:tabular-nums}
+</style>
+</head>
+<body>
+<h1>JAI encoder</h1>
+<p class="muted" style="margin-top:0">Turns an image into a JAI description by analysis by synthesis: a vision model describes the image, your chosen image models render the description, the renders are compared with the original, and the description is revised until the renders match as closely as the budget allows.</p>
+<div id="token-note" class="notice" hidden>No Replicate token yet. <a href="#" id="open-options">Open the options</a> to add one.</div>
+
+<div class="card">
+  <h2 style="margin-top:0">1. Image</h2>
+  <div class="drop" id="drop">
+    <p style="margin:0">Drop an image here, or <label style="display:inline;color:var(--accent);text-decoration:underline;cursor:pointer">choose a file<input type="file" id="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" hidden></label>.</p>
+    <div id="src-row" class="row" hidden style="justify-content:center;margin-top:8px"><button type="button" id="load-src" class="secondary">Load the image you right-clicked</button></div>
+    <img id="preview" alt="" hidden>
+    <div id="dims" class="muted"></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">2. Settings</h2>
+  <fieldset class="models"><legend>Target models</legend><div id="models"></div></fieldset>
+  <div class="grid">
+    <label>Spending limit (USD) <input type="number" id="budget" min="0.05" max="5" step="0.05" value="0.50"></label>
+    <label>Candidates per generation <input type="number" id="population" min="2" max="6" step="1" value="4"></label>
+    <label>Generations <input type="number" id="generations" min="1" max="10" step="1" value="5"></label>
+    <label>Analyst <select id="analyst"><option value="gemini">Google Gemini 2.5 Flash</option><option value="claude">Anthropic Claude Sonnet 4.5</option></select></label>
+  </div>
+  <label><input type="checkbox" id="judge" checked> Let the analyst rate renders as well (more faithful, one extra call per model and generation)</label>
+  <p class="notice" id="consent-text">Encoding sends a copy of this image, at most 1024 pixels on its longest side and without metadata, to Replicate. Replicate runs the analyst, a CLIP model and the image models you chose, under your account. The limit is enforced from price estimates; Replicate bills actual usage.</p>
+  <label><input type="checkbox" id="consent"> I understand</label>
+  <div class="row">
+    <button type="button" id="start" disabled>Encode</button>
+    <button type="button" id="cancel" class="secondary" disabled>Cancel</button>
+    <span id="spend" class="muted" aria-live="polite"></span>
+  </div>
+</div>
+
+<div class="card" id="progress-card" hidden>
+  <h2 style="margin-top:0">3. Progress</h2>
+  <ol id="log" aria-live="polite"></ol>
+  <div id="gens"></div>
+</div>
+
+<div class="card" id="result-card" hidden>
+  <h2 style="margin-top:0">4. Result</h2>
+  <pre id="result-text"></pre>
+  <div class="row"><button type="button" id="copy">Copy</button><button type="button" id="download" class="secondary">Download .jai</button></div>
+  <table id="ranking" style="margin-top:10px"></table>
+  <p class="muted" id="result-note"></p>
+</div>
+<script type="module" src="encode.js"></script>
+</body>
+</html>

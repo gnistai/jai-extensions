@@ -1,8 +1,17 @@
-# JAI tools — reference viewer and TypeScript library
+# JAI tools — reference viewer, encoder and TypeScript library
 
-The reference viewer for [JAI (Just AI Images)](https://jai.gnist.ai/), an
-open standard for images stored as a description instead of pixels. This
-repository holds:
+Reference tools for [JAI (Just AI Images)](https://jai.gnist.ai/), an open
+standard for images stored as a description instead of pixels. This repository
+holds four layers, each depending only on the ones above it:
+
+| Layer | Where | What |
+|---|---|---|
+| Library | `src/jai/` | Format logic only: no network, no rendering |
+| Engines | `src/providers/`, `src/renderers/`, `src/encoder/` | UI-free and environment-neutral: Replicate client, renderer, encoder loop |
+| Apps | `src/extension/`, `bin/jai.mjs` | The Chrome extension (viewer and encode page) and the command line |
+| Tests | `test/` | Unit tests with mocked providers, the spec's conformance suite, end to end in Chrome |
+
+In detail:
 
 - **`src/jai/`** — a dependency-free TypeScript library for JAI: parsing,
   canonical serialisation, JSON and `.jai` files, `data:` URLs, HTML
@@ -10,8 +19,14 @@ repository holds:
   specification's full conformance suite.
 - **`src/renderers/`** — a provider-independent renderer interface and the
   Replicate adapter.
+- **`src/encoder/`** — the image encoder engine: image to JAI by analysis by
+  synthesis, with pluggable analyst, scorer and renderer, hard budgets and
+  per-model refinements (`prompt/<target>`).
 - **`src/extension/`** — a Chrome Manifest V3 extension that finds JAI images on
-  web pages and renders them with your own Replicate account, when you ask.
+  web pages and renders them with your own Replicate account, when you ask, and
+  an **encode page** that turns an image into JAI.
+- **`bin/jai.mjs`** — a command-line app: `jai encode`, `jai render`,
+  `jai validate`.
 
 The [specification and its conformance fixtures](https://github.com/gnistai/jai)
 are authoritative; this extension demonstrates them and must not be read as
@@ -33,6 +48,48 @@ the definition of the format.
 Per site you can choose *render when I ask* (the default), *render visible JAI
 images automatically* (needs permission for that site, and respects your page
 and daily limits), or *ignore JAI here*.
+
+## Encoding images
+
+The encoder turns an existing image into a JAI document that your chosen models
+reproduce as closely as possible. It follows the specification's informative
+section [Encoding images](https://jai.gnist.ai/spec/#image-encoding):
+
+1. A vision model (Gemini 2.5 Flash by default, or Claude Sonnet 4.5) writes
+   several first descriptions.
+2. Every candidate is rendered with every target model, with fixed seeds.
+3. Each render is scored: CLIP image-embedding similarity, a coarse colour and
+   layout distance between thumbnails, and the vision model's own rating. The
+   current best is rated again in every call, because the ratings are noisy.
+   A candidate's fitness blends its mean and its worst per-model score, so the
+   core description cannot sacrifice one model.
+4. The vision model lists the differences between the best renders and the
+   original and writes revised descriptions. This repeats for a number of
+   generations or until scores stop improving.
+5. For models that still lag, it tries short `prompt/<target>` refinements and
+   keeps one only if it raises that model's score. It skips models whose
+   prompt window the core already fills.
+6. It stops at the spending limit, which it enforces from price estimates
+   before every call. The result is the best document plus a report.
+
+From the command line (reads `REPLICATE_API_TOKEN`):
+
+```sh
+npm install && npm run build
+node bin/jai.mjs encode photo.jpg --models flux-schnell,sdxl --budget 0.50
+# writes photo.jai and photo.jai.report/ (report.json and an HTML contact sheet)
+node bin/jai.mjs render photo.jai --model sdxl --out check.webp
+node bin/jai.mjs validate "jai:A castle;prompt/flux=at dusk"
+```
+
+In the extension, open **Encode** from the popup or right-click an image and
+choose **Encode this image as JAI**. The page runs the same engine. Every
+provider call goes through the background worker, which holds the token and
+accepts only the encoder's allow-listed models from the encode page itself.
+
+A typical run for two models, four candidates and six generations costs
+roughly $0.20 to $0.40 and takes five to eight minutes. See the
+[Earthrise example](https://jai.gnist.ai/examples/#encoding).
 
 ## Install
 
@@ -71,6 +128,10 @@ you want.
   The extension caps renders per page, per day and in parallel, caches
   results, shares one job between identical images, and cancels provider jobs
   when you cancel or leave the page.
+- **Encoding sends your image to Replicate.** The encode page and the CLI send
+  a copy, at most 1024 pixels on its longest side and without metadata, to the
+  vision model and to CLIP on Replicate. Nothing is sent until you consent and
+  start, and the spending limit is enforced before every call.
 - **Bandwidth.** The browser has usually already downloaded the original image
   before the extension sees the page, so rendering does not save bandwidth.
 
@@ -100,8 +161,9 @@ npm run conformance    # conformance only; uses ../jai, $JAI_SPEC_DIR, or clones
 `test/e2e/` contains an end-to-end test that loads the built extension into
 Chrome for Testing, saves a token through the options page, renders a test
 page with all four carriers, and checks replacement, accessibility, restore,
-de-duplication and a strict-CSP page. It renders one real image. See
-[`test/e2e/README.md`](test/e2e/README.md).
+de-duplication and a strict-CSP page, checks that content scripts cannot use
+the encoder's port, and runs a tiny real encode on the encode page. It costs
+about $0.03. See [`test/e2e/README.md`](test/e2e/README.md).
 
 ### Adding a renderer
 

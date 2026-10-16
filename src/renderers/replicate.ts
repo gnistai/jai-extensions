@@ -4,9 +4,10 @@
 // nothing from the document can choose an endpoint, a model outside this list,
 // safety settings, output counts or weights (spec: selectors, never locators).
 import { assemblePrompt, nearestAspect, ratioOf } from './prompt.ts';
+import { HttpReplicateClient, type FetchLike, type ReplicateClient } from '../providers/replicate-client.ts';
 import { RenderError, type ModelInfo, type RenderDiagnostic, type RenderRequest, type RenderResult, type Renderer } from './types.ts';
 
-interface ReplicateModel extends ModelInfo {
+export interface ReplicateModel extends ModelInfo {
   /** owner/name of an official model, called through /models/{id}/predictions */
   official: boolean;
   /** pinned version for community models */
@@ -120,67 +121,24 @@ export function buildInput(model: ReplicateModel, req: RenderRequest, opts: { fo
   return { input, shown, diagnostics, prompt: assembled.prompt, negative: assembled.negative };
 }
 
-type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
-
-interface Prediction { id: string; status: string; output?: unknown; error?: unknown; version?: string; urls?: { cancel?: string } }
-
 export class ReplicateRenderer implements Renderer {
   readonly id = 'replicate';
   readonly label = 'Replicate';
-  constructor(private readonly token: string, private readonly opts: { foldAvoid: boolean; fetch?: FetchLike; pollMs?: number; timeoutMs?: number } = { foldAvoid: true }) {}
+  private readonly client: ReplicateClient;
+  /** Pass a token (direct HTTP) or a ReplicateClient (for example one that proxies through the extension background). */
+  constructor(tokenOrClient: string | ReplicateClient, private readonly opts: { foldAvoid: boolean; fetch?: FetchLike; pollMs?: number; timeoutMs?: number } = { foldAvoid: true }) {
+    this.client = typeof tokenOrClient === 'string' ? new HttpReplicateClient(tokenOrClient, { fetch: opts.fetch, pollMs: opts.pollMs, timeoutMs: opts.timeoutMs }) : tokenOrClient;
+  }
 
   models(): ModelInfo[] { return REPLICATE_MODELS; }
 
   private get fetch(): FetchLike { return this.opts.fetch ?? ((u, i) => fetch(u, i)); }
 
-  private async api<T>(path: string, init: RequestInit = {}, signal?: AbortSignal): Promise<T> {
-    let res: Response;
-    try {
-      res = await this.fetch('https://api.replicate.com/v1' + path, {
-        ...init, signal, referrerPolicy: 'no-referrer', credentials: 'omit',
-        headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json', ...(init.headers as Record<string, string> | undefined) },
-      });
-    } catch (e) {
-      if ((e as Error).name === 'AbortError') throw new RenderError('Canceled', 'canceled');
-      throw new RenderError('Network error contacting Replicate', 'network');
-    }
-    const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-    if (res.status === 401 || res.status === 403) throw new RenderError('Replicate rejected the API token', 'auth');
-    if (!res.ok) throw new RenderError(`Replicate error ${res.status}: ${String(body.detail ?? body.title ?? '')}`.trim(), res.status === 422 ? 'refused' : 'provider');
-    return body as T;
-  }
-
-  async cancel(id: string): Promise<void> {
-    try { await this.api(`/predictions/${encodeURIComponent(id)}/cancel`, { method: 'POST' }); } catch { /* best effort */ }
-  }
-
   async render(req: RenderRequest): Promise<RenderResult> {
     const model = REPLICATE_MODELS.find(m => m.id === req.modelId);
     if (!model) throw new RenderError(`Model ${req.modelId} is not supported by this renderer`, 'config');
     const built = buildInput(model, req, { foldAvoid: this.opts.foldAvoid });
-    const path = model.official ? `/models/${model.id}/predictions` : '/predictions';
-    const payload = model.official ? { input: built.input } : { version: model.version, input: built.input };
-    req.onStatus?.('starting');
-    let p = await this.api<Prediction>(path, { method: 'POST', body: JSON.stringify(payload), headers: { Prefer: 'wait=5' } }, req.signal);
-    const started = Date.now();
-    const onAbort = (): void => { void this.cancel(p.id); };
-    req.signal?.addEventListener('abort', onAbort, { once: true });
-    try {
-      while (!['succeeded', 'failed', 'canceled'].includes(p.status)) {
-        if (req.signal?.aborted) throw new RenderError('Canceled', 'canceled', p.id);
-        if (Date.now() - started > (this.opts.timeoutMs ?? 180_000)) { void this.cancel(p.id); throw new RenderError('Timed out', 'timeout', p.id); }
-        req.onStatus?.(p.status);
-        await new Promise(r => setTimeout(r, this.opts.pollMs ?? 1500));
-        p = await this.api<Prediction>(`/predictions/${encodeURIComponent(p.id)}`, {}, req.signal);
-      }
-    } finally {
-      req.signal?.removeEventListener('abort', onAbort);
-    }
-    if (p.status === 'canceled') throw new RenderError('Canceled', 'canceled', p.id);
-    if (p.status === 'failed') {
-      const msg = String(p.error ?? 'failed');
-      throw new RenderError(msg, /nsfw|safety|flagged|content/i.test(msg) ? 'refused' : 'provider', p.id);
-    }
+    const p = await this.client.predict(model.official ? { id: model.id } : { id: model.id, version: model.version }, built.input, { signal: req.signal, onStatus: req.onStatus });
     const url = Array.isArray(p.output) ? p.output[0] : p.output;
     if (typeof url !== 'string' || !/^https:\/\//.test(url)) throw new RenderError('Replicate returned no image', 'provider', p.id);
     req.onStatus?.('downloading');
@@ -191,7 +149,7 @@ export class ReplicateRenderer implements Renderer {
     const bytes = new Uint8Array(await res.arrayBuffer());
     const mime = sniffImage(bytes);
     if (!mime) throw new RenderError('The provider returned something that is not an image', 'provider', p.id);
-    return { bytes, mime, model: model.id, sentPrompt: built.prompt, sentNegative: built.negative, sentInput: built.shown, jobId: p.id, diagnostics: built.diagnostics };
+    return { bytes, mime, model: model.id, sentPrompt: built.prompt, sentNegative: built.negative, sentInput: built.shown, jobId: p.id, diagnostics: built.diagnostics, outputURL: url, predictSeconds: p.metrics?.predict_time ?? null };
   }
 }
 

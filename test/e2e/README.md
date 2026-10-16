@@ -15,9 +15,13 @@ Loads the built extension into Chrome for Testing (branded Chrome ignores
    the flux render received only the `prompt/flux` refinement;
 4. restores originals and checks every recorded state came back;
 5. renders on `csp.html` (`img-src 'self'`) from the cache and checks the render
-   is visible either in the image or through the canvas fallback.
+   is visible either in the image or through the canvas fallback;
+6. checks that a content script cannot use the encoder's provider port;
+7. opens the encode page, checks that it needs consent, and runs a tiny real
+   encode (one generation of two candidates with FLUX.1 schnell, no judge,
+   limit $0.05).
 
-It costs two predictions on a fresh profile (about $0.006 with FLUX.1 schnell).
+It costs about $0.03 on a fresh profile: two FLUX.1 schnell renders for the viewer, and one Gemini call, two renders and three CLIP embeddings for the encoder.
 
 ```sh
 npm run build

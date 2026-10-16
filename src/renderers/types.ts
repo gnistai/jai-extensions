@@ -51,6 +51,10 @@ export interface RenderResult {
   sentInput: Record<string, unknown>;
   jobId: string | null;
   diagnostics: RenderDiagnostic[];
+  /** Where the provider published the output, if it did (short-lived; never shown to pages). */
+  outputURL?: string | null;
+  /** Provider-reported compute time in seconds, if known. */
+  predictSeconds?: number | null;
 }
 
 export interface ModelInfo {

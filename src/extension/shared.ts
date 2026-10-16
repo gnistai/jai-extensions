@@ -98,3 +98,15 @@ export const b64encode = (bytes: Uint8Array): string => {
 };
 export const b64decode = (s: string): Uint8Array => Uint8Array.from(atob(s), c => c.charCodeAt(0));
 export const today = (): string => new Date().toISOString().slice(0, 10);
+
+// ---------------------------------------------------------------- encoder port
+// The encode page runs the encoder engine; the background, which alone holds
+// the token, runs each Replicate prediction for it, for allow-listed models only.
+export interface EncodeModelRef { id: string; version?: string }
+export type EncodePortRequest =
+  | { type: 'predict'; id: number; model: EncodeModelRef; input: Record<string, unknown> }
+  | { type: 'cancel'; id: number };
+export type EncodePortReply =
+  | { type: 'status'; id: number; status: string }
+  | { type: 'result'; id: number; prediction: { id: string; status: string; output: unknown; metrics?: Record<string, unknown> } }
+  | { type: 'error'; id: number; kind: string; message: string; jobId: string | null };

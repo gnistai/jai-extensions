@@ -1,8 +1,9 @@
 // End-to-end test of the JAI reference viewer in real Chrome.
 // Run with Node next to Chrome (puppeteer-core):
 //   node driver.mjs <chrome.exe> <unpacked-extension-dir> <base-url> <env-file-with-REPLICATE_API_TOKEN> <out-dir>
-// It renders ONE real image (identical documents on the page share one job via
-// the viewer's in-flight de-duplication and cache), so it costs one prediction.
+// It renders two real images (identical documents on the page share one job via
+// the viewer's in-flight de-duplication and cache) and runs one tiny encode:
+// about $0.03 in all.
 import puppeteer from 'puppeteer-core';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -111,6 +112,39 @@ try {
   const cspState = await csp.evaluate(() => { const i = document.getElementById('c2'); return { viaImg: /^data:image\//.test(i.currentSrc) && i.naturalWidth > 0, viaCanvas: !!document.querySelector('canvas[role=img]') && i.style.display === 'none' }; });
   check('strict CSP page: render visible (image or canvas fallback)', cspState.viaImg || cspState.viaCanvas, JSON.stringify(cspState));
   await csp.screenshot({ path: join(out, 'csp.png') });
+
+  // A content script must not be able to use the encoder's provider port.
+  const portProbe = await sw.evaluate(async id => (await chrome.scripting.executeScript({ target: { tabId: id }, func: () => new Promise(res => {
+    const p = chrome.runtime.connect({ name: 'encode' });
+    let replied = false;
+    p.onMessage.addListener(() => { replied = true; });
+    p.onDisconnect.addListener(() => res({ disconnected: true, replied }));
+    p.postMessage({ type: 'predict', id: 1, model: { id: 'black-forest-labs/flux-schnell' }, input: { prompt: 'x' } });
+    setTimeout(() => res({ disconnected: false, replied }), 3000);
+  }) }))[0].result, cspTab);
+  check('content scripts cannot use the encoder port', portProbe.disconnected && !portProbe.replied, JSON.stringify(portProbe));
+
+  // Encode page: a tiny real run (one generation of two candidates, FLUX schnell, no judge): about $0.02.
+  const png = Buffer.from(await (await fetch(`${base}/original.png`)).arrayBuffer());
+  writeFileSync(join(out, 'encode-target.png'), png);
+  const enc = await browser.newPage();
+  await enc.setViewport({ width: 1000, height: 1400 });
+  await enc.goto(`chrome-extension://${extId}/encode.html`);
+  await (await enc.$('#file')).uploadFile(join(out, 'encode-target.png'));
+  await enc.waitForFunction(() => /pixels/.test(document.getElementById('dims').textContent), { timeout: 10000 });
+  check('encode page: start needs consent', await enc.$eval('#start', b => b.disabled));
+  await enc.click('#consent');
+  await enc.$eval('#budget', i => { i.value = '0.05'; });
+  await enc.$eval('#population', i => { i.value = '2'; });
+  await enc.$eval('#generations', i => { i.value = '1'; });
+  await enc.click('#judge');
+  await enc.click('#start');
+  await enc.waitForFunction(() => !document.getElementById('result-card').hidden || /Encoding failed/.test(document.getElementById('log').textContent), { timeout: 240000 });
+  const encState = await enc.evaluate(() => ({ text: document.getElementById('result-text').textContent, note: document.getElementById('result-note').textContent, log: document.getElementById('log').textContent, renders: document.querySelectorAll('.cand img').length }));
+  check('encode page: tiny real run returns a JAI document', /^jai:.+;aspect=3:2;(?:.*;)?model=black-forest-labs\/flux-schnell(?:;|$)/.test(encState.text) && encState.renders === 2, JSON.stringify(encState).slice(0, 400));
+  const spent = Number(/\$(\d+\.\d+) in/.exec(encState.note)?.[1] ?? NaN);
+  check('encode page: estimated spend within the limit', spent > 0 && spent <= 0.05, encState.note);
+  await enc.screenshot({ path: join(out, 'encode.png'), fullPage: true });
 } catch (e) {
   check('driver', false, String(e && e.stack || e));
 } finally {

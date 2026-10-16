@@ -6,9 +6,10 @@
 // chooses among the models the user enabled, renders, and returns bytes.
 import { identity, interpret, readJSON, sha256Hex, type CatalogModel } from '../jai/index.ts';
 import { FAMILIES, REPLICATE_MODELS, ReplicateRenderer } from '../renderers/replicate.ts';
+import { HttpReplicateClient, type ModelRef } from '../providers/replicate-client.ts';
 import { RenderError, type RenderIntent } from '../renderers/types.ts';
 import { idbAll, idbClear, idbDelete, idbGet, idbSet } from './idb.ts';
-import { b64decode, b64encode, getSettings, saveSettings, siteMode, today, type BgRequest, type RenderPortReply, type RenderPortRequest, type Settings, type StateReply } from './shared.ts';
+import { b64decode, b64encode, getSettings, saveSettings, siteMode, today, type BgRequest, type EncodePortReply, type EncodePortRequest, type RenderPortReply, type RenderPortRequest, type Settings, type StateReply } from './shared.ts';
 
 // ---------------------------------------------------------------- token
 
@@ -149,7 +150,52 @@ async function handleRender(req: RenderPortRequest, post: (m: RenderPortReply) =
   }
 }
 
+// ---------------------------------------------------------------- encoder port
+
+/** Models the encode page may run: the renderers, the analysts and the scorer, pinned where community. */
+const ENCODER_MODELS: ModelRef[] = [
+  ...REPLICATE_MODELS.map(m => (m.official ? { id: m.id } : { id: m.id, version: m.version })),
+  { id: 'google/gemini-2.5-flash' },
+  { id: 'anthropic/claude-4.5-sonnet' },
+  { id: 'krthr/clip-embeddings', version: '1c0371070cb827ec3c7f2f28adcdde54b50dcd239aa6faea0bc98b174ef03fb4' },
+];
+const allowedModel = (m: { id?: unknown; version?: unknown }): ModelRef | null =>
+  ENCODER_MODELS.find(a => a.id === m.id && (a.version ?? null) === (m.version ?? null)) ?? null;
+
+function handleEncodePort(port: chrome.runtime.Port): void {
+  const jobs = new Map<number, AbortController>();
+  let open = true;
+  const post = (m: EncodePortReply): void => { if (open) port.postMessage(m); };
+  port.onDisconnect.addListener(() => { open = false; for (const ac of jobs.values()) ac.abort(); jobs.clear(); });
+  port.onMessage.addListener((msg: EncodePortRequest) => {
+    if (msg?.type === 'cancel') { jobs.get(msg.id)?.abort(); return; }
+    if (msg?.type !== 'predict' || typeof msg.id !== 'number' || jobs.has(msg.id)) return;
+    const model = allowedModel(msg.model ?? {});
+    if (!model) return post({ type: 'error', id: msg.id, kind: 'config', message: 'That model is not available to the encoder.', jobId: null });
+    if (!msg.input || typeof msg.input !== 'object' || Array.isArray(msg.input)) return post({ type: 'error', id: msg.id, kind: 'config', message: 'Invalid input.', jobId: null });
+    const ac = new AbortController();
+    jobs.set(msg.id, ac);
+    void (async () => {
+      const token = await getToken();
+      if (!token) return post({ type: 'error', id: msg.id, kind: 'auth', message: 'Add your Replicate API token in the extension options first.', jobId: null });
+      try {
+        const p = await new HttpReplicateClient(token).predict(model, msg.input, { signal: ac.signal, onStatus: status => post({ type: 'status', id: msg.id, status }) });
+        post({ type: 'result', id: msg.id, prediction: { id: p.id, status: p.status, output: p.output, metrics: p.metrics } });
+      } catch (e) {
+        const err = e as RenderError;
+        post({ type: 'error', id: msg.id, kind: err.kind ?? 'provider', message: err.message, jobId: err.jobId ?? null });
+      } finally { jobs.delete(msg.id); }
+    })();
+  });
+}
+
 chrome.runtime.onConnect.addListener(port => {
+  if (port.name === 'encode') {
+    // Only the extension's own encode page; content scripts report the web page's URL.
+    const page = port.sender?.url?.split(/[?#]/)[0];
+    if (port.sender?.id !== chrome.runtime.id || page !== chrome.runtime.getURL('encode.html')) return port.disconnect();
+    return handleEncodePort(port);
+  }
   if (port.name !== 'render' || !port.sender?.tab) return port.disconnect();
   const ac = new AbortController();
   let open = true;
@@ -179,7 +225,15 @@ async function syncRegistrations(): Promise<void> {
   }
 }
 chrome.runtime.onStartup.addListener(() => { void syncRegistrations(); });
-chrome.runtime.onInstalled.addListener(() => { void syncRegistrations(); });
+chrome.runtime.onInstalled.addListener(() => {
+  void syncRegistrations();
+  chrome.contextMenus.create({ id: 'jai-encode', title: 'Encode this image as JAI…', contexts: ['image'] }, () => void chrome.runtime.lastError);
+});
+chrome.contextMenus.onClicked.addListener(info => {
+  if (info.menuItemId !== 'jai-encode') return;
+  const src = info.srcUrl && /^(https?|data):/i.test(info.srcUrl) ? info.srcUrl : '';
+  void chrome.tabs.create({ url: chrome.runtime.getURL('encode.html') + (src ? `#src=${encodeURIComponent(src)}` : '') });
+});
 chrome.permissions.onRemoved.addListener(() => { void syncRegistrations(); });
 
 // ---------------------------------------------------------------- messages

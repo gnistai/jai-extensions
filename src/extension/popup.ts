@@ -5,6 +5,8 @@ import type { SiteMode, StateReply } from './shared.ts';
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
 const send = <T>(m: unknown): Promise<T> => chrome.runtime.sendMessage(m) as Promise<T>;
 
+document.getElementById('encode-link')?.addEventListener('click', e => { e.preventDefault(); void chrome.tabs.create({ url: chrome.runtime.getURL('encode.html') }); });
+
 async function main(): Promise<void> {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id || !tab.url || !/^https?:/.test(tab.url)) { $('list').textContent = 'JAI works on http and https pages.'; return; }
