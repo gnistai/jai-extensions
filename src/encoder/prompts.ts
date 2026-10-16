@@ -1,6 +1,6 @@
 // Instructions for the analyst. They condense the JAI authoring guidance
 // (spec: Writing JAI by hand; skills/jai/SKILL.md) and the encoder's task.
-import type { Draft, RenderView } from './types.ts';
+import type { Draft, Observation, ProposeContext } from './types.ts';
 
 export const SYSTEM = `You write JAI image descriptions. A JAI description is plain natural-language text that text-to-image models render. Your job is compression: given a target image, write text from which the named image models reproduce the target as closely as possible.
 
@@ -10,7 +10,7 @@ Rules:
 - Describe only what is visible. Concrete nouns, digits for counts, plain spatial words.
 - When the size or position of a main subject matters, state it concretely as a share of the frame: "small, about one sixth of the frame width, just right of centre, halfway up". Image models ignore vague words like "small" or "distant".
 - Start with the medium ("Photograph of...", "Watercolour painting of...").
-- One paragraph, 40 to 120 words. No lists, no headings, no line breaks.
+- One paragraph, no lists, no headings, no line breaks; keep within the word limit given in the task.
 - Put the essentials (medium, main subject with its size and position, setting, dominant colours) in the first 50 words: some models read only about the first 60 words.
 - Literal text visible in the image goes in straight double quotes, exactly as spelled, only if legible.
 - People: describe appearance, clothing, pose and expression generically. Never name or guess the identity of a real person, and do not describe anyone as a celebrity or public figure.
@@ -21,39 +21,75 @@ Rules:
 
 Answer with one JSON object only, no Markdown fences.`;
 
+const draftShapeD = '{"prompt": string, "style": [string], "avoid": [string]}';
+
+export function describePrompt(n: number, models: string[], maxWords = 120): string {
+  return `The image is the target. The models that will render your text: ${models.join(', ')}.
+Write ${n} different candidate descriptions, each at most ${maxWords} words (a model reads only that much; words beyond it are lost). All must be faithful; vary emphasis, order and wording so that they explore different ways to make the models reproduce the target.
+Answer: {"notes": string (one sentence on what is hardest to reproduce), "drafts": [${draftShapeD}, ...${n} items]}`;
+}
+
+export const INSPECT_SYSTEM = `You measure images for layout comparison. You report what is visible, with bounding boxes as box_2d [ymin, xmin, ymax, xmax] in integers from 0 to 1000 (0,0 is the top left). Be precise: boxes tight around each subject. Answer with one JSON object only, no Markdown fences.`;
+
+const OBS_SHAPE = '"horizon_y": integer 0-1000 or null (where the horizon or the line between ground and sky is, 0 = top, measured at the middle of the frame), "horizon_shape": "flat", "curved" or null, "camera": short phrase (angle and distance), "lighting": short phrase, "medium": short phrase (photograph, oil painting, 3D render, ...)';
+
+export function inspectTargetPrompt(): string {
+  return `List the 1 to 5 most important visible subjects or regions, most important first (people, animals, objects, buildings, a planet, the ground or sea when it defines the composition). Name each with a short generic noun phrase that would let someone find it again in a similar picture ("red bicycle", "lunar surface").
+Answer: {"subjects": [{"name": string, "box_2d": [ymin, xmin, ymax, xmax]}], ${OBS_SHAPE}}`;
+}
+
+export function inspectRenderPrompt(subjects: string[]): string {
+  return `Find each of these in the image: ${subjects.map((x, i) => `${i + 1}. ${x}`).join('; ')}. For each, give its box, or null when it is not visible. Use the names exactly as given, in the same order.
+Answer: {"subjects": [{"name": string, "box_2d": [ymin, xmin, ymax, xmax] or null}], ${OBS_SHAPE}}`;
+}
+
+const clamp01 = (x: unknown): number | null => (typeof x === 'number' && Number.isFinite(x) ? Math.min(1, Math.max(0, x / 1000)) : null);
+
+/** Validate an inspection answer into an Observation; subjects follow `expected` when given. */
+export function toObservation(a: Record<string, unknown>, expected: string[] | null): Observation {
+  const raw = Array.isArray(a.subjects) ? a.subjects : [];
+  const parsed = raw.map(s => {
+    const o = (s ?? {}) as Record<string, unknown>;
+    const name = typeof o.name === 'string' ? cleanText(o.name, 60) : '';
+    const b = Array.isArray(o.box_2d) && o.box_2d.length === 4 ? o.box_2d.map(clamp01) : null;
+    const box = b && b.every(x => x !== null) && b[2]! > b[0]! && b[3]! > b[1]! ? { ymin: b[0]!, xmin: b[1]!, ymax: b[2]!, xmax: b[3]! } : null;
+    return { name, box };
+  }).filter(s => s.name);
+  const subjects = expected
+    ? expected.map((name, i) => ({ name, box: (parsed.find(p => p.name.toLowerCase() === name.toLowerCase()) ?? parsed[i])?.box ?? null }))
+    : parsed.slice(0, 5);
+  const text = (v: unknown): string => (typeof v === 'string' ? cleanText(v, 80) : '');
+  const shape = typeof a.horizon_shape === 'string' && /^(flat|curved)$/i.test(a.horizon_shape.trim()) ? a.horizon_shape.trim().toLowerCase() : '';
+  return { subjects, horizon: clamp01(a.horizon_y), horizonShape: shape, camera: text(a.camera), lighting: text(a.lighting), medium: text(a.medium) };
+}
+
 const draftShape = '{"prompt": string, "style": [string], "avoid": [string]}';
 
-export function describePrompt(n: number, models: string[]): string {
-  return `The image is the target. The models that will render your text: ${models.join(', ')}.
-Write ${n} different candidate descriptions. All must be faithful; vary emphasis, order and wording so that they explore different ways to make the models reproduce the target.
-Answer: {"notes": string (one sentence on what is hardest to reproduce), "drafts": [${draftShape}, ...${n} items]}`;
-}
+/** The optimiser's prompt (OPRO-style): target measurements, the scored history with measured errors, and its own notes. */
+export function proposePrompt(ctx: ProposeContext, targetText: string): string {
+  const rows = ctx.history.map((h, i) => {
+    const what = h.addition !== undefined ? `addition: "${h.addition}"` : `description: ${JSON.stringify(h.draft)}`;
+    const fb = Object.entries(h.feedback).map(([m, f]) => `   ${m}: ${f}`).join('\n');
+    return `#${i + 1} score ${h.fitness.toFixed(3)} — ${what}\n${fb}`;
+  }).join('\n');
+  const common = `The attached image is the target. Its measured layout:
+${targetText}
 
-export function revisePrompt(current: Draft, renders: RenderView[], n: number): string {
-  const list = renders.map((r, i) => `Image ${i + 2}: rendered by ${r.label} (similarity ${r.score.toFixed(3)})`).join('\n');
-  return `Image 1 is the target. The other images were rendered from this description:
-${JSON.stringify(current)}
-${list}
-First list the most important visible differences between the renders and the target (subject, counts, composition, sizes and positions as shares of the frame, colours, light, style). Then write ${n} revised descriptions that fix those differences while keeping everything that already matches. Change what is wrong; do not rewrite what works.
-Answer: {"notes": string (the differences, most important first, one line), "drafts": [${draftShape}, ...${n} items]}`;
-}
+Rendering models: ${ctx.models.join(', ')}.
+${ctx.history.length ? `Earlier attempts, best first, with the measured differences of their renders from the target (score 0 to 1, higher is closer):\n${rows}` : 'No attempts yet.'}
+${ctx.notes ? `Your notes from earlier rounds: ${ctx.notes}` : ''}`;
+  if (ctx.scope.kind === 'refine') {
+    return `${common}
 
-export function refinePrompt(core: Draft, render: RenderView, n: number): string {
-  return `Image 1 is the target. Image 2 was rendered by ${render.label} from this description:
-${JSON.stringify(core)}
-Other models already reproduce the target well from this description, so do not change it. Write ${n} alternative short additions, one descriptive sentence each and at most 25 words, that will be appended to the description for ${render.label} only and correct its most important remaining differences. Each addition describes the picture (sizes, positions, colours, light) as the description does; it never gives instructions and never contradicts the description.
-Answer: {"notes": string (the remaining differences, one line), "additions": [string, ...${n} items]}`;
-}
+The core description works well for most models:
+${JSON.stringify(ctx.scope.core)}
+Write ${ctx.n} different short additions (one or two descriptive sentences each) that will be appended to it for ${ctx.scope.model} only, to fix that model's measured differences. Describe the picture; never give instructions; never contradict the core. If an addition did not help before, try a different one.
+Answer: {"notes": string (what you learned, under 60 words), "additions": [string, ...${ctx.n} items]}`;
+  }
+  return `${common}
 
-export function judgePrompt(renders: RenderView[]): string {
-  return `Image 1 is the target. Images 2 to ${renders.length + 1} are candidate reproductions of it.
-Rate each candidate from 0 to 100 for how closely it reproduces the target as the same picture. Judge in this order of weight: composition and layout (positions, sizes, horizon height, framing, camera angle); subject, shapes and counts; colours and light; medium and style. 100: a viewer would take it for the same photograph or artwork. 50: same subject, clearly different layout or look. 0: a different picture. Use the whole scale and be consistent between candidates.
-Answer: {"notes": string (one line on what separates the best from the rest), "scores": [${renders.length} integers, one per candidate in order]}`;
-}
-
-export function toScores(v: unknown, n: number): number[] {
-  if (!Array.isArray(v) || v.length !== n) throw new Error(`The analyst returned ${Array.isArray(v) ? v.length : 'no'} scores for ${n} renders`);
-  return v.map(x => { const k = Number(x); if (!Number.isFinite(k)) throw new Error('The analyst returned a non-numeric score'); return Math.min(100, Math.max(0, k)) / 100; });
+Write ${ctx.n} new descriptions, each at most ${ctx.maxWords ?? 120} words (some models read only that much; words beyond it are lost), that reduce the largest measured differences (listed first in each feedback line) while keeping what already matches. Image models respond to plain visual language, not to numbers: say "small, about a seventh of the frame wide", "a little right of centre", "just below the middle", "a low, flat horizon near the bottom quarter", "dark grey-brown ground"; never write coordinates, percentages of bounding boxes or measurements. Put the essentials first; describe and never instruct. Mix two kinds: make about half of them minimal edits of attempt #1, changing only the words behind its one or two largest differences and keeping every other word; make the rest fresh rewrites that try clearly different wording, order, emphasis or camera and framing terms. Learn from the history: when a phrasing did not move a measurement, do not repeat it. Make the ${ctx.n} descriptions differ from each other.
+Answer: {"notes": string (what the history shows works and what does not, under 80 words), "drafts": [${draftShape}, ...${ctx.n} items]}`;
 }
 
 /** Extract the first JSON object from a model answer (tolerates fences and chatter). */

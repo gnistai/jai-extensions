@@ -1,12 +1,18 @@
 // Analysis-by-synthesis image encoder (spec: Encoding images, informative).
-// Phase A evolves the core description on the mean score across the target
-// models; phase B tries short prompt/<target> refinements for models that lag.
+// Measure, feed back numbers, optimise from history: the target is inspected
+// once; every candidate is rendered with every target model and several seeds;
+// each render is inspected the same way and its fitness is computed from the
+// measured differences; an optimiser sees the best past candidates with their
+// measured errors and writes the next ones (OPRO-style). Lagging models then get
+// short prompt/<family> refinements by the same mechanism. Independent
+// lineages share the budget, and the best by fitness wins: fitness is computed
+// against one target measurement, so it compares across lineages.
 // Documents are built and read only through the JAI library.
 import { fromObject, interpret, serialize, type CatalogModel, type JaiDocument } from '../jai/index.ts';
 import type { ModelInfo, RenderIntent, RenderResult } from '../renderers/types.ts';
 import { Budget, BudgetExceeded } from './budget.ts';
-import { reduceAspect, thumbnailSimilarity } from './metrics.ts';
-import type { Candidate, Draft, EncodeOptions, EncodeResult, Generation, RenderView, ScoredRender, StopReason } from './types.ts';
+import { measure, reduceAspect } from './metrics.ts';
+import type { Analyst, AnalystReply, Candidate, Draft, EncodeOptions, EncodeResult, Generation, HistoryEntry, Observation, ScoredRender, SpendLine, StopReason, Thumbnail } from './types.ts';
 
 const SEGMENT = /^[a-z0-9][a-z0-9_-]*$/;
 
@@ -81,20 +87,22 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
   const t0 = Date.now();
   const emit = opts.onEvent ?? ((): void => {});
   const population = Math.max(1, Math.floor(fin(opts.population, 4)));
-  const maxGenerations = Math.max(1, Math.floor(fin(opts.maxGenerations, 5)));
-  const plateau = Math.max(1, Math.floor(fin(opts.plateau, 2)));
-  const minGain = fin(opts.minGain, 0.005);
-  const validSeeds = (opts.seeds ?? []).filter(x => Number.isSafeInteger(x) && x >= 0);
-  const seeds = validSeeds.length ? validSeeds : [1];
+  const maxGenerations = Math.max(1, Math.floor(fin(opts.maxGenerations, 8)));
+  const plateau = Math.max(1, Math.floor(fin(opts.plateau, 4)));
+  const minGain = fin(opts.minGain, 0.01);
+  const goal = Math.min(1, Math.max(0, fin(opts.goal, 0.9)));
+  const validSeeds = (opts.seeds ?? [1, 2]).filter(x => Number.isSafeInteger(x) && x >= 0);
+  const seeds = validSeeds.length ? validSeeds : [1, 2];
+  const restarts = Math.max(1, Math.floor(fin(opts.restarts, 1)));
+  const historySize = Math.max(1, Math.floor(fin(opts.historySize, 8)));
   const refine = opts.refine ?? opts.models.length > 1;
-  const refineShare = refine ? Math.min(0.9, Math.max(0, fin(opts.refineShare, 0.25))) : 0;
-  const refineTries = Math.max(1, Math.floor(fin(opts.refineTries, 2)));
-  const pixelWeight = opts.thumbnail && opts.targetThumbnail ? Math.min(1, Math.max(0, fin(opts.pixelWeight, 0.25))) : 0;
-  const judgeWeight = opts.analyst.judge ? Math.min(1, Math.max(0, fin(opts.judgeWeight, 0.5))) : 0;
-  const judgeLimit = Math.max(2, opts.analyst.judgeLimit ?? 9);
+  const refineShare = refine ? Math.min(0.9, Math.max(0, fin(opts.refineShare, 0.2))) : 0;
+  const refineTries = Math.max(1, Math.floor(fin(opts.refineTries, 3)));
   const limit = pool(Math.max(1, Math.floor(fin(opts.concurrency, 4))));
   const budget = new Budget(opts.budgetUSD);
   const ceilingA = opts.budgetUSD * (1 - refineShare);
+  const analyst = opts.analyst;
+  const optimiser = opts.optimiser ?? opts.analyst;
 
   const all = opts.renderer.models();
   const chosen = opts.models.map(id => {
@@ -107,14 +115,17 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
   const catalog: CatalogModel[] = all.map(m => ({ id: m.id, aliases: m.aliases, family: m.family, imageInput: m.imageInput, default: false }));
   const targets = refinementTargets(chosen);
   const aspect = reduceAspect(opts.target.width, opts.target.height);
-  const ctx = { models: chosen.map(m => m.label), signal: opts.signal };
-  const evalCost = (models: string[]): number => models.reduce((a, id) => a + seeds.length * ((all.find(m => m.id === id)?.costHint ?? 0) + opts.scorer.costHint), 0);
-  /** Judge calls for `count` candidates (one anchor repeated in every call), per model. */
-  const judgeCost = (count: number, models: number): number => (judgeWeight > 0 && count > 0 ? models * Math.ceil(Math.max(1, count - 1) / (judgeLimit - 1)) * opts.analyst.costHint : 0);
+  // A model with a 77-token text encoder reads only the first ~55 words: keep every description inside that.
+  const maxWords = chosen.some(m => m.shortWindow) ? SHORT_WINDOW_WORDS - 5 : 120;
+  const ctx = { models: chosen.map(m => m.label), maxWords, signal: opts.signal };
+  const wordsIn = (d: Draft): number => (d.style.join(' ') + ' ' + d.prompt).split(/\s+/).filter(Boolean).length;
+  /** One candidate on `models`: a render and an inspection per model and seed. */
+  const evalCost = (models: string[]): number => models.reduce((a, id) => a + seeds.length * ((all.find(m => m.id === id)?.costHint ?? 0) + analyst.costHint), 0);
 
   const candidates: Candidate[] = [];
   const generations: Generation[] = [];
   let best: Candidate | null = null;
+  let targetObs: Observation | null = null;
   let stopReason: StopReason = 'complete';
   let error: string | null = null;
 
@@ -124,15 +135,15 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
   };
   const spend = (): void => emit({ type: 'spend', spent: budget.spent, limit: budget.limit });
 
-  async function callAnalyst<T>(f: () => Promise<{ value: T; notes: string; cost: number }>, label: string, ceiling: number): Promise<{ value: T; notes: string }> {
+  async function call<T>(who: Analyst, f: () => Promise<AnalystReply<T>>, kind: SpendLine['kind'], label: string, ceiling: number): Promise<AnalystReply<T>> {
     checkpoint();
-    const hold = budget.hold(opts.analyst.costHint, ceiling);
+    const hold = budget.hold(who.costHint, ceiling);
     try {
       const r = await f();
-      hold.charge('analyst', label, r.cost);
+      hold.charge(kind, label, r.cost);
       return r;
     } catch (e) {
-      hold.charge('analyst', label, opts.analyst.costHint);
+      hold.charge(kind, label, who.costHint);
       throw e;
     } finally { hold.release(); spend(); }
   }
@@ -141,162 +152,126 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
     checkpoint();
     const hold = budget.hold(evalCost(models), ceiling);
     const doc = buildDocument(c.draft, c.refinements, targets, opts.models, aspect);
+    const names = targetObs!.subjects.filter(x => x.box).map(x => x.name);
     let broken = false;
     try {
       const tasks = models.flatMap(model => seeds.map(seed => limit(async (): Promise<ScoredRender> => {
-        // Never start more provider work once the run is canceled or this batch has failed.
         if (opts.signal?.aborted) throw new Stop('canceled');
         if (broken) throw new Stop('error', 'An earlier render in this batch failed unexpectedly.');
         const it = interpret(doc, { catalog, selected: model }).interpreted;
-        const intent: RenderIntent = {
-          description: it.modelDescription, style: it.modelStyle, avoid: it.modelAvoid,
-          aspect: it.aspect ? { width: it.aspect.width, height: it.aspect.height } : null,
-          mode: 'generate', strength: null, seed: String(seed), animate: false,
-        };
         const m = all.find(x => x.id === model)!;
         let result: RenderResult | null = null;
         try {
-          result = await opts.renderer.render({ intent, modelId: model, inputImage: null, governingRatio: null, target: null, signal: opts.signal });
+          result = await opts.renderer.render({
+            intent: { description: it.modelDescription, style: it.modelStyle, avoid: it.modelAvoid, aspect: it.aspect ? { width: it.aspect.width, height: it.aspect.height } : null, mode: 'generate', strength: null, seed: String(seed), animate: false },
+            modelId: model, inputImage: null, governingRatio: null, target: null, signal: opts.signal,
+          });
         } catch (e) {
           // The job may have run even if it failed or was canceled: charge it either way.
           hold.charge('render', `${c.id} ${model} (${opts.signal?.aborted ? 'canceled' : 'failed'})`, m.costHint);
           if (opts.signal?.aborted) throw new Stop('canceled');
-          return { model, seed, result: null, error: (e as Error).message, semantic: 0, pixel: null, judge: null, metric: 0, score: 0 };
+          return { model, seed, result: null, error: (e as Error).message, observation: null, measure: null, score: 0 };
         }
         hold.charge('render', `${c.id} ${model}`, m.costHint);
-        let semantic: number;
+        let observation: Observation;
         try {
-          semantic = await opts.scorer.score(imageOf(result), opts.signal);
-          if (!Number.isFinite(semantic)) throw new Error('The scorer returned no number');
+          const r = await analyst.inspect(imageOf(result), names, { ...ctx });
+          hold.charge('inspect', `${c.id} ${model}`, r.cost);
+          observation = r.value;
         } catch (e) {
-          hold.charge('scorer', `${c.id} ${model} (failed)`, opts.scorer.costHint);
+          hold.charge('inspect', `${c.id} ${model} (failed)`, analyst.costHint);
           if (opts.signal?.aborted) throw new Stop('canceled');
-          return { model, seed, result, error: `Scoring failed: ${(e as Error).message}`, semantic: 0, pixel: null, judge: null, metric: 0, score: 0 };
+          return { model, seed, result, error: `Inspection failed: ${(e as Error).message}`, observation: null, measure: null, score: 0 };
         }
-        hold.charge('scorer', `${c.id} ${model}`, opts.scorer.costHint);
-        let pixel: number | null = null;
-        if (pixelWeight > 0 && opts.thumbnail && opts.targetThumbnail) {
-          try { pixel = thumbnailSimilarity(opts.targetThumbnail, await opts.thumbnail(result)); } catch { pixel = null; }
+        let thumbs: { target: Thumbnail; render: Thumbnail } | null = null;
+        if (opts.thumbnail && opts.targetThumbnail) {
+          try { thumbs = { target: opts.targetThumbnail, render: await opts.thumbnail(result) }; } catch { thumbs = null; }
         }
-        const metric = pixel === null ? semantic : (1 - pixelWeight) * semantic + pixelWeight * pixel;
-        return { model, seed, result, error: null, semantic, pixel, judge: null, metric, score: metric };
+        const ms = measure(targetObs!, observation, thumbs);
+        return { model, seed, result, error: null, observation, measure: ms, score: ms.fitness };
       }).catch(e => { broken = true; throw e; })));
       // Wait for every task, so that nothing keeps running or goes uncharged after a failure.
       const settled = await Promise.allSettled(tasks);
       const failed = settled.find((r): r is PromiseRejectedResult => r.status === 'rejected');
       if (failed) throw failed.reason;
       const renders = settled.map(r => (r as PromiseFulfilledResult<ScoredRender>).value);
-      const cand: Candidate = { ...c, renders, perModel: {}, fitness: 0 };
-      tally(cand);
+      const perModel: Record<string, number> = {};
+      for (const model of models) {
+        const rs = renders.filter(r => r.model === model);
+        perModel[model] = rs.reduce((a, r) => a + r.score, 0) / rs.length;
+      }
+      const cand: Candidate = { ...c, renders, perModel, fitness: fitnessOf(perModel) };
       candidates.push(cand);
+      emit({ type: 'candidate', candidate: cand });
       return cand;
     } finally { hold.release(); spend(); }
   }
 
-  /** Recompute per-model means and fitness from the render scores. */
-  function tally(c: Candidate): void {
-    const models = [...new Set(c.renders.map(r => r.model))];
-    for (const model of models) {
-      const rs = c.renders.filter(r => r.model === model);
-      c.perModel[model] = rs.reduce((a, r) => a + r.score, 0) / rs.length;
-    }
-    c.fitness = fitnessOf(c.perModel);
-  }
-
-  /**
-   * Ask the analyst to rate the renders of `set` for each model, the first
-   * candidate (the current best, or the first new one) included in every call
-   * as the anchor, and blend the rating into the scores. If a call fails, the
-   * renders in that call fall back to the metric alone, the anchor included,
-   * so that comparisons stay within one scale.
-   */
-  async function judgeSet(set: Candidate[], models: string[], ceiling: number): Promise<string> {
-    if (judgeWeight === 0 || !opts.analyst.judge) return '';
-    const notes: string[] = [];
-    for (const model of models) {
-      const entries = set.map(c => ({ c, r: c.renders.find(r => r.model === model && r.seed === seeds[0] && r.result && !r.error) })).filter(e => e.r);
-      if (entries.length < 2) continue;
-      const [anchor, ...rest] = entries;
-      for (let i = 0; i < rest.length; i += judgeLimit - 1) {
-        const chunk = [anchor!, ...rest.slice(i, i + judgeLimit - 1)];
-        const view = chunk.map(e => ({ model, label: labels[model] ?? model, image: imageOf(e.r!.result!), score: e.r!.metric }));
-        let ratings: number[] | null = null;
-        try {
-          const reply = await callAnalyst(() => opts.analyst.judge!(opts.target, view, ctx), `judge ${model}`, ceiling);
-          ratings = reply.value;
-          if (reply.notes) notes.push(`${labels[model]}: ${reply.notes}`);
-        } catch (e) {
-          if (e instanceof Stop || e instanceof BudgetExceeded) throw e;
-          emit({ type: 'log', message: `Judging ${labels[model]} failed (${(e as Error).message}); using the metric alone for these renders.` });
-        }
-        chunk.forEach((e, k) => {
-          for (const r of e.c.renders.filter(x => x.model === model && x.result && !x.error)) {
-            r.judge = ratings ? ratings[k]! : null;
-            r.score = r.judge === null ? r.metric : (1 - judgeWeight) * r.metric + judgeWeight * r.judge;
-          }
-        });
-      }
-    }
-    for (const c of set) tally(c);
-    return notes.join(' ');
-  }
-
-  /** Evaluate as many drafts as the budget allows, in parallel, then judge them against the current best. */
-  async function evaluateAll(drafts: Draft[], gen: number, ceiling: number): Promise<{ next: Candidate[]; notes: string }> {
+  /** Evaluate as many drafts as the budget allows, in parallel. */
+  async function evaluateAll(drafts: Draft[], lineage: number, gen: number, ceiling: number): Promise<Candidate[]> {
     const cost = evalCost(opts.models);
-    const anchor = best ? 1 : 0;
-    const affordable = drafts.filter((_, i) => budget.canAfford(cost * (i + 1) + judgeCost(i + 1 + anchor, opts.models.length), ceiling));
+    const affordable = drafts.filter((_, i) => budget.canAfford(cost * (i + 1), ceiling));
     if (!affordable.length) throw new Stop('budget');
-    const next = await Promise.all(affordable.map((draft, k) => evaluate({ id: `g${gen}c${k + 1}`, generation: gen, phase: 'evolve', draft, refinements: {} }, opts.models, ceiling)));
-    const notes = await judgeSet(best ? [best, ...next] : next, opts.models, ceiling);
-    for (const c of next) emit({ type: 'candidate', candidate: c });
-    return { next, notes };
+    return Promise.all(affordable.map((draft, k) => evaluate({ id: `l${lineage}g${gen}c${k + 1}`, lineage, generation: gen, phase: 'evolve', draft, refinements: {} }, opts.models, ceiling)));
   }
 
-  const views = (c: Candidate, models = opts.models): RenderView[] => c.renders
-    .filter(r => r.result && !r.error && r.seed === seeds[0] && models.includes(r.model))
-    .map(r => ({ model: r.model, label: labels[r.model] ?? r.model, image: imageOf(r.result!), score: r.score }));
+  /** The measured feedback of a candidate per model label (first seed with a measurement). */
+  const feedbackOf = (c: Candidate, models = opts.models): Record<string, string> => Object.fromEntries(models.map(model => {
+    const r = c.renders.find(x => x.model === model && x.measure) ?? c.renders.find(x => x.model === model);
+    const info = all.find(m => m.id === model);
+    const words = wordsIn(c.draft);
+    const cut = info?.shortWindow && words > SHORT_WINDOW_WORDS ? `the description has ${words} words and ${labels[model]} reads only about the first ${SHORT_WINDOW_WORDS}, so the rest was cut; ` : '';
+    return [labels[model] ?? model, cut + (r?.measure ? r.measure.feedback : `render failed${r?.error ? ` (${r.error})` : ''}`)];
+  }));
+  const top = (h: HistoryEntry[]): HistoryEntry[] => [...h].sort((a, b) => b.fitness - a.fitness).slice(0, historySize);
 
   try {
-    // Phase A: describe, then evolve the core.
-    emit({ type: 'phase', phase: 'describe' });
-    if (!budget.canAfford(opts.analyst.costHint + opts.scorer.costHint + evalCost(opts.models), ceilingA)) throw new Stop('budget', 'The budget does not cover one description and one round of renders.');
-    if (judgeWeight > 0) emit({ type: 'log', message: `Scores blend CLIP${pixelWeight ? ', colour/layout' : ''} and the analyst's rating (weight ${judgeWeight}).` });
-    checkpoint();
-    const hold = budget.hold(opts.scorer.costHint, ceilingA);
-    try { await opts.scorer.prepare(opts.target, opts.signal); hold.charge('scorer', 'target', opts.scorer.costHint); }
-    finally { hold.release(); }
-    const first = await callAnalyst(() => opts.analyst.describe(opts.target, population, ctx), 'describe', ceilingA);
-    if (!first.value.length) throw new Stop('error', 'The analyst wrote no usable description.');
-    emit({ type: 'phase', phase: 'evolve' });
-    let gen = 0;
-    const g0 = await evaluateAll(first.value, gen, ceilingA);
-    best = g0.next.reduce((a, b) => (b.fitness > a.fitness ? b : a));
-    generations.push({ index: gen, phase: 'evolve', candidates: g0.next.map(c => c.id), best: best.id, bestFitness: best.fitness, notes: [first.notes, g0.notes].filter(Boolean).join(' '), spent: budget.spent });
-    emit({ type: 'generation', generation: generations[generations.length - 1]! });
-    let stale = 0;
-    stopReason = 'generations';
-    while (++gen < maxGenerations) {
-      if (!budget.canAfford(opts.analyst.costHint + evalCost(opts.models) + judgeCost(2, opts.models.length), ceilingA)) { stopReason = 'budget'; break; }
-      const n = Math.max(1, population - 1);
-      const rev = await callAnalyst(() => opts.analyst.revise(opts.target, best!.draft, views(best!), n, ctx), `revise g${gen}`, ceilingA);
-      if (!rev.value.length) { emit({ type: 'log', message: `Generation ${gen}: the analyst wrote no usable revision.` }); stale++; if (stale >= plateau) { stopReason = 'plateau'; break; } continue; }
-      let next: Candidate[];
-      let judged = '';
-      const before = best.fitness;
-      try { ({ next, notes: judged } = await evaluateAll(rev.value, gen, ceilingA)); } catch (e) { if (e instanceof Stop && e.reason === 'budget') { stopReason = 'budget'; break; } throw e; }
-      if (best.fitness !== before) emit({ type: 'log', message: `Re-rated the best (${best.id}): ${before.toFixed(3)} -> ${best.fitness.toFixed(3)}` });
-      const top = next.reduce((a, b) => (b.fitness > a.fitness ? b : a));
-      const gain = top.fitness - best.fitness;
-      if (gain > 0) best = top;
-      stale = gain >= minGain ? 0 : stale + 1;
-      generations.push({ index: gen, phase: 'evolve', candidates: next.map(c => c.id), best: best.id, bestFitness: best.fitness, notes: [rev.notes, judged].filter(Boolean).join(' '), spent: budget.spent });
-      emit({ type: 'generation', generation: generations[generations.length - 1]! });
-      if (stale >= plateau) { stopReason = 'plateau'; break; }
+    // Measure the target once (careful), the yardstick for every render in every lineage.
+    emit({ type: 'phase', phase: 'inspect' });
+    if (!budget.canAfford(analyst.costHint * 2 + evalCost(opts.models), ceilingA)) throw new Stop('budget', 'The budget does not cover measuring the target and one round of renders.');
+    targetObs = (await call(analyst, () => analyst.inspect(opts.target, null, { ...ctx, careful: true }), 'inspect', 'inspect target', ceilingA)).value;
+    emit({ type: 'target', observation: targetObs });
+    if (!targetObs.subjects.some(x => x.box)) emit({ type: 'log', message: 'The target inspection found no subjects with boxes; fitness uses the horizon and colours only.' });
+
+    let reachedGoal = false;
+    for (let lineage = 1; lineage <= restarts && !reachedGoal; lineage++) {
+      const ceiling = ceilingA * lineage / restarts;
+      if (!budget.canAfford(optimiser.costHint + evalCost(opts.models), ceiling)) { stopReason = 'budget'; break; }
+      emit({ type: 'phase', phase: 'describe', lineage });
+      const first = await call(analyst, () => analyst.describe(opts.target, population, ctx), 'analyst', `describe l${lineage}`, ceiling);
+      if (!first.value.length) throw new Stop('error', 'The analyst wrote no usable description.');
+      emit({ type: 'phase', phase: 'evolve', lineage });
+      const history: HistoryEntry[] = [];
+      let notes = first.notes;
+      let lineBest: Candidate | null = null;
+      let stale = 0;
+      let drafts: Draft[] = first.value;
+      let reason: StopReason = 'generations';
+      for (let gen = 0; gen < maxGenerations; gen++) {
+        let next: Candidate[];
+        try { next = await evaluateAll(drafts, lineage, gen, ceiling); } catch (e) { if (e instanceof Stop && e.reason === 'budget') { reason = 'budget'; break; } throw e; }
+        for (const c of next) history.push({ draft: c.draft, fitness: c.fitness, feedback: feedbackOf(c) });
+        const genTop = next.reduce((a, b) => (b.fitness > a.fitness ? b : a));
+        const gain = lineBest ? genTop.fitness - lineBest.fitness : Infinity;
+        if (!lineBest || genTop.fitness > lineBest.fitness) lineBest = genTop;
+        if (!best || lineBest.fitness > best.fitness) best = lineBest;
+        stale = gain >= minGain ? 0 : stale + 1;
+        generations.push({ lineage, index: gen, phase: 'evolve', candidates: next.map(c => c.id), best: lineBest.id, bestFitness: lineBest.fitness, notes, spent: budget.spent });
+        emit({ type: 'generation', generation: generations[generations.length - 1]! });
+        if (lineBest.fitness >= goal) { reason = 'goal'; reachedGoal = true; break; }
+        if (stale >= plateau) { reason = 'plateau'; break; }
+        if (gen + 1 >= maxGenerations) break;
+        if (!budget.canAfford(optimiser.costHint + evalCost(opts.models), ceiling)) { reason = 'budget'; break; }
+        const reply = await call(optimiser, () => optimiser.propose(opts.target, { ...ctx, targetObservation: targetObs!, history: top(history), notes, n: population, scope: { kind: 'core' } }), 'analyst', `propose l${lineage}g${gen + 1}`, ceiling);
+        if (reply.notes) notes = reply.notes;
+        drafts = (reply.value as Draft[]).filter(d => d && typeof d.prompt === 'string');
+        if (!drafts.length) { emit({ type: 'log', message: `Lineage ${lineage}: the optimiser wrote no usable description.` }); reason = 'error'; break; }
+      }
+      stopReason = reason;
     }
 
-    // Phase B: per-model refinements for the models that lag.
-    if (refine && chosen.length > 1) {
+    // Per-model refinements for the models that lag, by the same measured-feedback mechanism.
+    if (best && refine && chosen.length > 1) {
       emit({ type: 'phase', phase: 'refine' });
       const order = [...opts.models].sort((a, b) => best!.perModel[a]! - best!.perModel[b]!);
       const leader = order[order.length - 1];
@@ -305,31 +280,30 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
         if (!targets[model]) { emit({ type: 'log', message: `Not refining ${labels[model]}: another target model shares its family, so a refinement would reach both.` }); continue; }
         const info = all.find(m => m.id === model)!;
         const words = (best.draft.style.join(' ') + ' ' + best.draft.prompt).split(/\s+/).filter(Boolean).length;
-        if (info.shortWindow && words >= SHORT_WINDOW_WORDS) {
-          emit({ type: 'log', message: `Not refining ${labels[model]}: it reads only about ${SHORT_WINDOW_WORDS} words and the core already has ${words}, so an appended refinement would be cut off.` });
-          continue;
+        if (info.shortWindow && words >= SHORT_WINDOW_WORDS) { emit({ type: 'log', message: `Not refining ${labels[model]}: it reads only about ${SHORT_WINDOW_WORDS} words and the core already has ${words}, so an appended refinement would be cut off.` }); continue; }
+        const tries: HistoryEntry[] = [{ draft: best.draft, addition: '', fitness: best.perModel[model]!, feedback: feedbackOf(best, [model]) }];
+        let notes = '';
+        for (let round = 0; round < 2; round++) {
+          if (!budget.canAfford(optimiser.costHint + evalCost([model]))) break;
+          const reply = await call(optimiser, () => optimiser.propose(opts.target, { ...ctx, targetObservation: targetObs!, history: top(tries), notes, n: refineTries, scope: { kind: 'refine', model: labels[model]!, core: best!.draft } }), 'analyst', `refine ${model}`, opts.budgetUSD);
+          if (reply.notes) notes = reply.notes;
+          const tried: Candidate[] = [];
+          for (const [k, addition] of (reply.value as string[]).entries()) {
+            if (!budget.canAfford(evalCost([model]))) break;
+            const c = await evaluate({ id: `r${round + 1}-${targets[model]}-${k + 1}`, lineage: best.lineage, generation: round, phase: 'refine', draft: best.draft, refinements: { ...best.refinements, [model]: [addition] } }, [model], opts.budgetUSD);
+            tried.push(c);
+            tries.push({ draft: best.draft, addition, fitness: c.perModel[model]!, feedback: feedbackOf(c, [model]) });
+          }
+          const winner = tried.reduce<Candidate | null>((a, b) => (!a || b.perModel[model]! > a.perModel[model]! ? b : a), null);
+          const accepted = !!winner && winner.perModel[model]! - best.perModel[model]! >= minGain;
+          if (winner && accepted) {
+            const perModel: Record<string, number> = { ...best.perModel, [model]: winner.perModel[model]! };
+            best = { ...best, id: winner.id, phase: 'refine', refinements: winner.refinements, perModel, fitness: fitnessOf(perModel), renders: [...best.renders.filter(r => r.model !== model), ...winner.renders] };
+          }
+          generations.push({ lineage: best.lineage, index: round, phase: 'refine', candidates: tried.map(c => c.id), best: best.id, bestFitness: best.fitness, notes: `${labels[model]}: ${notes}${accepted ? '' : ' (no addition kept)'}`, spent: budget.spent });
+          emit({ type: 'generation', generation: generations[generations.length - 1]! });
+          if (accepted && best.perModel[model]! >= goal) break;
         }
-        if (!budget.canAfford(opts.analyst.costHint + evalCost([model]) + judgeCost(2, 1))) break;
-        const view = views(best, [model])[0];
-        if (!view) continue;
-        const ref = await callAnalyst(() => opts.analyst.refine(opts.target, best!.draft, view, refineTries, ctx), `refine ${model}`, opts.budgetUSD);
-        const tried: Candidate[] = [];
-        for (const [k, addition] of ref.value.entries()) {
-          if (!budget.canAfford(evalCost([model]) + judgeCost(tried.length + 2, 1))) break;
-          tried.push(await evaluate({ id: `r${gen}-${targets[model]}-${k + 1}`, generation: gen, phase: 'refine', draft: best.draft, refinements: { ...best.refinements, [model]: [addition] } }, [model], opts.budgetUSD));
-        }
-        const judged = tried.length ? await judgeSet([best, ...tried], [model], opts.budgetUSD) : '';
-        for (const c of tried) emit({ type: 'candidate', candidate: c });
-        const top = tried.reduce<Candidate | null>((a, b) => (!a || b.perModel[model]! > a.perModel[model]! ? b : a), null);
-        const accepted = !!top && top.perModel[model]! - best.perModel[model]! >= minGain;
-        if (top && accepted) {
-          const perModel: Record<string, number> = { ...best.perModel, [model]: top.perModel[model]! };
-          best = { ...best, id: top.id, phase: 'refine', refinements: top.refinements, perModel, fitness: fitnessOf(perModel),
-            renders: [...best.renders.filter(r => r.model !== model), ...top.renders] };
-        }
-        generations.push({ index: gen, phase: 'refine', candidates: tried.map(c => c.id), best: best.id, bestFitness: best.fitness, notes: `${labels[model]}: ${ref.notes}${judged ? ` ${judged}` : ''}${accepted ? '' : ' (no addition kept)'}`, spent: budget.spent });
-        emit({ type: 'generation', generation: generations[generations.length - 1]! });
-        gen++;
       }
     }
   } catch (e) {
@@ -347,7 +321,7 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
   const ranking = [...opts.models].map(model => ({ model, score: best!.perModel[model] ?? 0 })).sort((a, b) => b.score - a.score);
   const document = buildDocument(best!.draft, best!.refinements, targets, ranking.map(r => r.model), aspect);
   return {
-    document, text: serialize(document), best: best!, candidates, generations, ranking,
+    document, text: serialize(document), best: best!, target: targetObs!, candidates, generations, ranking,
     spent: budget.spent, spend: budget.lines, stopReason, error, seconds: (Date.now() - t0) / 1000,
   };
 }

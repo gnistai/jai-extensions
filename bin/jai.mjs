@@ -14,10 +14,12 @@ const HELP = `jai encode <image> [options]
   --budget <usd>        hard spending limit in USD (default 0.50)
   --population <n>      candidates per generation (default 4)
   --generations <n>     evolve generations including the first (default 5)
-  --seeds <list>        fixed seeds, comma-separated (default 1)
-  --analyst <name>      gemini (default) or claude
+  --seeds <list>        fixed seeds, comma-separated (default 1,2)
+  --analyst <name>      luna (default: openai/gpt-5.6-luna) or gemini; describes and measures
+  --optimiser <name>    who writes improved descriptions: the analyst (default), luna, gemini or sonnet
+  --restarts <n>        independent attempts within the budget; the best by fitness wins (default 1)
+  --goal <f>            stop when the measured fitness reaches this, 0..1 (default 0.9)
   --no-pixel            no colour/layout term
-  --judge-weight <w>    weight of the analyst's rating, 0..1 (default 0.5; 0 = off)
   --no-refine           skip per-model refinements
   --scores              record scores in jaitools.* vendor keys
   --out <file.jai>      output file (default <image>.jai)
@@ -31,7 +33,7 @@ const { values: o, positionals } = parseArgs({
   allowPositionals: true,
   options: {
     models: { type: 'string' }, model: { type: 'string' }, budget: { type: 'string' }, population: { type: 'string' },
-    generations: { type: 'string' }, 'judge-weight': { type: 'string' }, seeds: { type: 'string' }, analyst: { type: 'string' }, 'no-pixel': { type: 'boolean' },
+    generations: { type: 'string' }, optimiser: { type: 'string' }, restarts: { type: 'string' }, goal: { type: 'string' }, seeds: { type: 'string' }, analyst: { type: 'string' }, 'no-pixel': { type: 'boolean' },
     'no-refine': { type: 'boolean' }, scores: { type: 'boolean' }, out: { type: 'string' }, report: { type: 'string' },
     env: { type: 'string' }, force: { type: 'boolean' }, help: { type: 'boolean', short: 'h' },
   },
@@ -130,36 +132,40 @@ const models = (o.models ?? 'flux-schnell').split(',').filter(Boolean).map(findM
 const budgetUSD = numberOption('budget', 0.5, 0.01, 50);
 const population = numberOption('population', 4, 1, 9, true);
 const generations = numberOption('generations', 5, 1, 30, true);
-const judgeWeight = numberOption('judge-weight', 0.5, 0, 1);
-const seeds = (o.seeds ?? '1').split(',').map(x => {
+const restarts = numberOption('restarts', 1, 1, 5, true);
+const goal = numberOption('goal', 0.9, 0, 1);
+const seeds = (o.seeds ?? '1,2').split(',').map(x => {
   const n = Number(x);
   if (!Number.isSafeInteger(n) || n < 0 || n > 2 ** 32 - 1) { console.error('--seeds must be integers from 0 to 4294967295'); process.exit(2); }
   return n;
 });
 const client = new E.HttpReplicateClient(token());
-const composite = async images => {
-  const bufs = await Promise.all(images.map(async i => i.url.startsWith('data:') ? Buffer.from(i.url.split(',')[1], 'base64') : Buffer.from(await (await fetch(i.url)).arrayBuffer())));
-  const tiles = await Promise.all(bufs.map(b => sharp(b, { limitInputPixels: PIXELS }).resize(512, 512, { fit: 'contain', background: '#fff' }).toBuffer()));
-  const img = await sharp({ create: { width: 512 * tiles.length, height: 512, channels: 3, background: '#fff' } }).composite(tiles.map((t, k) => ({ input: t, left: 512 * k, top: 0 }))).jpeg({ quality: 85 }).toBuffer();
-  return { url: `data:image/jpeg;base64,${img.toString('base64')}` };
+const makeAnalyst = name => {
+  if (name === 'gemini') return new E.GeminiAnalyst(client);
+  if (name === 'sonnet') return new E.ClaudeAnalyst(client);
+  if (name === undefined || name === 'luna') return new E.OpenAIAnalyst(client);
+  console.error(`Unknown model "${name}": use luna, gemini or sonnet`); process.exit(2);
 };
-const analyst = o.analyst === 'claude' ? new E.ClaudeAnalyst(client, { composite }) : new E.GeminiAnalyst(client);
+const analyst = makeAnalyst(o.analyst);
+if (o.analyst === 'sonnet') { console.error('--analyst sonnet takes one image per call; use it as --optimiser'); process.exit(2); }
+const optimiser = o.optimiser ? makeAnalyst(o.optimiser) : analyst;
 const out = resolve(o.out ?? join(dirname(src), `${basename(src, extname(src))}.jai`));
 if (existsSync(out) && !o.force) { console.error(`${out} exists; pass --force to overwrite it.`); process.exit(2); }
 const reportDir = o.report ?? `${out}.report`;
 mkdirSync(join(reportDir, 'renders'), { recursive: true });
 writeFileSync(join(reportDir, 'target.jpg'), upload);
 
-console.log(`Encoding ${basename(src)} (${target.width}x${target.height}) for ${models.map(m => m.label).join(', ')}; budget ${usd(budgetUSD)}; analyst ${analyst.id}`);
+console.log(`Encoding ${basename(src)} (${target.width}x${target.height}) for ${models.map(m => m.label).join(', ')}; budget ${usd(budgetUSD)}; analyst ${analyst.id}${optimiser !== analyst ? `, optimiser ${optimiser.id}` : ''}`);
 const files = new Map();
 let n = 0;
 const result = await E.encode({
-  target, models: models.map(m => m.id), renderer: new E.ReplicateRenderer(client, { foldAvoid: true }), analyst, scorer: new E.ClipScorer(client),
+  target, models: models.map(m => m.id), renderer: new E.ReplicateRenderer(client, { foldAvoid: true }), analyst, optimiser,
   ...(o['no-pixel'] ? {} : { thumbnail: r => thumb(Buffer.from(r.bytes)), targetThumbnail: await thumb(upload) }),
-  budgetUSD, judgeWeight, population, maxGenerations: generations,
+  budgetUSD, population, maxGenerations: generations, restarts, goal,
   seeds, refine: o['no-refine'] ? false : undefined,
   onEvent: e => {
-    if (e.type === 'phase') console.log(`\n== ${e.phase}`);
+    if (e.type === 'phase') console.log(`\n== ${e.phase}${e.lineage ? ` (lineage ${e.lineage})` : ''}`);
+    if (e.type === 'target') console.log(`  target: ${E.describeObservation(e.observation).replace(/\n/g, '\n          ')}`);
     if (e.type === 'candidate') {
       for (const r of e.candidate.renders) if (r.result) {
         const f = `renders/${String(++n).padStart(3, '0')}-${e.candidate.id}-${r.model.split('/')[1]}-s${r.seed}.${r.result.mime.split('/')[1]}`;
@@ -168,33 +174,35 @@ const result = await E.encode({
       }
       const scores = Object.entries(e.candidate.perModel).map(([m, s]) => `${m.split('/')[1]} ${s.toFixed(3)}`).join(', ');
       console.log(`  ${e.candidate.id.padEnd(16)} ${e.candidate.fitness.toFixed(3)}  [${scores}]`);
+      const fb = e.candidate.renders.find(r => r.measure)?.measure?.feedback;
+      if (fb) console.log(`     ${fb.slice(0, 240)}`);
     }
-    if (e.type === 'generation') console.log(`  -> gen ${e.generation.index} best ${e.generation.best} ${e.generation.bestFitness.toFixed(3)}, spent ${usd(e.generation.spent)}${e.generation.notes ? `\n     ${e.generation.notes.slice(0, 300)}` : ''}`);
+    if (e.type === 'generation') console.log(`  -> l${e.generation.lineage} gen ${e.generation.index} best ${e.generation.best} ${e.generation.bestFitness.toFixed(3)}, spent ${usd(e.generation.spent)}${e.generation.notes ? `\n     ${e.generation.notes.slice(0, 300)}` : ''}`);
     if (e.type === 'log') console.log(`  ${e.message}`);
   },
 }).catch(e => { console.error(`\nEncoding failed: ${e.message}${e.spent !== undefined ? ` (spent about ${usd(e.spent)})` : ''}`); process.exit(1); });
 
 let doc = result.document;
 if (o.scores) {
-  doc = J.fromObject({ ...J.toObject(doc), 'jaitools.score': result.ranking.map(r => `${r.model} ${r.score.toFixed(4)}`), 'jaitools.encoder': [`${analyst.id} + ${E.CLIP_MODEL.id}`] });
+  doc = J.fromObject({ ...J.toObject(doc), 'jaitools.score': result.ranking.map(r => `${r.model} ${r.score.toFixed(4)}`), 'jaitools.encoder': [optimiser === analyst ? analyst.id : `${analyst.id} + ${optimiser.id}`] });
 }
 writeFileSync(out, await J.encode(doc));
 const text = J.serialize(doc);
 
 // Report: JSON without image bytes, plus an HTML contact sheet with relative image paths.
-const strip = c => ({ ...c, renders: c.renders.map(r => ({ model: r.model, seed: r.seed, file: files.get(r) ?? null, error: r.error, semantic: r.semantic, pixel: r.pixel, judge: r.judge, metric: r.metric, score: r.score, sentPrompt: r.result?.sentPrompt ?? null })) });
-const report = { source: basename(src), size: [target.width, target.height], models: models.map(m => m.id), analyst: analyst.id, scorer: E.CLIP_MODEL.id, budgetUSD, text, ranking: result.ranking, stopReason: result.stopReason, error: result.error, spentEstimateUSD: result.spent, seconds: result.seconds, generations: result.generations, best: strip(result.best), candidates: result.candidates.map(strip), spend: result.spend };
+const strip = c => ({ ...c, renders: c.renders.map(r => ({ model: r.model, seed: r.seed, file: files.get(r) ?? null, error: r.error, observation: r.observation, measure: r.measure, score: r.score, sentPrompt: r.result?.sentPrompt ?? null })) });
+const report = { source: basename(src), size: [target.width, target.height], models: models.map(m => m.id), analyst: analyst.id, optimiser: optimiser.id, settings: { population, generations, seeds, restarts, goal }, target: result.target, budgetUSD, text, ranking: result.ranking, stopReason: result.stopReason, error: result.error, spentEstimateUSD: result.spent, seconds: result.seconds, generations: result.generations, best: strip(result.best), candidates: result.candidates.map(strip), spend: result.spend };
 writeFileSync(join(reportDir, 'report.json'), JSON.stringify(report, null, 2));
 const byId = new Map(result.candidates.map(c => [c.id, c]));
-const card = c => `<div class="cand${c.id === result.best.id ? ' best' : ''}"><div class="h"><b>${esc(c.id)}</b> ${c.fitness.toFixed(3)}</div><div class="imgs">${c.renders.map(r => `<figure>${files.get(r) ? `<img src="${esc(files.get(r))}" alt="" loading="lazy">` : '<div class="fail">failed</div>'}<figcaption>${esc(r.model.split('/')[1])} ${r.score.toFixed(3)}${r.judge !== null ? ` (judge ${Math.round(r.judge * 100)})` : ''}</figcaption></figure>`).join('')}</div><p>${esc(c.draft.prompt)}${Object.entries(c.refinements).map(([m, v]) => `<br><i>+ ${esc(m.split('/')[1])}: ${esc(v.join(' '))}</i>`).join('')}</p></div>`;
+const card = c => `<div class="cand${c.id === result.best.id ? ' best' : ''}"><div class="h"><b>${esc(c.id)}</b> ${c.fitness.toFixed(3)}</div><div class="imgs">${c.renders.map(r => `<figure>${files.get(r) ? `<img src="${esc(files.get(r))}" alt="" loading="lazy">` : '<div class="fail">failed</div>'}<figcaption>${esc(r.model.split('/')[1])} ${r.score.toFixed(3)}</figcaption></figure>`).join('')}</div><p class="fb">${esc(c.renders.find(r => r.measure)?.measure?.feedback ?? '')}</p><p>${esc(c.draft.prompt)}${Object.entries(c.refinements).map(([m, v]) => `<br><i>+ ${esc(m.split('/')[1])}: ${esc(v.join(' '))}</i>`).join('')}</p></div>`;
 const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>JAI encoding: ${esc(basename(src))}</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;margin:0 auto;max-width:1200px;padding:16px;color:#1c1917;background:#fafaf9}h1{font-size:1.4rem}pre{white-space:pre-wrap;background:#fff;border:1px solid #d6d3d1;padding:12px;border-radius:8px}.gen{margin:24px 0}.row{display:flex;flex-wrap:wrap;gap:12px}.cand{background:#fff;border:1px solid #d6d3d1;border-radius:8px;padding:8px;width:min(100%,360px)}.cand.best{border:2px solid #c2410c}.imgs{display:flex;gap:6px}figure{margin:0;flex:1}figure img{width:100%;border-radius:4px}figcaption{font-size:.8rem;color:#57534e}.cand p{font-size:.85rem;margin:6px 0 0}.fail{background:#fee2e2;padding:20px;text-align:center}table{border-collapse:collapse}td,th{padding:2px 10px;text-align:left}</style></head><body>
+<style>body{font:15px/1.5 system-ui,sans-serif;margin:0 auto;max-width:1200px;padding:16px;color:#1c1917;background:#fafaf9}h1{font-size:1.4rem}pre{white-space:pre-wrap;background:#fff;border:1px solid #d6d3d1;padding:12px;border-radius:8px}.gen{margin:24px 0}.row{display:flex;flex-wrap:wrap;gap:12px}.cand{background:#fff;border:1px solid #d6d3d1;border-radius:8px;padding:8px;width:min(100%,360px)}.cand.best{border:2px solid #c2410c}.imgs{display:flex;gap:6px}figure{margin:0;flex:1}figure img{width:100%;border-radius:4px}figcaption{font-size:.8rem;color:#57534e}.cand p{font-size:.85rem;margin:6px 0 0}.fail{background:#fee2e2;padding:20px;text-align:center}.fb{color:#57534e;font-size:.78rem!important}table{border-collapse:collapse}td,th{padding:2px 10px;text-align:left}</style></head><body>
 <h1>JAI encoding of ${esc(basename(src))}</h1>
-<div class="row"><figure style="max-width:360px"><img src="target.jpg" alt="Target image"><figcaption>Target, ${target.width}×${target.height}</figcaption></figure></div>
+<div class="row"><figure style="max-width:360px"><img src="target.jpg" alt="Target image"><figcaption>Target, ${target.width}×${target.height}</figcaption></figure><pre style="flex:1;min-width:260px">${esc(E.describeObservation(result.target))}</pre></div>
 <h2>Result</h2><pre>${esc(text)}</pre>
 <table><tr><th>Model</th><th>Score</th></tr>${result.ranking.map(r => `<tr><td>${esc(r.model)}</td><td>${r.score.toFixed(3)}</td></tr>`).join('')}</table>
-<p>Stopped: ${esc(result.stopReason)}${result.error ? ` (${esc(result.error)})` : ''}. Estimated spend ${usd(result.spent)} of ${usd(budgetUSD)} in ${result.seconds.toFixed(0)} s. Analyst ${esc(analyst.id)}, scorer ${esc(E.CLIP_MODEL.id)}.</p>
-${result.generations.map(g => `<section class="gen"><h3>${g.phase === 'refine' ? 'Refinement' : 'Generation'} ${g.index}: best ${g.bestFitness.toFixed(3)}</h3>${g.notes ? `<p>${esc(g.notes)}</p>` : ''}<div class="row">${g.candidates.map(id => byId.get(id)).filter(Boolean).map(card).join('')}</div></section>`).join('\n')}
+<p>Stopped: ${esc(result.stopReason)}${result.error ? ` (${esc(result.error)})` : ''}. Estimated spend ${usd(result.spent)} of ${usd(budgetUSD)} in ${result.seconds.toFixed(0)} s. Analyst ${esc(analyst.id)}${optimiser !== analyst ? `, optimiser ${esc(optimiser.id)}` : ''}; fitness is measured against the target's boxes, horizon and colours.</p>
+${result.generations.map(g => `<section class="gen"><h3>${g.phase === 'refine' ? 'Refinement' : `Lineage ${g.lineage}, generation`} ${g.index}: best ${g.bestFitness.toFixed(3)}</h3>${g.notes ? `<p>${esc(g.notes)}</p>` : ''}<div class="row">${g.candidates.map(id => byId.get(id)).filter(Boolean).map(card).join('')}</div></section>`).join('\n')}
 </body></html>`;
 writeFileSync(join(reportDir, 'index.html'), html);
 

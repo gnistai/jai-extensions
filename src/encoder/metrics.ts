@@ -1,5 +1,5 @@
 // Pure helpers: similarity measures and aspect reduction.
-import type { Thumbnail } from './types.ts';
+import type { Box, Measure, Observation, SubjectMeasure, Thumbnail } from './types.ts';
 
 export function cosine(a: readonly number[], b: readonly number[]): number {
   if (a.length !== b.length || !a.length) throw new RangeError('embeddings differ in length');
@@ -50,4 +50,98 @@ export function reduceAspect(width: number, height: number): string {
   }
   const g = gcd(Math.round(width), Math.round(height));
   return `${Math.round(width) / g}:${Math.round(height) / g}`;
+}
+
+// ---------------------------------------------------------------- measured fitness
+
+
+/** Mean CIE L* of a thumbnail. */
+export function meanLightness(t: Thumbnail): number {
+  let sum = 0;
+  const n = t.width * t.height;
+  for (let i = 0; i < n; i++) sum += toLab(t.data[i * 4]!, t.data[i * 4 + 1]!, t.data[i * 4 + 2]!)[0];
+  return sum / n;
+}
+
+const area = (b: Box): number => Math.max(0, b.xmax - b.xmin) * Math.max(0, b.ymax - b.ymin);
+function iou(a: Box, b: Box): number {
+  const ix = Math.max(0, Math.min(a.xmax, b.xmax) - Math.max(a.xmin, b.xmin));
+  const iy = Math.max(0, Math.min(a.ymax, b.ymax) - Math.max(a.ymin, b.ymin));
+  const inter = ix * iy;
+  const union = area(a) + area(b) - inter;
+  return union > 0 ? inter / union : 0;
+}
+const pct = (x: number): string => `${Math.round(Math.abs(x) * 100)}%`;
+const times = (lnRatio: number): string => `${Math.exp(Math.abs(lnRatio)).toFixed(1)}×`;
+const same = (a: string, b: string): boolean => a.trim().toLowerCase() === b.trim().toLowerCase();
+
+/**
+ * Compare a render's observation with the target's (and, when given, their
+ * thumbnails) and return a fitness in 0..1 with the differences in words.
+ * Weights: each subject 1 (regions covering more than 40% of the frame 0.5),
+ * horizon 1, palette 1, lightness 0.5.
+ */
+export function measure(target: Observation, render: Observation, thumbs?: { target: Thumbnail; render: Thumbnail } | null): Measure {
+  // Each difference contributes weight × error; the feedback lists them largest first.
+  const items: Array<{ w: number; error: number; text: string | null }> = [];
+  const subjects: SubjectMeasure[] = [];
+  for (const t of target.subjects) {
+    if (!t.box) continue;
+    const w = area(t.box) > 0.4 ? 0.5 : 1;
+    const r = render.subjects.find(s => same(s.name, t.name))?.box ?? null;
+    if (!r || area(r) <= 0) {
+      subjects.push({ name: t.name, present: false, dx: 0, dy: 0, sw: 0, sh: 0, iou: 0, error: 1 });
+      items.push({ w, error: 1, text: `${t.name}: missing` });
+      continue;
+    }
+    const tw = Math.max(1e-3, t.box.xmax - t.box.xmin), th = Math.max(1e-3, t.box.ymax - t.box.ymin);
+    const rw = Math.max(1e-3, r.xmax - r.xmin), rh = Math.max(1e-3, r.ymax - r.ymin);
+    const dx = (r.xmin + r.xmax) / 2 - (t.box.xmin + t.box.xmax) / 2;
+    const dy = (r.ymin + r.ymax) / 2 - (t.box.ymin + t.box.ymax) / 2;
+    const sw = Math.log(rw / tw), sh = Math.log(rh / th);
+    const o = iou(t.box, r);
+    // Gentle enough to separate near misses: position in frame fractions, size as log ratios, overlap a little.
+    const error = Math.min(1, 1.2 * (Math.abs(dx) + Math.abs(dy)) + 0.35 * (Math.abs(sw) + Math.abs(sh)) + 0.15 * (1 - o));
+    subjects.push({ name: t.name, present: true, dx, dy, sw, sh, iou: o, error });
+    const says: string[] = [];
+    if (Math.abs(sw) > 0.15) says.push(`${times(sw)} too ${sw > 0 ? 'wide' : 'narrow'}`);
+    if (Math.abs(sh) > 0.15) says.push(`${times(sh)} too ${sh > 0 ? 'tall' : 'short'}`);
+    if (Math.abs(dx) > 0.04) says.push(`${pct(dx)} of the frame too far ${dx > 0 ? 'right' : 'left'}`);
+    if (Math.abs(dy) > 0.04) says.push(`${pct(dy)} of the frame too ${dy > 0 ? 'low' : 'high'}`);
+    items.push({ w, error, text: says.length ? `${t.name}: ${says.join(', ')}` : null });
+  }
+  let horizon: number | null = null;
+  if (target.horizon !== null) {
+    if (render.horizon === null) items.push({ w: 1, error: 0.5, text: `horizon: not visible (target ${pct(target.horizon)} from the top)` });
+    else {
+      horizon = render.horizon - target.horizon;
+      items.push({ w: 1, error: Math.min(1, 4 * Math.abs(horizon)), text: Math.abs(horizon) > 0.03 ? `horizon ${pct(horizon)} of the frame too ${horizon > 0 ? 'low' : 'high'} (at ${pct(render.horizon)} from the top, target ${pct(target.horizon)})` : null });
+    }
+    if (target.horizonShape && render.horizonShape && render.horizonShape !== target.horizonShape) items.push({ w: 1, error: 1, text: `horizon is ${render.horizonShape}, target ${target.horizonShape}` });
+  } else if (render.horizon !== null) items.push({ w: 1, error: 0.3, text: 'a horizon appears; the target has none' });
+  let palette: number | null = null, lightness: number | null = null;
+  if (thumbs) {
+    palette = thumbnailSimilarity(thumbs.target, thumbs.render);
+    lightness = meanLightness(thumbs.render) - meanLightness(thumbs.target);
+    items.push({ w: 1, error: 1 - palette, text: palette < 0.75 ? `colours and their placement differ (similarity ${palette.toFixed(2)})` : null });
+    items.push({ w: 1, error: Math.min(1, Math.abs(lightness) / 30), text: Math.abs(lightness) > 5 ? `overall ${lightness > 0 ? 'too bright' : 'too dark'} (lightness ${lightness > 0 ? '+' : ''}${Math.round(lightness)} of 100)` : null });
+  }
+  const weights = items.reduce((a, i) => a + i.w, 0);
+  const fitness = weights > 0 ? Math.max(0, 1 - items.reduce((a, i) => a + i.w * i.error, 0) / weights) : 0;
+  const ranked = items.filter(i => i.text).sort((a, b) => b.w * b.error - a.w * a.error).map(i => i.text!);
+  if (render.medium && !same(render.medium, target.medium)) ranked.push(`looks like: ${render.medium} (target: ${target.medium})`);
+  if (render.lighting && !same(render.lighting, target.lighting)) ranked.push(`light: ${render.lighting} (target: ${target.lighting})`);
+  const feedback = ranked.length ? `Largest first: ${ranked.join('; ')}` : 'matches the measured layout';
+  return { fitness, subjects, horizon, palette, lightness, feedback };
+}
+
+/** The target's measurements in words, for the optimiser. */
+export function describeObservation(o: Observation): string {
+  const lines = o.subjects.filter(s => s.box).map(s => {
+    const b = s.box!;
+    return `- ${s.name}: x ${pct(b.xmin)}–${pct(b.xmax)}, y ${pct(b.ymin)}–${pct(b.ymax)} of the frame (width ${pct(b.xmax - b.xmin)}, height ${pct(b.ymax - b.ymin)})`;
+  });
+  if (o.horizon !== null) lines.push(`- horizon: ${pct(o.horizon)} from the top${o.horizonShape ? `, ${o.horizonShape}` : ''}`);
+  lines.push(`- camera: ${o.camera}; light: ${o.lighting}; medium: ${o.medium}`);
+  return lines.join('\n');
 }

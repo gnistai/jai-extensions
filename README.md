@@ -58,29 +58,29 @@ The encoder turns an existing image into a JAI document that your chosen models
 reproduce as closely as possible. It follows the specification's informative
 section [Encoding images](https://jai.gnist.ai/spec/#image-encoding):
 
-1. A vision model (Gemini 2.5 Flash by default, or Claude Sonnet 4.5) writes
-   several first descriptions.
-2. Every candidate is rendered with every target model, with fixed seeds.
-3. Each render is scored: CLIP image-embedding similarity, a coarse colour and
-   layout distance between thumbnails, and the vision model's own rating. The
-   current best is rated again in every call, because the ratings are noisy.
-   A candidate's fitness blends its mean and its worst per-model score, so the
-   core description cannot sacrifice one model.
-4. The vision model lists the differences between the best renders and the
-   original and writes revised descriptions. This repeats for a number of
-   generations or until scores stop improving.
-5. For models that still lag, it tries short `prompt/<family>` refinements and
-   keeps one only if it raises that model's score. It skips models whose
-   prompt window the core already fills, and models that share a family with
-   another target model.
-6. It stops at the spending limit, which it enforces from price estimates
-   before every call. The result is the best document plus a report.
+1. A vision model (GPT-5.6 luna by default, Gemini 2.5 Flash as an option)
+   measures the original: its main subjects with bounding boxes, the horizon's
+   height and shape, the camera, the light and the medium. Palette and
+   lightness come from the pixels.
+2. It writes several first descriptions. Every candidate is rendered with every
+   target model and two fixed seeds.
+3. Each render is measured the same way, and its fitness is computed from the
+   differences: positions, sizes, horizon, palette and lightness. Nothing is
+   judged by feel, so scores are stable and comparable across runs. A
+   candidate's fitness blends its mean and its worst per-model score.
+4. An optimiser (by default the same model; `--optimiser sonnet` uses Claude
+   Sonnet 5) sees the original's measurements and the best earlier candidates
+   with their measured differences, largest first, and writes the next
+   candidates. This repeats until a target fitness, a plateau or the budget.
+5. Models that still lag get short `prompt/<family>` refinements written the
+   same way. Independent restarts (`--restarts`) can share the budget; the
+   best by fitness wins.
 
 From the command line (reads `REPLICATE_API_TOKEN`):
 
 ```sh
 npm install && npm run build   # Node 20.9 or later
-node bin/jai.mjs encode photo.jpg --models flux-schnell,sdxl --budget 0.50
+node bin/jai.mjs encode photo.jpg --models flux-schnell,sdxl --budget 0.60
 # writes photo.jai and photo.jai.report/ (report.json and an HTML contact sheet)
 node bin/jai.mjs render photo.jai --model sdxl --out check.webp
 node bin/jai.mjs validate "jai:A castle;prompt/flux=at dusk"
@@ -94,9 +94,12 @@ allow-list of fields per model and accepts images only as re-encoded `data:`
 images or Replicate output URLs. It also enforces the run's spending limit,
 fixed when the run starts, and caps concurrent calls.
 
-A typical run for two models, four candidates and six generations costs
-roughly $0.20 to $0.40 and takes five to eight minutes. See the
-[Earthrise example](https://jai.gnist.ai/examples/#encoding).
+A run for one model with six candidates per generation and two seeds costs
+about $0.25 and takes five to seven minutes; on Earthrise it climbed from
+fitness 0.54 to 0.72 by itself. Jointly optimising one core for FLUX.1 schnell
+and SDXL does not converge yet (SDXL responds too erratically), so encode for
+one model and let other models render the core. See the
+[examples](https://jai.gnist.ai/examples/#encoding).
 
 ## Install
 

@@ -2,7 +2,7 @@
 // ReplicateClient that sends every prediction through the background, which
 // alone holds the token. The engine (src/encoder) does the rest.
 import { encode as encodeFile, type JaiDocument } from '../jai/index.ts';
-import { ClaudeAnalyst, ClipScorer, GeminiAnalyst, encode, type Candidate, type EncodeEvent, type ImageRef, type Thumbnail } from '../encoder/index.ts';
+import { GeminiAnalyst, OpenAIAnalyst, encode, type Candidate, type EncodeEvent, type ImageRef, type Thumbnail } from '../encoder/index.ts';
 import type { ModelRef, PredictOptions, Prediction, ReplicateClient } from '../providers/replicate-client.ts';
 import { REPLICATE_MODELS, ReplicateRenderer } from '../renderers/replicate.ts';
 import { RenderError } from '../renderers/types.ts';
@@ -105,15 +105,6 @@ async function loadImage(blob: Blob, name: string): Promise<Loaded> {
   return { target: { url: await blobToDataURL(jpeg), width, height }, thumb, name, previewURL: URL.createObjectURL(jpeg) };
 }
 
-async function composite(images: ImageRef[]): Promise<ImageRef> {
-  const tiles = await Promise.all(images.map(async i => createImageBitmap(await (await fetch(i.url)).blob())));
-  const c = new OffscreenCanvas(512 * tiles.length, 512);
-  const ctx = c.getContext('2d')!;
-  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
-  tiles.forEach((t, k) => { const s = Math.min(512 / t.width, 512 / t.height); ctx.drawImage(t, 512 * k + (512 - t.width * s) / 2, (512 - t.height * s) / 2, t.width * s, t.height * s); t.close(); });
-  return { url: await blobToDataURL(await c.convertToBlob({ type: 'image/jpeg', quality: 0.85 })) };
-}
-
 // ---------------------------------------------------------------- UI
 
 let loaded: Loaded | null = null;
@@ -214,7 +205,9 @@ function candidateCard(c: Candidate): HTMLElement {
       img = el('img', { src: url, alt: `AI render of candidate ${c.id} by ${REPLICATE_MODELS.find(m => m.id === r.model)?.label ?? r.model}` });
     } else img = el('div', { className: 'err' }, 'failed');
     const label = REPLICATE_MODELS.find(m => m.id === r.model)?.label ?? r.model;
-    return el('figure', {}, img, el('figcaption', {}, `${label} ${r.score.toFixed(3)}${r.judge !== null ? ` · rated ${Math.round(r.judge * 100)}` : ''}`));
+    const fig = el('figure', {}, img, el('figcaption', {}, `${label} ${r.score.toFixed(3)}`));
+    if (r.measure) fig.title = r.measure.feedback;
+    return fig;
   });
   const refinements = Object.entries(c.refinements).map(([m, v]) => `+ ${m.split('/')[1]}: ${v.join(' ')}`).join('\n');
   const card = el('div', { className: 'cand' }, el('div', {}, el('b', {}, c.id), ` ${c.fitness.toFixed(3)}`), el('div', { className: 'imgs' }, ...figs), el('p', {}, c.draft.prompt + (refinements ? `\n${refinements}` : '')));
@@ -224,7 +217,8 @@ function candidateCard(c: Candidate): HTMLElement {
 
 let currentGen: HTMLElement | null = null;
 function onEvent(e: EncodeEvent): void {
-  if (e.type === 'phase') { log({ describe: 'Describing the image…', evolve: 'Rendering and revising…', refine: 'Trying per-model refinements…', done: 'Done.' }[e.phase]); currentGen = null; log(`${$('spend').textContent || 'Nothing spent yet.'}`); }
+  if (e.type === 'target') log(`Measured the image: ${e.observation.subjects.map(s => s.name).join(', ') || 'no distinct subjects'}${e.observation.horizon !== null ? `, horizon at ${Math.round(e.observation.horizon * 100)}%` : ''}.`);
+  if (e.type === 'phase') { log({ inspect: 'Measuring the image…', describe: `Describing the image${e.lineage && e.lineage > 1 ? ` (attempt ${e.lineage})` : ''}…`, evolve: 'Rendering, measuring and improving…', refine: 'Trying per-model refinements…', done: 'Done.' }[e.phase]); currentGen = null; log(`${$('spend').textContent || 'Nothing spent yet.'}`); }
   if (e.type === 'log') log(e.message);
   if (e.type === 'spend') $('spend').textContent = `Estimated spend ${usd(e.spent)} of ${usd(e.limit)}`;
   if (e.type === 'candidate') {
@@ -249,16 +243,16 @@ $('start').addEventListener('click', async () => {
   $('log').textContent = ''; $('gens').textContent = ''; $('result-card').hidden = true; $('progress-card').hidden = false;
   const budget = Math.min(5, Math.max(0.05, Number($<HTMLInputElement>('budget').value) || 0.5));
   const client = new PortClient(budget);
-  const analyst = $<HTMLSelectElement>('analyst').value === 'claude' ? new ClaudeAnalyst(client, { composite }) : new GeminiAnalyst(client);
+  const analyst = $<HTMLSelectElement>('analyst').value === 'gemini' ? new GeminiAnalyst(client) : new OpenAIAnalyst(client);
   running = new AbortController();
   refresh();
   try {
     const r = await encode({
-      target: loaded.target, models: chosenModels(), renderer: new ReplicateRenderer(client, { foldAvoid: true }), analyst, scorer: new ClipScorer(client),
+      target: loaded.target, models: chosenModels(), renderer: new ReplicateRenderer(client, { foldAvoid: true }), analyst,
       thumbnail: async res => { const b = await createImageBitmap(new Blob([res.bytes as BlobPart], { type: res.mime })); const t = coverThumb(b, b.width, b.height); b.close(); return t; },
-      targetThumbnail: loaded.thumb, judgeWeight: $<HTMLInputElement>('judge').checked ? 0.5 : 0,
+      targetThumbnail: loaded.thumb, restarts: Math.min(3, Math.max(1, Number($<HTMLInputElement>('restarts').value) || 1)),
       budgetUSD: budget, population: Math.min(6, Math.max(2, Number($<HTMLInputElement>('population').value) || 4)),
-      maxGenerations: Math.min(10, Math.max(1, Number($<HTMLInputElement>('generations').value) || 5)),
+      maxGenerations: Math.min(12, Math.max(1, Number($<HTMLInputElement>('generations').value) || 8)),
       signal: running.signal, onEvent,
     });
     resultDoc = r.document;

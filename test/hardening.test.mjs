@@ -2,7 +2,7 @@
 // cancellation by id, and failures that must not orphan provider work.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { sanitizeInput, allowedModel, allowedImage, PortLedger, GEMINI, CLAUDE, CLIP, costOf } from '../dist/test/encode-guard.js';
+import { sanitizeInput, allowedModel, allowedImage, PortLedger, GEMINI, CLAUDE, CLIP, LUNA, costOf } from '../dist/test/encode-guard.js';
 import { HttpReplicateClient } from '../dist/test/replicate-client.js';
 import { cleanText, toDrafts, encode } from '../dist/encoder.mjs';
 
@@ -31,6 +31,11 @@ test('guard: inputs are rebuilt from an allow-list; fixed fields come from the r
   assert.ok('error' in sanitizeInput(GEMINI, { prompt: 'p', images: ['http://192.168.0.1/secret.png'] }));
   assert.ok('error' in sanitizeInput(CLAUDE, { prompt: 'p', image: 'https://evil.example/a.png' }));
   assert.ok('error' in sanitizeInput(CLIP, { text: 'x' }));
+  const l = sanitizeInput(LUNA, { prompt: 'p', system_prompt: 's', image_input: ['data:image/jpeg;base64,AAAA'], reasoning_effort: 'low', max_completion_tokens: 99999, tools: [1] });
+  assert.deepEqual(Object.keys(l.input).sort(), ['image_input', 'max_completion_tokens', 'prompt', 'reasoning_effort', 'system_prompt']);
+  assert.equal(l.input.max_completion_tokens, 4096);
+  assert.ok('error' in sanitizeInput(LUNA, { prompt: 'p', reasoning_effort: 'xhigh' }));
+  assert.ok('error' in sanitizeInput(LUNA, { prompt: 'p', image_input: ['https://evil.example/a.png'] }));
 });
 
 test('guard: image URLs are re-encoded rasters or Replicate outputs only', () => {
@@ -87,21 +92,24 @@ test('client: an abort during the create request cancels the prediction by id', 
   assert.equal(posts, 0);
 });
 
-test('engine: a scorer failure is one failed render, not a crash; nothing runs after encode() returns', async () => {
+test('engine: an inspection failure is one failed render, not a crash; nothing runs after encode() returns', async () => {
   const models = [{ id: 'acme/a', label: 'A', family: 'a', aliases: [], imageInput: false, negativePrompt: false, shortWindow: false, costHint: 0.01, description: '' }];
   let started = 0, returned = false, after = 0;
   const renderer = { id: 'm', label: 'm', models: () => models, async render(req) { started++; if (returned) after++; await new Promise(r => setTimeout(r, 5)); return { bytes: new Uint8Array([1]), mime: 'image/png', model: req.modelId, sentPrompt: '', sentNegative: null, sentInput: {}, jobId: null, diagnostics: [], outputURL: 'mock:' + started }; } };
   let n = 0;
-  const scorer = { id: 's', costHint: 0.001, async prepare() {}, async score() { if (++n === 2) throw new Error('no embedding'); return 0.5; } };
-  const analyst = { id: 'a', costHint: 0.005, async describe(t, k) { return { value: Array.from({ length: k }, (_, i) => ({ prompt: 'p' + i, style: [], avoid: [] })), notes: '', cost: 0.005 }; }, async revise(t, d, r, k) { return { value: Array.from({ length: k }, (_, i) => ({ prompt: 'q' + i, style: [], avoid: [] })), notes: '', cost: 0.005 }; }, async refine() { return { value: [], notes: '', cost: 0.005 }; } };
-  const r = await encode({ target: { url: 'data:image/png;base64,AA', width: 10, height: 10 }, models: ['acme/a'], renderer, analyst, scorer, budgetUSD: 1, population: 4, maxGenerations: 2, concurrency: 2 });
+  const obs = { subjects: [{ name: 'thing', box: { ymin: 0.4, xmin: 0.4, ymax: 0.6, xmax: 0.6 } }], horizon: null, horizonShape: '', camera: '', lighting: '', medium: '' };
+  const analyst = { id: 'a', costHint: 0.005,
+    async describe(t, k) { return { value: Array.from({ length: k }, (_, i) => ({ prompt: 'p' + i, style: [], avoid: [] })), notes: '', cost: 0.005 }; },
+    async inspect(img, subjects) { if (subjects && ++n === 2) throw new Error('bad JSON'); return { value: obs, notes: '', cost: 0.001 }; },
+    async propose(t, ctx) { return { value: Array.from({ length: ctx.n }, (_, i) => ({ prompt: 'q' + i, style: [], avoid: [] })), notes: '', cost: 0.005 }; } };
+  const r = await encode({ target: { url: 'data:image/png;base64,AA', width: 10, height: 10 }, models: ['acme/a'], renderer, analyst, budgetUSD: 1, population: 4, maxGenerations: 2, concurrency: 2, goal: 2 });
   returned = true;
   await new Promise(r => setTimeout(r, 50));
   assert.equal(after, 0);
-  const failed = r.candidates.flatMap(c => c.renders).filter(x => x.error?.startsWith('Scoring failed'));
+  const failed = r.candidates.flatMap(c => c.renders).filter(x => x.error?.startsWith('Inspection failed'));
   assert.equal(failed.length, 1);
   assert.equal(failed[0].score, 0);
-  assert.ok(r.spend.some(l => l.label.includes('(failed)') && l.kind === 'scorer'));
+  assert.ok(r.spend.some(l => l.label.includes('(failed)') && l.kind === 'inspect'));
 });
 
 test('fetch guard: only .jai over http(s), no private targets from public pages, rate limited', async () => {

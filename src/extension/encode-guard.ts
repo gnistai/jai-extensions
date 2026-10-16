@@ -10,11 +10,13 @@ import { tokenCostUSD, worstCaseUSD } from '../providers/pricing.ts';
 
 export const GEMINI: ModelRef = { id: 'google/gemini-2.5-flash' };
 export const CLAUDE: ModelRef = { id: 'anthropic/claude-4.5-sonnet' };
+export const CLAUDE5: ModelRef = { id: 'anthropic/claude-sonnet-5' };
+export const LUNA: ModelRef = { id: 'openai/gpt-5.6-luna' };
 export const CLIP: ModelRef = { id: 'krthr/clip-embeddings', version: '1c0371070cb827ec3c7f2f28adcdde54b50dcd239aa6faea0bc98b174ef03fb4' };
 
 /** Most one prediction can cost (held before it starts), the same estimates the engine budgets with. */
 export function costOf(model: ModelRef): number {
-  if (model.id === GEMINI.id || model.id === CLAUDE.id) return worstCaseUSD(model.id);
+  if (model.id === GEMINI.id || model.id === CLAUDE.id || model.id === CLAUDE5.id || model.id === LUNA.id) return worstCaseUSD(model.id);
   if (model.id === CLIP.id) return 0.0005;
   return REPLICATE_MODELS.find(m => m.id === model.id)?.costHint ?? Infinity;
 }
@@ -24,7 +26,7 @@ export const MAX_IN_FLIGHT = 8;
 const MAX_DATA_URL = 12 * 1024 * 1024;
 
 export function allowedModel(m: { id?: unknown; version?: unknown }): ModelRef | null {
-  const all: ModelRef[] = [...REPLICATE_MODELS.map(x => (x.official ? { id: x.id } : { id: x.id, version: x.version })), GEMINI, CLAUDE, CLIP];
+  const all: ModelRef[] = [...REPLICATE_MODELS.map(x => (x.official ? { id: x.id } : { id: x.id, version: x.version })), GEMINI, CLAUDE, CLAUDE5, LUNA, CLIP];
   return all.find(a => a.id === m.id && (a.version ?? null) === (m.version ?? null)) ?? null;
 }
 
@@ -57,7 +59,7 @@ export function sanitizeInput(model: ModelRef, raw: unknown): Sanitized {
   const fail = (what: string): Sanitized => ({ error: `Invalid ${what} for ${model.id}.` });
 
   if (model.id === GEMINI.id) {
-    if (!put('prompt', str(r.prompt, 20000), true)) return fail('prompt');
+    if (!put('prompt', str(r.prompt, 40000), true)) return fail('prompt');
     if (!put('system_instruction', str(r.system_instruction, 20000))) return fail('system_instruction');
     if (!put('temperature', num(r.temperature, 0, 2))) return fail('temperature');
     if (!put('thinking_budget', int(r.thinking_budget, 0, 2048))) return fail('thinking_budget');
@@ -68,8 +70,19 @@ export function sanitizeInput(model: ModelRef, raw: unknown): Sanitized {
     }
     return { input: out };
   }
-  if (model.id === CLAUDE.id) {
-    if (!put('prompt', str(r.prompt, 20000), true)) return fail('prompt');
+  if (model.id === LUNA.id) {
+    if (!put('prompt', str(r.prompt, 40000), true)) return fail('prompt');
+    if (!put('system_prompt', str(r.system_prompt, 20000))) return fail('system_prompt');
+    if (!put('reasoning_effort', ['none', 'low', 'medium'].includes(r.reasoning_effort as string) ? r.reasoning_effort : undefined)) return fail('reasoning_effort');
+    out.max_completion_tokens = int(r.max_completion_tokens, 1, 4096) ?? 4096;
+    if (r.image_input !== undefined) {
+      if (!Array.isArray(r.image_input) || r.image_input.length > 10 || !r.image_input.every(allowedImage)) return fail('image_input');
+      out.image_input = r.image_input;
+    }
+    return { input: out };
+  }
+  if (model.id === CLAUDE.id || model.id === CLAUDE5.id) {
+    if (!put('prompt', str(r.prompt, 40000), true)) return fail('prompt');
     if (!put('system_prompt', str(r.system_prompt, 20000))) return fail('system_prompt');
     out.max_tokens = int(r.max_tokens, 1, 4096) ?? 4096;
     if (r.image !== undefined) { if (!allowedImage(r.image)) return fail('image'); out.image = r.image; }

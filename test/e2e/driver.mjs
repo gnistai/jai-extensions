@@ -131,7 +131,7 @@ try {
   }) }))[0].result, cspTab);
   check('content scripts cannot use the encoder port', portProbe.disconnected && !portProbe.replied, JSON.stringify(portProbe));
 
-  // Encode page: a tiny real run (one generation of two candidates, FLUX schnell, no judge): about $0.02.
+  // Encode page: a tiny real run (one generation of two candidates, two seeds, FLUX schnell, GPT-5.6 luna measuring): about $0.03.
   const png = Buffer.from(await (await fetch(`${base}/original.png`)).arrayBuffer());
   writeFileSync(join(out, 'encode-target.png'), png);
   const enc = await browser.newPage();
@@ -141,16 +141,15 @@ try {
   await enc.waitForFunction(() => /pixels/.test(document.getElementById('dims').textContent), { timeout: 10000 });
   check('encode page: start needs consent', await enc.$eval('#start', b => b.disabled));
   await enc.click('#consent');
-  await enc.$eval('#budget', i => { i.value = '0.05'; });
+  await enc.$eval('#budget', i => { i.value = '0.10'; });
   await enc.$eval('#population', i => { i.value = '2'; });
   await enc.$eval('#generations', i => { i.value = '1'; });
-  await enc.click('#judge');
   await enc.click('#start');
   await enc.waitForFunction(() => !document.getElementById('result-card').hidden || /Encoding failed/.test(document.getElementById('log').textContent), { timeout: 240000 });
   const encState = await enc.evaluate(() => ({ text: document.getElementById('result-text').textContent, note: document.getElementById('result-note').textContent, log: document.getElementById('log').textContent, renders: document.querySelectorAll('.cand img').length }));
-  check('encode page: tiny real run returns a JAI document', /^jai:.+;aspect=3:2;(?:.*;)?model=black-forest-labs\/flux-schnell(?:;|$)/.test(encState.text) && encState.renders === 2, JSON.stringify(encState).slice(0, 400));
+  check('encode page: tiny real run returns a JAI document', /^jai:.+;aspect=3:2;(?:.*;)?model=black-forest-labs\/flux-schnell(?:;|$)/.test(encState.text) && encState.renders === 4, JSON.stringify(encState).slice(0, 400));
   const spent = Number(/\$(\d+\.\d+) in/.exec(encState.note)?.[1] ?? NaN);
-  check('encode page: estimated spend within the limit', spent > 0 && spent <= 0.05, encState.note);
+  check('encode page: estimated spend within the limit', spent > 0 && spent <= 0.10, encState.note);
   await enc.screenshot({ path: join(out, 'encode.png'), fullPage: true });
 } catch (e) {
   check('driver', false, String(e && e.stack || e));
