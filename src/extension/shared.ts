@@ -10,7 +10,7 @@ export interface Settings {
   maxConcurrent: number;
   maxPerPage: number;
   maxPerDay: number;
-  /** Elements smaller than this (CSS px, both sides) are never rendered automatically. */
+  /** Elements smaller than this on either side (CSS px) are never rendered automatically. */
   minDisplayedPx: number;
   defaultSiteMode: SiteMode;
   sites: Record<string, SiteMode>;
@@ -70,7 +70,7 @@ export interface StateReply {
   models: ModelChoice[];
   defaultModel: string;
   usage: { today: number; maxPerDay: number; maxPerPage: number };
-  /** Elements smaller than this (CSS px, either side) are never rendered automatically. */
+  /** Elements smaller than this on either side (CSS px) are never rendered automatically. */
   minDisplayedPx: number;
 }
 
@@ -100,6 +100,9 @@ export const b64encode = (bytes: Uint8Array): string => {
 };
 export const b64decode = (s: string): Uint8Array => Uint8Array.from(atob(s), c => c.charCodeAt(0));
 export const today = (): string => new Date().toISOString().slice(0, 10);
+
+/** The most bytes of a .jai resource either fetch route reads: 16 MiB, the decoder's decompression bound (spec §Untrusted input and bounds). */
+export const MAX_JAI_BYTES = 16 * 1024 * 1024;
 
 export /** Read a response body, giving up (null) past `max` bytes without buffering the rest. */
 async function readCapped(res: Response, max: number): Promise<Uint8Array | null> {

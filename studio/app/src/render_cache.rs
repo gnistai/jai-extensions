@@ -39,9 +39,11 @@ impl RenderCache {
 
     /// The key of a render: the canonical document text, the requested seed
     /// (`None` for the document's own) and a size tag (model, scale, format).
+    /// The prefix changes whenever the renderer would draw the same key
+    /// differently, so that no older render is served.
     pub fn key(identity: &str, seed: Option<&str>, size: &str) -> String {
         let mut h = Sha256::new();
-        h.update(b"jai-render-v1\n");
+        h.update(b"jai-render-v2\n");
         h.update(identity.as_bytes());
         h.update(b"\nseed=");
         h.update(seed.unwrap_or("document").as_bytes());

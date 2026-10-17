@@ -1,5 +1,5 @@
 // Interpretation of the standard keys and model matching (spec §Interpretation, §Model matching).
-import { QUALIFIABLE, RASTER_TYPES, WS_CLASS, asciiLower, byCodePoint, diag, trim, type Diagnostic, type JaiDocument } from './chars.ts';
+import { RASTER_TYPES, WS_CLASS, asciiLower, byCodePoint, diag, trim, type Diagnostic, type JaiDocument } from './chars.ts';
 import { parseDataURL } from './decode.ts';
 
 export interface Aspect { kind: 'ratio' | 'keyword'; width: number; height: number; keyword?: string; ratio?: number }
@@ -25,7 +25,6 @@ export interface Interpreted {
   seed: string | null;
   source: string | null;
   preview: string | null;
-  animate: boolean;
   /** What the selected model receives (spec §Per-model refinements): core values, then matching refinements. */
   modelPrompt: string[];
   modelDescription: string;
@@ -75,7 +74,7 @@ export interface InterpretOptions { catalog?: CatalogModel[]; families?: Record<
 
 export function interpret(doc: JaiDocument, { catalog = [], families = {}, hasOriginal = false, governingRatio = null, selected = null }: InterpretOptions = {}): { interpreted: Interpreted; diagnostics: Diagnostic[] } {
   const diagnostics: Diagnostic[] = [];
-  const out: Interpreted = { prompt: null, description: '', style: [], avoid: [], model: [], aspect: null, mode: 'generate', strength: null, seed: null, source: null, preview: null, animate: false, modelPrompt: [], modelDescription: '', modelStyle: [], modelAvoid: [] };
+  const out: Interpreted = { prompt: null, description: '', style: [], avoid: [], model: [], aspect: null, mode: 'generate', strength: null, seed: null, source: null, preview: null, modelPrompt: [], modelDescription: '', modelStyle: [], modelAvoid: [] };
   const single = (key: string): string | null => {
     const vals = doc.get(key);
     if (!vals || !vals.length) return null;
@@ -123,12 +122,6 @@ export function interpret(doc: JaiDocument, { catalog = [], families = {}, hasOr
   if ((v = single('preview')) !== null) {
     const d = /^data:/i.test(v) ? parseDataURL(v) : null;
     if (d && RASTER_TYPES.has(d.essence)) out.preview = v; else diagnostics.push(diag('unsupported-preview', 'preview'));
-  }
-  if ((v = single('animate')) !== null) {
-    const lv = asciiLower(v);
-    if (['true', 'yes', '1', 'on'].includes(lv)) out.animate = true;
-    else if (['false', 'no', '0', 'off'].includes(lv)) out.animate = false;
-    else diagnostics.push(diag('invalid-value', 'animate'));
   }
   // Ratio to render at (spec §Size and aspect): the governing ratio wins over aspect.
   out.ratio = out.aspect ? out.aspect.width / out.aspect.height : null;

@@ -1,6 +1,6 @@
 // HTML discovery (spec §Discovery). Works on a minimal element interface so it
 // runs on real DOM elements and on hand-made trees alike.
-import { LEADING_WS_RE, MEDIA_TYPE, asciiLower, isAsciiSpace, normalizeValue, trimBy, type Diagnostic, type JaiDocument } from './chars.ts';
+import { MEDIA_TYPE, asciiLower, isAsciiSpace, normalizeValue, trimBy, type Diagnostic, type JaiDocument } from './chars.ts';
 import { decodeDataURL } from './decode.ts';
 import { parse, type ParseInfo } from './text.ts';
 
@@ -171,13 +171,13 @@ export function discoverAll(root: RootLike, opts?: { baseURL?: string }): Array<
 }
 
 /**
- * Attribute carrier (spec §Carriers): the element's alt text, taken literally and never
- * parsed, is the first prompt value; the prose in data-jai follows it.
+ * Attribute carrier (spec §Carriers): when the document parsed from data-jai has no
+ * prompt value (qualified prompt/<target> keys do not count), the element's alt text,
+ * after value normalisation and if not empty, is its single prompt value, taken
+ * literally and never parsed. Otherwise alt plays no part.
  */
 export function withAltPrompt(doc: JaiDocument, alt: string | null | undefined): JaiDocument {
-  const a = alt === null || alt === undefined ? null : normalizeValue(alt);
-  if (!a) return doc;
-  const out: JaiDocument = new Map([['prompt', [a, ...(doc.get('prompt') ?? [])]]]);
-  for (const [k, v] of doc) if (k !== 'prompt') out.set(k, v);
-  return out;
+  if (doc.has('prompt')) return doc;
+  const a = alt === null || alt === undefined ? null : normalizeValue(String(alt));
+  return a ? new Map([['prompt', [a]], ...doc]) : doc;
 }

@@ -13,14 +13,14 @@ holds four layers, each depending only on the ones above it:
 
 In detail:
 
-- **`src/jai/`** — a dependency-free TypeScript library for JAI: parsing,
-  canonical serialisation, JSON and `.jai` files, `data:` URLs, HTML
-  discovery, parameter interpretation and validation. It passes the
+- **`src/jai/`** — a dependency-free TypeScript library for JAI: parsing and
+  canonical serialisation of JAI text, `.jai` files, `data:image/jai` URLs,
+  HTML discovery, parameter interpretation and validation. It passes the
   specification's full conformance suite.
 - **`src/renderers/`** — a provider-independent renderer interface and the
   Replicate adapter.
 - **`src/encoder/`** — the image encoder engine: image to JAI by analysis by
-  synthesis, with pluggable analyst, scorer and renderer, hard budgets and
+  synthesis, with pluggable analyst, optimiser and renderer, hard budgets and
   per-model refinements (`prompt/<target>`).
 - **`src/extension/`** — a Chrome Manifest V3 extension that finds JAI images on
   web pages and renders them with your own Replicate account, when you ask, and
@@ -42,14 +42,14 @@ the definition of the format.
 ## What it does
 
 1. Click the toolbar button on a page. The extension scans it for images that
-   explicitly carry JAI: the attribute form (`alt` as the description plus
-   `data-jai`), the picture form (`<source type="image/jai">`), or the src
-   form (a `.jai` file or `data:image/jai` URL in `src`). `.jai` files are
-   fetched only when you open an image's controls or render it. A plain `alt`
-   is never read as JAI.
-   Ordinary images are never touched.
-2. Each JAI image gets a small **JAI** control. It opens a panel with the raw and
-   parsed description, diagnostics, the canonical form, and a choice of renderer.
+   explicitly carry JAI: the attribute form (`data-jai`, where the image's `alt`
+   is the prompt unless `data-jai` gives one), the picture form
+   (`<source type="image/jai">`), or the src form (a `.jai` file or
+   `data:image/jai` URL in `src`). `.jai` files are fetched only when you open
+   an image's controls or render it. An `alt` without `data-jai` is never read
+   as JAI. Ordinary images are never touched.
+2. Each JAI image gets a small **JAI** control. It opens a panel with the
+   parsed description, diagnostics, the canonical text, and a choice of renderer.
 3. **Render** sends the description (and, for `mode=transform`, the picture shown
    on the page, if the page itself is allowed to read it) to Replicate, then
    swaps the render in while keeping the layout box. **Show original** switches
@@ -89,9 +89,25 @@ From the command line (reads `REPLICATE_API_TOKEN`):
 npm install && npm run build   # Node 20.9 or later
 node bin/jai.mjs encode photo.jpg --models flux-schnell,sdxl --budget 0.60
 # writes photo.jai and photo.jai.report/ (report.json and an HTML contact sheet)
-node bin/jai.mjs render photo.jai --model sdxl --out check.webp
-node bin/jai.mjs validate "jai:A castle;prompt/flux=at dusk"
+node bin/jai.mjs render photo.jai --model sdxl --out check.png
+node bin/jai.mjs validate "A castle;prompt/flux=at dusk"
 ```
+
+A document argument that begins with `data:image/jai` followed by `,` or `;`
+(ignoring case and surrounding spaces) is a `data:image/jai` URL, read as its
+text body; `validate` also reports the URL's own advisories, such as
+`data-url-parameter` for `;base64`. Otherwise one line ending in `.jai` is a
+`.jai` file, read as the file form only (one gzip member of JSON; nothing else
+is tried), and any other argument, prose that begins with "Data:" included, is
+JAI text. A document that cannot be read (`malformed-container` or
+`invalid-json` for a `.jai` file, `undecodable` for a `data:` URL, a
+`data:image/jai` URL that carries no document, or a `.jai` file that exists but
+cannot be read) makes `validate` and `render` exit with 1: `validate` prints
+only its diagnostics, and `render` sends nothing. Usage errors, such as a
+missing `.jai` file, exit with 2. `render` renders at the document's `aspect`,
+else at its `preview`'s ratio, else at the model's default; it never fetches a
+`source`, so a `mode=transform` document renders as `generate` and is reported
+with `original-not-readable`.
 
 In the extension, open **Encode** from the popup or right-click an image and
 choose **Encode this image as JAI**. The page runs the same engine. Every
@@ -147,8 +163,10 @@ you want.
   when you cancel or leave the page.
 - **Encoding sends your image to Replicate.** The encode page and the CLI send
   a copy, at most 1024 pixels on its longest side and without metadata, to the
-  vision model and to CLIP on Replicate. Nothing is sent until you consent and
-  start, and the spending limit is enforced before every call.
+  vision models on Replicate that describe it, measure it and write the next
+  candidates (the analyst and the optimiser). With `--local` the CLI sends it
+  only to JAI Studio's server on your own computer. Nothing is sent until you
+  consent and start, and the spending limit is enforced before every call.
 - **Bandwidth.** The browser has usually already downloaded the original image
   before the extension sees the page, so rendering does not save bandwidth.
 

@@ -180,10 +180,11 @@ struct ChatArgs {
 
 #[derive(Debug, Args)]
 struct RenderArgs {
-    /// A .jai file, or JAI text
-    #[arg(value_name = "FILE.jai|TEXT")]
+    /// A data:image/jai URL (read as its text body), else a .jai file (one line
+    /// ending in .jai, read as the file form only), else JAI text
+    #[arg(value_name = "FILE.jai|URL|TEXT")]
     input: String,
-    /// Seed, overriding the document's
+    /// Seed, 1 to 20 digits, overriding the document's
     #[arg(long, value_name = "S")]
     seed: Option<String>,
     /// Output image file
@@ -193,8 +194,9 @@ struct RenderArgs {
 
 #[derive(Debug, Args)]
 struct ValidateArgs {
-    /// A .jai file, or JAI text
-    #[arg(value_name = "FILE.jai|TEXT")]
+    /// A data:image/jai URL (read as its text body), else a .jai file (one line
+    /// ending in .jai, read as the file form only), else JAI text
+    #[arg(value_name = "FILE.jai|URL|TEXT")]
     input: String,
 }
 

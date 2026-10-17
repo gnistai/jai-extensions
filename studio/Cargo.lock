@@ -2127,6 +2127,7 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "clap",
+ "flate2",
  "futures",
  "jai-core",
  "jai-engines",

@@ -173,7 +173,7 @@ export interface EncodeOptions {
   population?: number;
   /** Generations per lineage, including the first (default 8). */
   maxGenerations?: number;
-  /** Stop a lineage after this many generations without a gain of `minGain` (default 3). */
+  /** Stop a lineage after this many generations without a gain of `minGain` (default 4). */
   plateau?: number;
   minGain?: number;
   /** Stop as soon as the best fitness reaches this (default 0.9). */

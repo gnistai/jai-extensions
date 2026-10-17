@@ -556,7 +556,7 @@ fn library_gzip_output_is_compressed_through_node_zlib() {
             const doc = J.parse('prompt=a lighthouse on a cliff, a lighthouse on a cliff, a lighthouse on a cliff').document;
             const file = await J.encode(doc);
             const back = J.decode(file);
-            return { gzip: [file[0], file[1]], blockType: (file[10] >> 1) & 3, form: back.form,
+            return { gzip: [file[0], file[1]], blockType: (file[10] >> 1) & 3, diagnostics: back.diagnostics.length,
                      same: J.serialize(back.document) === J.serialize(doc), identity: (await J.identity(doc)).length };
         }"#,
     );
@@ -567,7 +567,7 @@ fn library_gzip_output_is_compressed_through_node_zlib() {
         v["blockType"], 0,
         "the first deflate block is stored, so node:zlib was not used"
     );
-    assert_eq!(v["form"], "gzip");
+    assert_eq!(v["diagnostics"], 0);
     assert_eq!(v["same"], true);
     assert_eq!(v["identity"], 64);
 }

@@ -14,10 +14,9 @@ use anyhow::{anyhow, Context as _};
 use base64::Engine as _;
 use clap::Parser as _;
 use jai_core::download::DlState;
-use jai_js::{DocInput, ValidateResult};
+use jai_js::ValidateResult;
 use sha2::{Digest, Sha256};
 
-use crate::output::format_diag;
 use crate::{Cli, Command};
 
 /// `data:<mime>;base64,<bytes>`.
@@ -44,19 +43,15 @@ pub fn data_url_bytes(url: &str) -> anyhow::Result<Vec<u8>> {
         .context("the data: URL is not valid base64")
 }
 
-/// What `save_file` writes: exactly one of a data URL, text or base64 bytes.
-pub fn save_payload(
-    data_url: Option<&str>,
-    text: Option<&str>,
-    bytes_b64: Option<&str>,
-) -> anyhow::Result<Vec<u8>> {
-    match (data_url, text, bytes_b64) {
-        (Some(url), None, None) => data_url_bytes(url),
-        (None, Some(text), None) => Ok(text.as_bytes().to_vec()),
-        (None, None, Some(b64)) => base64::engine::general_purpose::STANDARD
+/// What `save_file` writes: exactly one of a data URL (a rendered image) or
+/// base64 bytes (a `.jai` file).
+pub fn save_payload(data_url: Option<&str>, bytes_b64: Option<&str>) -> anyhow::Result<Vec<u8>> {
+    match (data_url, bytes_b64) {
+        (Some(url), None) => data_url_bytes(url),
+        (None, Some(b64)) => base64::engine::general_purpose::STANDARD
             .decode(b64.trim())
             .context("bytesB64 is not valid base64"),
-        _ => Err(anyhow!("give exactly one of dataUrl, text and bytesB64")),
+        _ => Err(anyhow!("give exactly one of dataUrl and bytesB64")),
     }
 }
 
@@ -67,10 +62,6 @@ pub fn save_filter(name: &str) -> Option<(&'static str, &'static [&'static str])
         "jai" => ("JAI image", &["jai"]),
         "png" => ("PNG image", &["png"]),
         "jpg" | "jpeg" => ("JPEG image", &["jpg", "jpeg"]),
-        "webp" => ("WebP image", &["webp"]),
-        "html" | "htm" => ("Web page", &["html", "htm"]),
-        "txt" => ("Text", &["txt"]),
-        "json" => ("JSON", &["json"]),
         _ => return None,
     })
 }
@@ -80,7 +71,7 @@ pub fn open_filter(image: bool) -> (&'static str, &'static [&'static str]) {
     if image {
         ("Images", &["png", "jpg", "jpeg", "webp", "gif"])
     } else {
-        ("JAI images", &["jai", "json", "txt"])
+        ("JAI images", &["jai"])
     }
 }
 
@@ -117,39 +108,17 @@ pub fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
-/// What the render cache keys a document by: its canonical text, else a hash
-/// of its raw input.
-pub fn input_identity(validated: &ValidateResult, input: &DocInput) -> String {
+/// What the render cache keys a `.jai` file by: its canonical text, else a
+/// hash of its bytes.
+pub fn input_identity(validated: &ValidateResult, bytes: &[u8]) -> String {
     if let Some(text) = validated.text.as_ref().filter(|t| !t.is_empty()) {
         return text.clone();
     }
-    let mut h = Sha256::new();
-    match input {
-        DocInput::Bytes(b) => h.update(b),
-        DocInput::Text(t) => h.update(t.as_bytes()),
-    }
-    let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    format!("raw:{hex}")
-}
-
-/// Why a document cannot be rendered, from its fatal diagnostics.
-pub fn fatal_message(validated: &ValidateResult) -> String {
-    let fatal: Vec<String> = validated
-        .diagnostics
+    let hex: String = Sha256::digest(bytes)
         .iter()
-        .filter(|d| {
-            matches!(
-                d.code.as_str(),
-                "invalid-json" | "malformed-container" | "undecodable"
-            )
-        })
-        .map(format_diag)
+        .map(|b| format!("{b:02x}"))
         .collect();
-    if fatal.is_empty() {
-        "this is not a readable JAI document".into()
-    } else {
-        format!("this is not a readable JAI document: {}", fatal.join("; "))
-    }
+    format!("raw:{hex}")
 }
 
 /// What a second launch asks the running instance for.
@@ -381,7 +350,6 @@ impl ProgressThrottle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jai_js::Diag;
 
     #[test]
     fn data_urls() {
@@ -396,26 +364,24 @@ mod tests {
     #[test]
     fn payloads() {
         assert_eq!(
-            save_payload(None, Some("a castle"), None).unwrap(),
-            b"a castle"
-        );
-        assert_eq!(
-            save_payload(Some("data:image/png;base64,AAE="), None, None).unwrap(),
+            save_payload(Some("data:image/png;base64,AAE="), None).unwrap(),
             [0, 1]
         );
-        assert_eq!(save_payload(None, None, Some("AAE=")).unwrap(), [0, 1]);
-        assert!(save_payload(None, None, None).is_err());
-        assert!(save_payload(Some("data:x;base64,AA=="), Some("t"), None).is_err());
+        assert_eq!(save_payload(None, Some("AAE=")).unwrap(), [0, 1]);
+        assert!(save_payload(None, None).is_err());
+        assert!(save_payload(Some("data:x;base64,AA=="), Some("AA==")).is_err());
     }
 
     #[test]
     fn filters() {
         assert_eq!(save_filter("castle.jai"), Some(("JAI image", &["jai"][..])));
         assert_eq!(save_filter("castle.JPG").map(|f| f.0), Some("JPEG image"));
+        assert_eq!(save_filter("castle.png").map(|f| f.0), Some("PNG image"));
+        assert_eq!(save_filter("castle.html"), None);
         assert_eq!(save_filter("castle"), None);
         assert_eq!(save_filter("castle.xyz"), None);
         assert!(open_filter(true).1.contains(&"webp"));
-        assert!(open_filter(false).1.contains(&"jai"));
+        assert_eq!(open_filter(false), ("JAI images", &["jai"][..]));
     }
 
     #[test]
@@ -431,42 +397,26 @@ mod tests {
         assert_eq!(jpeg_size(&[0xff, 0xd8, 0xff, 0xc0, 0x00]), None);
     }
 
-    fn validated(text: Option<&str>, codes: &[&str]) -> ValidateResult {
+    fn validated(text: Option<&str>) -> ValidateResult {
         ValidateResult {
-            ok: codes.is_empty(),
-            fatal: !codes.is_empty(),
-            form: None,
+            ok: true,
+            fatal: false,
             text: text.map(str::to_string),
-            diagnostics: codes
-                .iter()
-                .map(|c| Diag {
-                    code: c.to_string(),
-                    key: None,
-                    requested: None,
-                    actual: None,
-                    reason: None,
-                })
-                .collect(),
+            diagnostics: Vec::new(),
         }
     }
 
     #[test]
-    fn identities_and_fatal_messages() {
-        let input = DocInput::Text("a castle".into());
+    fn identities() {
+        let bytes = b"\x1f\x8b a castle";
         assert_eq!(
-            input_identity(&validated(Some("a castle\n"), &[]), &input),
+            input_identity(&validated(Some("a castle\n")), bytes),
             "a castle\n"
         );
-        let raw = input_identity(&validated(None, &[]), &input);
+        let raw = input_identity(&validated(None), bytes);
         assert!(raw.starts_with("raw:") && raw.len() == 68);
-        assert_ne!(
-            raw,
-            input_identity(&validated(None, &[]), &DocInput::Bytes(b"x".to_vec()))
-        );
-        assert_eq!(
-            fatal_message(&validated(None, &["invalid-json", "adjusted-value"])),
-            "this is not a readable JAI document: invalid-json"
-        );
+        assert_eq!(raw, input_identity(&validated(Some("")), bytes));
+        assert_ne!(raw, input_identity(&validated(None), b"x"));
     }
 
     fn args(a: &[&str]) -> Vec<String> {

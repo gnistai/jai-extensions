@@ -1,5 +1,7 @@
 //! `jai render`: a document rendered with `jai_js::render` against the local
-//! server, written to an image file.
+//! server, written to an image file. A document that cannot be read is
+//! refused as `jai validate` judges it (exit 1), before any server is found
+//! or started.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -8,7 +10,7 @@ use anyhow::Context as _;
 use jai_js::RenderOptions;
 
 use super::{engine_progress, usage};
-use crate::output::{format_diag, js_error};
+use crate::output::{fatal_message, format_diag, js_error};
 use crate::term::Live;
 use crate::RenderArgs;
 
@@ -20,7 +22,11 @@ pub async fn run(args: RenderArgs) -> anyhow::Result<ExitCode> {
         Some(out) => format_for(out)?,
         None => "png",
     };
-    let (input, _) = super::doc_input(&args.input)?;
+    let input = super::doc_input(&args.input)?;
+    let checked = super::validate_doc(input.clone()).await?;
+    if checked.fatal {
+        anyhow::bail!("{}", fatal_message(&checked));
+    }
     let paths = super::paths()?;
     let live = Live::new();
     let seed = args.seed.clone();
@@ -32,9 +38,7 @@ pub async fn run(args: RenderArgs) -> anyhow::Result<ExitCode> {
             RenderOptions {
                 server: client.server.clone(),
                 seed,
-                model: None,
                 output_format: Some(format.to_string()),
-                scale: None,
             },
         )
         .await
@@ -67,14 +71,14 @@ pub async fn run(args: RenderArgs) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// A seed is a non-negative integer of any size; the renderer reduces it
-/// modulo 2^32 and says so.
+/// A seed is one to twenty ASCII digits, as the document's `seed` key takes
+/// it; the renderer reduces it modulo 2^32 and says so.
 pub fn check_seed(seed: &str) -> anyhow::Result<()> {
-    if !seed.is_empty() && seed.len() <= 40 && seed.bytes().all(|b| b.is_ascii_digit()) {
+    if (1..=20).contains(&seed.len()) && seed.bytes().all(|b| b.is_ascii_digit()) {
         Ok(())
     } else {
         Err(usage(format!(
-            "--seed must be a non-negative integer, not {seed:?}"
+            "--seed must be 1 to 20 digits, not {seed:?}"
         )))
     }
 }
@@ -132,7 +136,9 @@ mod tests {
     #[test]
     fn seeds() {
         assert!(check_seed("0").is_ok());
-        assert!(check_seed("123456789012345678901234567890").is_ok());
+        assert!(check_seed("99999999999999999999").is_ok());
+        let e = check_seed("123456789012345678901").unwrap_err();
+        assert_eq!(super::super::exit_code(&e), 2, "21 digits");
         assert!(check_seed("-1").is_err());
         assert!(check_seed("1.5").is_err());
         assert!(check_seed("").is_err());

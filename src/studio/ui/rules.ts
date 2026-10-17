@@ -6,6 +6,8 @@ import type { EncodeSettings, Thinking, VcInstallReply } from './api.ts';
 export const IMAGE_FILE = /\.(png|jpe?g|webp|gif)$/i;
 /** The same formats in words, for the UI's texts. */
 export const IMAGE_FORMATS = 'PNG, JPEG, WebP or GIF';
+/** A JAI document file, by its name: a .jai file holds the file form and is the only document file Studio opens. */
+export const JAI_FILE = /\.jai$/i;
 
 /**
  * encode_start's ranges (studio/app/src/encoding.rs, EncodeSettings::check),

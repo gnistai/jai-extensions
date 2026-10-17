@@ -675,7 +675,7 @@ keeps the time; QuickJS calls it while regular expressions run too.
 
 ```rust
 pub struct ServerRef { pub url: String, pub token: String }
-pub enum DocInput { Bytes(Vec<u8>), Text(String) }
+pub enum DocInput { Bytes(Vec<u8>), Text(String) }        // a .jai file (the file form only), or text: a data:image/jai URL or JAI text (see validate below)
 pub fn validate(input: DocInput) -> anyhow::Result<ValidateResult>;
 pub async fn render(input: DocInput, opts: RenderOptions) -> anyhow::Result<RenderOutput>;
 pub async fn encode(opts: EncodeOptions, sink: EncodeSink, cancel: CancellationToken) -> anyhow::Result<EncodeOutput>;
@@ -738,11 +738,11 @@ export function validate(input: DocInput): ValidateResult;
 export async function render(input: DocInput, opts: RenderOptions): Promise<RenderOutput>;
 export async function encode(opts: EncodeHostOptions): Promise<EncodeOutput>;
 
-type DocInput = { bytes: Uint8Array } | { text: string };
+type DocInput = { bytes: Uint8Array } | { text: string };   // a .jai file's bytes, or text: a data:image/jai URL or JAI text
 interface ServerRef { url: string; token: string }
 interface Diag { code: string; key?: string; requested?: string; actual?: string; reason?: string }
-interface ValidateResult { ok: boolean; fatal: boolean; form: 'gzip' | 'json' | 'text' | null; text: string | null; diagnostics: Diag[] }
-interface RenderOptions { server: ServerRef; seed?: string | null; model?: string | null; outputFormat?: 'png' | 'jpeg'; scale?: number }
+interface ValidateResult { ok: boolean; fatal: boolean; text: string | null; diagnostics: Diag[] }
+interface RenderOptions { server: ServerRef; seed?: string | null; outputFormat?: 'png' | 'jpeg' }
 interface RenderOutput { bytes: Uint8Array; mime: string; model: string; modelLabel: string; sentPrompt: string; seed: number;
                          width: number; height: number; description: string; documentText: string; diagnostics: Diag[] }
 interface EncodeHostOptions { server: ServerRef; target: { url: string; width: number; height: number };
@@ -755,13 +755,34 @@ interface EncodeOutput { text: string; jai: Uint8Array; stopReason: string; seco
 ```
 
 What each function does:
-- `validate` mirrors `bin/jai.mjs validate`. The fatal codes are `invalid-json`,
-  `malformed-container` and `undecodable`.
+- `validate` mirrors `bin/jai.mjs validate`. Bytes are a `.jai` file and are decoded as the
+  file form only. Text that, after trimming C0 controls and spaces (as the URL parser does),
+  begins with `data:image/jai` and then `,` or `;` (ASCII case-insensitively) is a
+  `data:image/jai` URL: `decodeDataURL` decodes its body as the text form, and
+  `validateDataURL` adds the URL's own advisories (`data-url-parameter`,
+  `unencoded-url-text`). A URL that carries no document (the data: URL processor fails: no
+  `,`, or a `;base64` body that is not base64) throws "The document cannot be read: …".
+  Any other text, prose that begins with "Data:" and other `data:` URLs included, is parsed
+  as the text form. Nothing is sniffed between forms: uncompressed JSON or text in a file
+  is `malformed-container`, and JSON in text is prose. The fatal codes are
+  `malformed-container` and `invalid-json` (a `.jai` file) and `undecodable` (a `data:`
+  body that is not UTF-8 text within the text bound). A fatal result has `text: null` and
+  no validator diagnostics (the empty document it decoded to would only report
+  `no-prompt`); otherwise `text` is the canonical text. Diagnostics come in this order: the
+  decoder's, the URL's, then the validator's on the document.
 - `render`:
-  1. Interpret the document with a one-model catalog (FLUX schnell, `default: true`) and
+  1. Read the document as `validate` does, and refuse one with a fatal code: "The document
+     cannot be read: <code> (<reason>)".
+  2. Interpret the document with a one-model catalog (FLUX schnell, `default: true`) and
      `FAMILIES`.
-  2. Render with `LocalRenderer`. Seeds go modulo 2^32; with no seed, the renderer picks one.
-  3. Return the exact sent prompt and the diagnostics.
+  3. Render with `LocalRenderer`, with no input image: a `source` is never fetched, so
+     `transform` renders as `generate`. A standalone document has no governing ratio, so
+     the ratio is the document's `aspect`, else its `preview`'s (`previewRatio`, section
+     9), else 1:1. The `seed` option (1 to 20 digits, as the `seed` key takes it) replaces
+     the document's. Seeds go modulo 2^32; with no seed, the renderer picks one.
+  4. Return the exact sent prompt and the diagnostics: the interpreter's, without
+     `mode-degraded` (`INTERPRETER_CODES`; the renderer reports `original-not-readable`
+     instead), then the renderer's.
 - `encode`:
   - Runs `E.encode` with `LocalRenderer` (JPEG output) and `LocalAnalyst`, and the thumbnails
     from `__jai.thumbnail`.
@@ -849,19 +870,38 @@ export const FLUX_SIZES: Record<string, [number, number]>;
 
 - The prompt comes from `assemblePrompt(intent, LOCAL_FLUX, {foldAvoid: true})`, the same text
   Replicate would get.
-- The ratio is the governing ratio, else the intent's aspect, else 1:1. It snaps to the nearest
-  `FLUX_SIZES` key by log distance and reports `adjusted-value:aspect` when more than 0.05 off,
-  with no governing ratio. `scale` scales the area (width × height × scale², at most the
+- The ratio follows the spec's "Size and aspect": the governing ratio, else the intent's aspect,
+  else `previewRatio`, else 1:1. It snaps to the nearest `FLUX_SIZES` key by log distance and
+  reports `adjusted-value:aspect` when the aspect decided and the snap is more than 0.05 off. `scale` scales the area (width × height × scale², at most the
   server's limit). The size is picked from the sizes the server takes (multiples of 64 from 256
   to 2048): it keeps the FLUX size's ratio within 0.05 (log) and comes closest to that area,
   with a ratio error weighing four times an area error. Rounding each side by itself would
   distort small sizes (16:9 at 0.25 would become 320×256). Scale 1 is the FLUX size itself.
 - Seed: `BigInt(seed) mod 2^32` with `adjusted-value:seed` when reduced. With no seed, the
   server picks one and the result reports it.
-- Mode: `transform` gives `mode-degraded:mode`, and `animate` gives
-  `unsupported-parameter:animate`, as the Replicate renderer does.
+- Mode: `transform` gives `mode-degraded:mode` (or `original-not-readable:mode` without an
+  input image), as the Replicate renderer does.
 - The result includes `outputURL` as a `data:` URL, so the analyst needs no btoa.
 - `sentInput` is `{prompt, width, height, seed, steps, output_format}`.
+
+`src/renderers/types.ts` and `src/renderers/image-size.ts`:
+
+```ts
+interface RenderRequest { intent: RenderIntent; modelId: string; inputImage: InputImage | null;
+  governingRatio: number | null; previewRatio: number | null; target: { width: number; height: number } | null; … }
+export const INTERPRETER_CODES: ReadonlySet<string>;   // what a viewer shows with a render: all but mode-degraded
+export function previewRatio(preview: string | null): number | null;
+export function imageSize(bytes: Uint8Array): { width: number; height: number } | null;
+export function sniffImage(bytes: Uint8Array): string | null;   // PNG, JPEG, WebP, GIF or AVIF by signature
+```
+
+- `previewRatio` is the width/height of a document's `preview`, a raster `data:` URL that is
+  never fetched. The size comes from the image header (PNG IHDR, the JPEG frame header, WebP
+  VP8/VP8L/VP8X, the GIF screen, the largest AVIF `ispe`), with no decoding and no platform
+  API, so the same code runs in QuickJS, Node and browsers. Orientation metadata is not
+  applied. Null when there is no preview or its size cannot be read.
+- Both renderers choose the ratio in the same order: `governingRatio`, the intent's aspect,
+  `previewRatio`, then the model's default.
 
 `bin/jai.mjs` gains `--local`:
 - It reads `<root>/server.json` and `<root>/token`, with the root resolved as in section 2.
@@ -873,6 +913,9 @@ export const FLUX_SIZES: Record<string, [number, number]>;
   reply headers, and Studio replies only once the request's engine is free and the job is done.
 - `encode --local --scale` takes 0.25 to 1.25, as the app does.
 - No Replicate token is needed.
+- `render` (with or without `--local`) passes no input image and no governing ratio, sets
+  `previewRatio` from the document's preview, and prints the interpreter's codes in
+  `INTERPRETER_CODES` and then the renderer's, as the host does.
 
 ## 10. The `jai` app (studio/app)
 
@@ -890,8 +933,8 @@ jai serve [--host H] [--port P] [--allow-lan]      headless server in the foregr
 jai models status | download [--yes] [--no-reuse] [--only <ids,…>] | verify | path
 jai generate "<prompt>" [--size WxH] [--seed N] [--steps N] [--n N] [--format png|jpeg|webp] [--out FILE]
 jai chat "<prompt>" [--image FILE]… [--system TEXT] [--think] [--max-tokens N] [--json]
-jai render <file.jai|text> [--seed S] [--out FILE]
-jai validate <file.jai|text>
+jai render <file.jai|data:image/jai,…|text> [--seed S] [--out FILE]
+jai validate <file.jai|data:image/jai,…|text>
 jai encode <image> [--generations N=8] [--population N=4] [--seeds 1,2] [--restarts N=1] [--goal F=0.9]
                    [--scale F=1] [--think off|propose|all] [--out F.jai] [--report DIR] [--force]
 jai status                            server and engine status
@@ -922,12 +965,28 @@ How a CLI command finds the engines:
   is using the GPU.
 
 Command line rules:
+- A document argument (`render`, `validate`) is read as `bin/jai.mjs` reads one. After
+  trimming C0 controls and spaces, one that begins with `data:image/jai` and then `,` or `;`
+  (ASCII case-insensitively) is a `data:image/jai` URL, passed to the host as text, which
+  decodes it as its text body (section 8, `validate`). Otherwise one line ending in `.jai`
+  is a `.jai` file, decoded as the file form only; a missing one is a usage error, never a
+  prompt. Any other argument, prose that begins with "Data:" and other `data:` URLs
+  included, is JAI text. No other file type is read as a document.
+- A document that cannot be read exits 1, for `render` as for `validate`: a fatal code
+  (`malformed-container`, `invalid-json`, `undecodable`) or a `data:image/jai` URL that
+  carries no document. For a fatal code, `validate` prints the decoder's diagnostics (and a
+  URL's advisories) without canonical text, and does not validate the empty document they
+  leave. `render` refuses any unreadable document before it looks for a server,
+  with "The document cannot be read: <reason>" on stderr, which `validate` also prints for
+  a URL that carries no document.
 - A bare word that names no file and has no extension, given where a document path may go, is a
   mistyped subcommand: a usage error (exit 2) with a suggestion when a subcommand is one edit away
   (two for names over four letters), as `jai stauts` suggests `status`. Paths with a folder or an
-  extension still open the viewer, which says when the file is missing.
+  extension still go to the app: a `.jai` file opens in View, which says when it is missing, an
+  image opens in Encode, and anything else is refused with a message.
 - `render --out` must end in `.png`, `.jpg` or `.jpeg` (or have no extension, for PNG); anything
-  else is a usage error, never PNG bytes under another type's name.
+  else is a usage error, never PNG bytes under another type's name. `render --seed` takes 1 to
+  20 digits, as the document's `seed` key does; anything else is a usage error.
 - `encode` checks `--out` before it starts: not a folder, not an existing file without
   `--force`, and openable for writing (an existing file) or creatable (a new one; its folder is
   created). At the end it writes `report.json` and `index.html` first, then the `.jai`; when the
@@ -1031,8 +1090,8 @@ are snake_case and arguments camelCase.
 | `settings_set` | `{config}` | the saved Config. Applied: autostart, file association and the idle-unload time (`Scheduler::set_idle_unload`) at once; a port or host change restarts the server, an engine change (backend, llm, image) builds a new core. A port left as stored keeps the port in use. `llm.extraArgs` and `image.extraArgs` are kept as `config.json` holds them, whatever the webview sends, and the settings check (extraArgs included) runs before anything is saved. While an encode runs or the scheduler has active or waiting requests, a change that restarts the server or the engines is refused and nothing is saved |
 | `install_vc_runtime` | – | `{outcome: 'declined'\|'finished'\|'started', exitCode}`; Windows only, downloads https://aka.ms/vc14/vc_redist.x64.exe over HTTPS only (redirects included) from a Microsoft host into a new file in a new, randomly named folder under the user's temp folder, and runs it after the user confirms, only if WinVerifyTrust accepts its Authenticode signature and the signer is Microsoft Corporation (the file is held open, read-only to others, from the check until it has started). It waits for the installer (ShellExecuteExW, then the process's exit code: 0 installed, 3010 or 1641 restart needed, 1602 canceled, 1638 another version installed); `declined` when the user said no to the question or to the UAC prompt, `started` when Windows gave no process to wait for. The UI then reads `app_info` again, and keeps doing so for a while when the runtime may still come |
 | `read_document` | `{path}` | `{name, path, validate: ValidateResult}` |
-| `viewer_render` | `{path?, text?, seed?}` | `{dataUrl, width, height, seed, sentPrompt, description, documentText, diagnostics, cached}` |
-| `save_file` | `{dataUrl?, text?, bytesB64?, suggestedName}` | `{path}\|null`, through a save dialog (tauri-plugin-dialog) |
+| `viewer_render` | `{path, seed?}` | `{dataUrl, width, height, seed, sentPrompt, description, documentText, diagnostics, cached}` |
+| `save_file` | `{dataUrl?, bytesB64?, suggestedName}` | `{path}\|null`, through a save dialog (tauri-plugin-dialog); exactly one of a rendered image's data URL and a `.jai` file's bytes |
 | `open_dialog` | `{kind: 'jai'\|'image'}` | `{path}\|null` |
 | `image_preview` | `{path}` | `{dataUrl, width, height}` (JPEG ≤ 1024 px) |
 | `encode_start` | `{path, options: {generations, population, seeds, restarts, goal, scale, thinking}}` | `{jobId, dir}`; emits `encode-event` `{jobId, event}` and `encode-done` `{jobId, ok, text?, jaiPath?, reportDir, error?, stopReason?}`. `error` is why it failed, or, with a result, the host's `EncodeOutput.error` (why it stopped early) |
@@ -1084,12 +1143,21 @@ LLM and Image state.
 - A VC++ runtime warning with an Install button when it is missing.
 
 **View**:
-- A drop zone and an Open button. Command-line and file-association paths arrive through the
-  `open-path` event. The page registers that listener first, then calls `ui_ready`.
-- The rendered image, at its natural aspect, fitted to the panel.
+- A drop zone and an Open button (its dialog shows `.jai` files only). Command-line and
+  file-association paths arrive through the `open-path` event. The page registers that
+  listener first, then calls `ui_ready`. A `.jai` path goes to View and an image to Encode;
+  anything else is refused with a message. `read_document` decodes the file as the file form
+  only.
+- The rendered image, at its natural aspect, fitted to the panel. Until the first render is
+  ready, the document's `preview` stands in for it, scaled to the panel at its own ratio,
+  with the description and document text beside it. If that render fails, the preview, or
+  without one the description, stays in place of the image with the error; the drop zone
+  returns only for a document that could not be read.
 - The description text, the exact sent prompt (collapsible), the diagnostics, and the seed.
-- Buttons: Render again (new seed), Save image…, Copy HTML (`<img src="name.jai" alt="…">`
-  with the alt set to the description).
+- Buttons: Render again (new seed), Save image…, Copy HTML (`<img src="name.jai" alt="…"
+  width="…" height="…">` with the alt set to the description and the render's size). The src
+  carrier needs a non-empty `alt`, so Copy HTML is unavailable for a document with no
+  description.
 
 **Encode**:
 - A drop zone and an Open button for an image, then a preview.
@@ -1188,8 +1256,9 @@ Rust, with `cargo test --workspace --exclude jai` on Linux plus `cargo xwin chec
   `models verify` (engines found as the install status finds them, damaged models removed),
   settings (JAI_PORT never saved, restarts refused while busy), the launch gate, log rotation and
   tails, the registry values, and the Authenticode check (Windows). `app/tests/cli.rs` runs the
-  executable: a closed pipe, a document with terminal escapes, a mistyped subcommand, `render
-  --out` and `licenses`.
+  executable: a closed pipe, a document with terminal escapes, document arguments read as the
+  Node CLI reads them, `render` refusing an unreadable document before it looks for a server,
+  a mistyped subcommand, `render --out` and `licenses`.
 
 TypeScript: `npm test`, which adds `test/local.test.mjs` and `test/studio-host.test.mjs`.
 

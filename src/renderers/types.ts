@@ -2,6 +2,13 @@
 // into image bytes and reports, with the spec's renderer diagnostic codes,
 // every standard key it did not honour as written.
 
+/**
+ * The interpreter codes a viewer reports with a render: every one except
+ * `mode-degraded`, which the renderer decides from the input image it actually
+ * has (with none, it reports `original-not-readable` instead).
+ */
+export const INTERPRETER_CODES: ReadonlySet<string> = new Set(['repeated-single', 'invalid-value', 'adjusted-value', 'ignored-value', 'invalid-image', 'unsupported-preview', 'no-matching-model', 'substituted-model', 'version-ignored']);
+
 export interface RenderDiagnostic {
   code: string;
   key?: string;
@@ -19,7 +26,6 @@ export interface RenderIntent {
   mode: 'generate' | 'transform' | 'keep';
   strength: number | null;
   seed: string | null;
-  animate: boolean;
 }
 
 export interface InputImage {
@@ -30,10 +36,17 @@ export interface InputImage {
 export interface RenderRequest {
   intent: RenderIntent;
   modelId: string;
-  /** Pixels the page itself could read (spec: Inputs the viewer may use). */
+  /** Pixels the page itself could read (spec: Permitted inputs). */
   inputImage: InputImage | null;
-  /** The element's governing ratio (original image, or an author-sized layout box); it overrides aspect. */
+  /**
+   * The ratio to render at, in the order of the spec's "Size and aspect": the
+   * element's governing ratio (an author-sized layout box, else the original
+   * image), which overrides `aspect`; else `intent.aspect`; else this
+   * `previewRatio`; else the model's default.
+   */
   governingRatio: number | null;
+  /** Width/height of the document's `preview` (a raster data: URL, never fetched; see previewRatio()), or null. */
+  previewRatio: number | null;
   /** Desired output size in device pixels (layout box x DPR), advisory. */
   target: { width: number; height: number } | null;
   signal?: AbortSignal;

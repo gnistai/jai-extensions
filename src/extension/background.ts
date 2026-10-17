@@ -4,14 +4,15 @@
 // Content scripts send it a canonical JAI document plus, for transform, pixels
 // the page itself could read; it applies the user's consent and budgets,
 // chooses among the models the user enabled, renders, and returns bytes.
-import { identity, interpret, readJSON, sha256Hex, type CatalogModel } from '../jai/index.ts';
+import { identity, interpret, readJSON, serialize, sha256Hex, type CatalogModel } from '../jai/index.ts';
 import { FAMILIES, REPLICATE_MODELS, ReplicateRenderer } from '../renderers/replicate.ts';
 import { HttpReplicateClient } from '../providers/replicate-client.ts';
 import { PortLedger, allowedModel, sanitizeInput } from './encode-guard.ts';
-import { RateLimit, refuseJaiFetch } from './fetch-guard.ts';
-import { RenderError, type RenderIntent } from '../renderers/types.ts';
+import { RateLimit, privilegedFetchAllowed } from './fetch-guard.ts';
+import { INTERPRETER_CODES, RenderError, type RenderIntent } from '../renderers/types.ts';
+import { previewRatio } from '../renderers/image-size.ts';
 import { idbAll, idbClear, idbDelete, idbGet, idbSet } from './idb.ts';
-import { b64decode, b64encode, getSettings, readCapped, saveSettings, siteMode, today, type BgRequest, type EncodePortReply, type EncodePortRequest, type RenderPortReply, type RenderPortRequest, type Settings, type StateReply } from './shared.ts';
+import { MAX_JAI_BYTES, b64decode, b64encode, getSettings, readCapped, saveSettings, siteMode, today, type BgRequest, type EncodePortReply, type EncodePortRequest, type RenderPortReply, type RenderPortRequest, type Settings, type StateReply } from './shared.ts';
 
 // ---------------------------------------------------------------- token
 
@@ -80,9 +81,8 @@ async function handleRender(req: RenderPortRequest, post: (m: RenderPortReply) =
   if (!s.disclosed[req.origin]) return post({ type: 'error', kind: 'consent', message: 'Accept the provider notice for this site first.' });
   if (req.automatic && mode !== 'auto') return post({ type: 'error', kind: 'consent', message: 'Automatic rendering is not enabled for this site.' });
 
-  const read = readJSON(req.canonicalJSON, { inContext: true });
+  const read = readJSON(req.canonicalJSON);
   if (read.diagnostics.some(d => d.code === 'invalid-json')) return post({ type: 'error', kind: 'config', message: 'Invalid document.' });
-  if (req.automatic && read.diagnostics.some(d => d.code === 'unsupported-version')) return post({ type: 'error', kind: 'consent', message: 'Unknown JAI version: not rendered automatically.' });
 
   const hasInput = req.inputImage !== null;
   const { interpreted: it, diagnostics: idiag } = interpret(read.document, { catalog: catalog(s), families: FAMILIES, hasOriginal: hasInput, governingRatio: req.governingRatio });
@@ -101,8 +101,11 @@ async function handleRender(req: RenderPortRequest, post: (m: RenderPortReply) =
 
   // Cache: identity + renderer configuration + input image + top-level site (spec: Caches).
   const inputHash = req.inputImage ? await sha256Hex(b64decode(req.inputImage.b64)) : '-';
-  // The ratio actually requested is part of the render configuration (spec: render cache key).
-  const ratioKey = req.governingRatio ? req.governingRatio.toFixed(3) : (it.ratio ? it.ratio.toFixed(3) : '-');
+  // The ratio actually requested is part of the render configuration (spec: render cache key):
+  // the governing ratio, else aspect, else the preview's ratio (spec §Size and aspect).
+  const preview = previewRatio(it.preview);
+  const ratio = it.ratio ?? preview;
+  const ratioKey = ratio ? ratio.toFixed(3) : '-';
   const key = await sha256Hex(new TextEncoder().encode([await identity(read.document), modelId, model.version ?? '', s.foldAvoid ? 'fold' : 'omit', inputHash, ratioKey, req.topSite].join('|')));
   // Identical requests already in flight share one provider job (never pay twice).
   // Registration is synchronous, before any further await, so concurrent requests cannot race.
@@ -147,21 +150,21 @@ async function handleRender(req: RenderPortRequest, post: (m: RenderPortReply) =
     const intent: RenderIntent = {
       description: merged.modelDescription, style: merged.modelStyle, avoid: merged.modelAvoid,
       aspect: it.aspect ? { width: it.aspect.width, height: it.aspect.height } : null,
-      mode: it.mode, strength: it.strength, seed: it.seed, animate: it.animate,
+      mode: it.mode, strength: it.strength, seed: it.seed,
     };
     const renderer = new ReplicateRenderer(token, { foldAvoid: s.foldAvoid });
     const result = await renderer.render({
       intent, modelId, signal,
       inputImage: req.inputImage ? { bytes: b64decode(req.inputImage.b64), mime: req.inputImage.mime } : null,
-      governingRatio: req.governingRatio, target: req.target,
+      governingRatio: req.governingRatio, previewRatio: preview, target: req.target,
       onStatus: st => post({ type: 'status', status: st }),
     });
-    const interpreterCodes = idiag.filter(d => ['repeated-single', 'invalid-value', 'adjusted-value', 'ignored-value', 'invalid-image', 'unsupported-preview', 'no-matching-model', 'substituted-model', 'version-ignored'].includes(d.code));
+    const interpreterCodes = idiag.filter(d => INTERPRETER_CODES.has(d.code));
     const diagnostics = [...interpreterCodes.map(d => ({ code: d.code, ...(d.key ? { key: d.key } : {}) })), ...result.diagnostics];
     const b64 = b64encode(result.bytes);
     const entry: CacheEntry = { b64, mime: result.mime, model: result.model, sentPrompt: result.sentPrompt, sentNegative: result.sentNegative, sentInput: result.sentInput, jobId: result.jobId, diagnostics, created: Date.now() };
     await idbSet('cache', key, entry);
-    if (s.keepHistory) await idbSet('history', `${Date.now()}-${result.jobId ?? ''}`, { time: new Date().toISOString(), site: req.topSite, model: result.model, jobId: result.jobId, canonicalJSON: req.canonicalJSON, costHint: model.costHint });
+    if (s.keepHistory) await idbSet('history', `${Date.now()}-${result.jobId ?? ''}`, { time: new Date().toISOString(), site: req.topSite, model: result.model, jobId: result.jobId, jai: serialize(read.document), costHint: model.costHint });
     const done: Extract<RenderPortReply, { type: 'done' }> = { type: 'done', dataURL: `data:${result.mime};base64,${b64}`, mime: result.mime, model: result.model, modelLabel: model.label, sentPrompt: result.sentPrompt, sentNegative: result.sentNegative, sentInput: result.sentInput, jobId: result.jobId, diagnostics, cached: false, seconds: Math.round((Date.now() - t0) / 100) / 10 };
     finish(done);
     post(done);
@@ -303,19 +306,22 @@ async function onRequest(msg: BgRequest | { type: 'found'; count: number }, send
       return true;
     }
     case 'fetchJai': {
-      // Privileged fallback for .jai resources (picture or src carrier) when the page's CORS fetch fails.
-      // Works only where the user granted host permission; returns bytes, never executes anything.
-      // It must not let a page probe other servers (spec §Permitted inputs).
+      // A resource named by the picture or src carrier goes over the network at most once per page, so one
+      // route is chosen before anything is sent (spec §Permitted inputs). The background fetches a cross-origin
+      // .jai resource where the user granted host permission, within the rules that keep a page from reaching
+      // other servers through it and within the rate limit per tab. For anything else it answers { page: true }
+      // without touching the network, and the content script fetches with the page's own privileges.
+      // Returns bytes, never executes anything.
       const pageOrigin = senderOrigin(sender);
-      const refused = refuseJaiFetch(msg.url, pageOrigin);
-      if (refused) return { error: refused };
-      if (!sender.tab?.id || !fetchLimit.allow(String(sender.tab.id))) return { error: 'Too many .jai requests from this page' };
       if (pageOrigin && siteMode(await getSettings(), pageOrigin) === 'never') return { error: 'JAI is turned off for this site' };
+      if (!privilegedFetchAllowed(msg.url, pageOrigin) || originOf(msg.url) === pageOrigin
+        || !(await chrome.permissions.contains({ origins: [`${originOf(msg.url)}/*`] }))
+        || !sender.tab?.id || !fetchLimit.allow(String(sender.tab.id))) return { page: true };
       try {
         const res = await fetch(msg.url, { credentials: 'omit', referrerPolicy: 'no-referrer', redirect: 'error' });
-        if (!res.ok) return { error: `HTTP ${res.status}` };
+        if (!res.ok) { void res.body?.cancel(); return { error: `HTTP ${res.status}` }; }
         if (/^text\/html\b/i.test(res.headers.get('content-type') ?? '')) { void res.body?.cancel(); return { notJai: true }; }
-        const buf = await readCapped(res, 16 * 1024 * 1024);
+        const buf = await readCapped(res, MAX_JAI_BYTES);
         if (!buf) return { error: 'Too large' };
         return { b64: b64encode(buf) };
       } catch (e) { return { error: String((e as Error).message) }; }

@@ -1,49 +1,32 @@
-// The decoding algorithm and URL carriers (data: URLs, query forms).
+// The decoding algorithm for the file form, and data:image/jai URLs (the text form).
 import { MEDIA_TYPE, asciiLower, diag, isAsciiSpace, trimBy, type Diagnostic, type JaiDocument } from './chars.ts';
 import { createDocument } from './document.ts';
 import { gunzipOne } from './gzip.ts';
 import { readJSON } from './json.ts';
-import { parse, serialize, type ParseInfo, type ParseResult } from './text.ts';
+import { parse, serialize, type ParseResult } from './text.ts';
 
-const JSON_WS = /^[\t\n\r ]*/;
+export interface DecodeResult { document: JaiDocument; diagnostics: Diagnostic[] }
 
-export interface DecodeResult { document: JaiDocument; diagnostics: Diagnostic[]; form: 'gzip' | 'json' | 'text' | null; info?: ParseInfo }
-export interface DecodeOptions { inContext?: boolean; maxInflate?: number; maxText?: number }
+/** Strict UTF-8 decoding that keeps a leading U+FEFF; null for bytes that are not well-formed UTF-8. */
+function utf8OrNull(bytes: Uint8Array): string | null {
+  try { return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes); } catch { return null; }
+}
 
-/** Decoding algorithm (spec §Decoding). Layered, total, never falls back between forms. */
-export function decode(input: Uint8Array, { inContext = true, maxInflate = 16 * 1024 * 1024, maxText = 1024 * 1024 }: DecodeOptions = {}): DecodeResult {
+/**
+ * Decoding algorithm for the file form (spec §Decoding): the bytes of a .jai file or
+ * resource are exactly one gzip member holding a UTF-8 JSON text with an object at the
+ * top level. Nothing else is accepted and nothing is sniffed.
+ */
+export function decode(bytes: Uint8Array, { maxInflate = 16 * 1024 * 1024 }: { maxInflate?: number } = {}): DecodeResult {
   const diagnostics: Diagnostic[] = [];
-  const empty = (): DecodeResult => ({ document: createDocument(), diagnostics, form: null });
-  let bytes = input;
-  let fromGzip = false;
-  if (bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b) {
-    try { bytes = gunzipOne(bytes, maxInflate).content; fromGzip = true; }
-    catch (e) { diagnostics.push(diag('malformed-container', null, { reason: (e as Error).message })); return empty(); }
-  }
-  if (bytes.length > maxText && !fromGzip) { diagnostics.push(diag('undecodable', null, { reason: 'bound' })); return empty(); }
-  // Byte input never contains 00 (binary such as headerless UTF-16 must not become a prompt).
-  let text: string | null = null;
-  if (!bytes.includes(0)) {
-    try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch { text = null; }
-  }
-  if (text === null) { diagnostics.push(fromGzip ? diag('malformed-container', null, { reason: 'not-utf8' }) : diag('undecodable')); return empty(); }
-  let i = 0;
-  while (text.charCodeAt(i) === 0xfeff) i++;
-  text = text.slice(i);
-  const ws = (JSON_WS.exec(text)?.[0] ?? '').length;
-  if (text.charAt(ws) === '{') {
-    const after = (JSON_WS.exec(text.slice(ws + 1))?.[0] ?? '').length;
-    const next = text.charAt(ws + 1 + after);
-    if (next === '"' || next === '}') {
-      const r = readJSON(text, { inContext });
-      diagnostics.push(...r.diagnostics);
-      return { document: r.document, diagnostics, form: fromGzip ? 'gzip' : 'json' };
-    }
-  }
-  if (fromGzip) { diagnostics.push(diag('malformed-container', null, { reason: 'not-json' })); return empty(); }
-  const r = parse(text);
+  const empty = (code: string, reason: string): DecodeResult => { diagnostics.push(diag(code, null, { reason })); return { document: createDocument(), diagnostics }; };
+  let content: Uint8Array;
+  try { content = gunzipOne(bytes, maxInflate).content; } catch (e) { return empty('malformed-container', (e as Error).message); }
+  const text = utf8OrNull(content);
+  if (text === null) return empty('invalid-json', 'not-utf8');
+  const r = readJSON(text);
   diagnostics.push(...r.diagnostics);
-  return { document: r.document, diagnostics, form: 'text', info: r.info };
+  return { document: r.document, diagnostics };
 }
 
 /** Lenient byte-level percent-decode (URL Standard): never fails. */
@@ -103,11 +86,20 @@ export function parseDataURL(url: string): DataURL | null {
   return { mime: mimeType, essence: fetchMimeEssence(mimeType), bytes };
 }
 
-/** Decode a data:image/jai URL; null when it is not one. */
-export function decodeDataURL(url: string, opts?: DecodeOptions): DecodeResult | null {
+/**
+ * Decode a data:image/jai URL (spec §Decoding): the body, as the data: URL processor
+ * leaves it (percent-decoded, or base64-decoded), is the text form. Null when the URL is
+ * not a data:image/jai URL or the processor fails; the empty document with `undecodable`
+ * when the body exceeds `maxText` bytes, is not well-formed UTF-8 or contains a 00 byte.
+ */
+export function decodeDataURL(url: string, { maxText = 1024 * 1024 }: { maxText?: number } = {}): (DecodeResult & Partial<Pick<ParseResult, 'info'>>) | null {
   const d = parseDataURL(url);
   if (!d || d.essence !== MEDIA_TYPE) return null;
-  return decode(d.bytes, { inContext: true, ...opts });
+  const undecodable = (reason: string): DecodeResult => ({ document: createDocument(), diagnostics: [diag('undecodable', null, { reason })] });
+  if (d.bytes.length > maxText) return undecodable('bound');
+  if (d.bytes.includes(0)) return undecodable('nul');
+  const text = utf8OrNull(d.bytes);
+  return text === null ? undecodable('not-utf8') : parse(text);
 }
 
 /** Percent-encode text for the body of a data:image/jai, URL (spec encoding profile). */
@@ -122,20 +114,5 @@ export function encodeURLBody(text: string): string {
   }).join('');
 }
 
-/** Canonical URL form: data:image/jai, + encoded bare serialisation. */
-export function toDataURL(doc: JaiDocument): string { return 'data:image/jai,' + encodeURLBody(serialize(doc, { bare: true })); }
-
-/** Query forms: 'query' = whole query is the document; 'param' = first jai pair. Null when the URL carries no document. */
-export function fromQuery(url: string, kind: 'query' | 'param' = 'query'): ParseResult | null {
-  let href: string;
-  try { href = new URL(String(url)).href; } catch { return null; }
-  const hash = href.indexOf('#'); if (hash >= 0) href = href.slice(0, hash);
-  const q = href.indexOf('?');
-  if (q < 0) return null; // the query is null
-  const query = href.slice(q + 1);
-  if (kind === 'param') {
-    const v = new URLSearchParams(query).get('jai');
-    return v === null ? null : parse(v);
-  }
-  return parse(new TextDecoder().decode(percentDecode(query)));
-}
+/** Canonical URL form: data:image/jai, + the percent-encoded canonical text. */
+export function toDataURL(doc: JaiDocument): string { return 'data:image/jai,' + encodeURLBody(serialize(doc)); }

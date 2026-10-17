@@ -9,4 +9,6 @@ export { HttpReplicateClient, type ReplicateClient, type ModelRef, type Predicti
 export { ReplicateRenderer, REPLICATE_MODELS, FAMILIES } from '../renderers/replicate.ts';
 export { LocalAnalyst } from './local-providers.ts';
 export { LocalRenderer, LOCAL_FLUX, FLUX_SIZES, base64ToBytes } from '../renderers/local.ts';
+export { previewRatio, sniffImage } from '../renderers/image-size.ts';
+export { INTERPRETER_CODES } from '../renderers/types.ts';
 export { OpenAIChatClient, ProviderError, type ProviderErrorKind, type ChatContentPart, type ChatMessage, type ChatRequest, type ChatResult } from '../providers/openai-chat.ts';

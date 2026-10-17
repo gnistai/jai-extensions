@@ -89,13 +89,13 @@ async function main(): Promise<void> {
   const kh = $<HTMLInputElement>('keep-history'); kh.checked = s.keepHistory;
   kh.addEventListener('change', () => { void saveSettings({ keepHistory: kh.checked }); });
   $('show-history').addEventListener('click', async () => {
-    const h = await send<Array<{ time: string; site: string; model: string; canonicalJSON: string; costHint: number }>>({ type: 'history' });
+    const h = await send<Array<{ time: string; site: string; model: string; jai: string; costHint: number }>>({ type: 'history' });
     const box = $('history'); box.textContent = '';
     if (!h.length) { box.textContent = 'No renders recorded.'; return; }
     const total = h.reduce((a, x) => a + (x.costHint || 0), 0);
     const p = document.createElement('p'); p.className = 'muted'; p.textContent = `${h.length} renders, roughly $${total.toFixed(2)}.`;
     box.append(p);
-    for (const x of h.slice(-50).reverse()) { const pre = document.createElement('pre'); pre.textContent = `${x.time}  ${x.site}  ${x.model}\n${x.canonicalJSON}`; box.append(pre); }
+    for (const x of h.slice(-50).reverse()) { const pre = document.createElement('pre'); pre.textContent = `${x.time}  ${x.site}  ${x.model}\n${x.jai ?? ''}`; box.append(pre); }
   });
   $('clear-history').addEventListener('click', async () => { await send({ type: 'clearHistory' }); $('history').textContent = 'Cleared.'; });
   $('clear-cache').addEventListener('click', async () => { await send({ type: 'clearCache' }); $('history').textContent = 'Cached renders cleared.'; });

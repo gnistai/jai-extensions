@@ -4,6 +4,7 @@
 // nothing from the document can choose an endpoint, a model outside this list,
 // safety settings, output counts or weights (spec: selectors, never locators).
 import { assemblePrompt, nearestAspect, ratioOf } from './prompt.ts';
+import { sniffImage } from './image-size.ts';
 import { HttpReplicateClient, type FetchLike, type ReplicateClient } from '../providers/replicate-client.ts';
 import { RenderError, type ModelInfo, type RenderDiagnostic, type RenderRequest, type RenderResult, type Renderer } from './types.ts';
 
@@ -77,15 +78,17 @@ export function buildInput(model: ReplicateModel, req: RenderRequest, opts: { fo
   if (assembled.negative !== null) input.negative_prompt = assembled.negative;
   if (model.outputFormat) input[model.outputFormat.field] = model.outputFormat.value;
 
-  // Ratio (spec: Size and aspect): the element's governing ratio, else aspect, else the model default.
-  // Whether aspect was ignored is the interpreter's decision (library), not reported again here.
-  const ratio: number | null = req.governingRatio ?? (intent.aspect ? intent.aspect.width / intent.aspect.height : null);
+  // Ratio (spec: Size and aspect): the element's governing ratio, else aspect, else the preview's, else the
+  // model default. Whether aspect was ignored is the interpreter's decision (library), not reported again here.
+  const ratio: number | null = req.governingRatio ?? (intent.aspect ? intent.aspect.width / intent.aspect.height : null) ?? req.previewRatio;
 
   const transform = intent.mode === 'transform' && req.inputImage !== null;
   if (model.sizeInputs) {
-    const r = ratio ?? 1, px = 1024 * 1024;
+    // About one megapixel, within the 1:4 to 4:1 shapes these models were trained on.
+    const r = Math.min(4, Math.max(1 / 4, ratio ?? 1)), px = 1024 * 1024;
     input.width = Math.round(Math.sqrt(px * r) / 8) * 8;
     input.height = Math.round(Math.sqrt(px / r) / 8) * 8;
+    if (intent.aspect && !req.governingRatio && ratio !== null && r !== ratio) diagnostics.push({ code: 'adjusted-value', key: 'aspect', requested: `${intent.aspect.width}:${intent.aspect.height}`, actual: `${input.width}x${input.height}` });
   } else if (model.aspects) {
     if (transform && model.imageField === 'input_image') input.aspect_ratio = 'match_input_image';
     else if (ratio) {
@@ -117,7 +120,6 @@ export function buildInput(model: ReplicateModel, req: RenderRequest, opts: { fo
     if (big > max) diagnostics.push({ code: 'adjusted-value', key: 'seed', requested: intent.seed, actual: String(s) });
     input.seed = s; shown.seed = s;
   }
-  if (intent.animate) diagnostics.push({ code: 'unsupported-parameter', key: 'animate' });
   return { input, shown, diagnostics, prompt: assembled.prompt, negative: assembled.negative };
 }
 
@@ -151,15 +153,4 @@ export class ReplicateRenderer implements Renderer {
     if (!mime) throw new RenderError('The provider returned something that is not an image', 'provider', p.id);
     return { bytes, mime, model: model.id, sentPrompt: built.prompt, sentNegative: built.negative, sentInput: built.shown, jobId: p.id, diagnostics: built.diagnostics, outputURL: url, predictSeconds: p.metrics?.predict_time ?? null };
   }
-}
-
-/** Identify PNG, JPEG, WebP, GIF or AVIF by signature; null otherwise. */
-export function sniffImage(b: Uint8Array): string | null {
-  const at = (i: number, ...v: number[]): boolean => v.every((x, k) => b[i + k] === x);
-  if (at(0, 0x89, 0x50, 0x4e, 0x47)) return 'image/png';
-  if (at(0, 0xff, 0xd8, 0xff)) return 'image/jpeg';
-  if (at(0, 0x52, 0x49, 0x46, 0x46) && at(8, 0x57, 0x45, 0x42, 0x50)) return 'image/webp';
-  if (at(0, 0x47, 0x49, 0x46, 0x38)) return 'image/gif';
-  if (at(4, 0x66, 0x74, 0x79, 0x70) && (at(8, 0x61, 0x76, 0x69, 0x66) || at(8, 0x61, 0x76, 0x69, 0x73))) return 'image/avif';
-  return null;
 }

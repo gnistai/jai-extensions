@@ -5,7 +5,8 @@
 import { ProviderError, errorText, postJSON } from '../providers/openai-chat.ts';
 import type { FetchLike } from '../providers/replicate-client.ts';
 import { assemblePrompt, nearestAspect, ratioOf } from './prompt.ts';
-import { REPLICATE_MODELS, sniffImage } from './replicate.ts';
+import { sniffImage } from './image-size.ts';
+import { REPLICATE_MODELS } from './replicate.ts';
 import { RenderError, type ModelInfo, type RenderDiagnostic, type RenderRequest, type RenderResult, type Renderer } from './types.ts';
 
 function replicateInfo(id: string): ModelInfo {
@@ -129,8 +130,8 @@ function buildRequest(req: RenderRequest, opts: { outputFormat?: 'png' | 'jpeg';
     if (!diagnostics.some(d => d.code === 'adjusted-value' && d.key === 'prompt')) diagnostics.push({ code: 'adjusted-value', key: 'prompt' });
   }
 
-  // Ratio (spec: Size and aspect): the governing ratio, else aspect, else 1:1; snapped to the nearest FLUX size.
-  const ratio = req.governingRatio ?? (intent.aspect ? intent.aspect.width / intent.aspect.height : null);
+  // Ratio (spec: Size and aspect): the governing ratio, else aspect, else the preview's, else 1:1; snapped to the nearest FLUX size.
+  const ratio = req.governingRatio ?? (intent.aspect ? intent.aspect.width / intent.aspect.height : null) ?? req.previewRatio;
   const key = nearestAspect(ratio ?? 1, Object.keys(FLUX_SIZES));
   if (intent.aspect && ratio && !req.governingRatio && Math.abs(Math.log(ratioOf(key) / ratio)) > 0.05) diagnostics.push({ code: 'adjusted-value', key: 'aspect', requested: `${intent.aspect.width}:${intent.aspect.height}`, actual: key });
   const [bw, bh] = FLUX_SIZES[key] ?? [1024, 1024];
@@ -150,7 +151,6 @@ function buildRequest(req: RenderRequest, opts: { outputFormat?: 'png' | 'jpeg';
     body.seed = seed;
   }
   if (typeof opts.steps === 'number' && Number.isFinite(opts.steps)) body.steps = Math.min(MAX_STEPS, Math.max(1, Math.round(opts.steps)));
-  if (intent.animate) diagnostics.push({ code: 'unsupported-parameter', key: 'animate' });
   return { body, diagnostics };
 }
 

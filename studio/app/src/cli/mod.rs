@@ -13,7 +13,7 @@
 
 use std::fmt;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,14 +22,14 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use jai_core::Paths;
 use jai_engines::SchedulerStatus;
-use jai_js::{DocInput, ServerRef};
+use jai_js::{DocInput, ServerRef, ValidateResult};
 use jai_server::gpu_lock::{self, GpuLock};
 use jai_server::{discovery, Core, ServerHandle};
 use rand::TryRngCore as _;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::output::{clip, engines_summary, format_duration};
+use crate::output::{clip, engines_summary, format_duration, js_error};
 use crate::settings;
 use crate::term::Live;
 
@@ -414,24 +414,48 @@ impl Drop for ProgressGuard {
     }
 }
 
-/// A document argument: a file when one exists at that path, else JAI text.
-/// A missing file that looks like a file name is an error, not a prompt.
-pub fn doc_input(arg: &str) -> anyhow::Result<(DocInput, Option<PathBuf>)> {
-    let path = Path::new(arg);
-    if path.is_file() {
-        let bytes = read_limited(path, MAX_DOC_BYTES)?;
-        return Ok((DocInput::Bytes(bytes), Some(path.to_path_buf())));
+/// A document argument, as the Node CLI reads one: a `data:image/jai` URL is
+/// text, which the host decodes as its text body; else one line ending in
+/// `.jai` is a `.jai` file, decoded as the file form only; anything else is JAI
+/// text. A `.jai` file that does not exist is a usage error, never a prompt.
+pub fn doc_input(arg: &str) -> anyhow::Result<DocInput> {
+    if is_data_url(arg) || !is_jai_path(arg) {
+        return Ok(DocInput::Text(arg.to_string()));
     }
-    if looks_like_file(arg) {
+    let path = Path::new(arg);
+    if !path.is_file() {
         return Err(usage(format!("{arg}: no such file")));
     }
-    Ok((DocInput::Text(arg.to_string()), None))
+    Ok(DocInput::Bytes(read_limited(path, MAX_DOC_BYTES)?))
 }
 
-/// One line ending in a document file extension.
-pub fn looks_like_file(arg: &str) -> bool {
-    let a = arg.trim().to_ascii_lowercase();
-    !a.contains('\n') && [".jai", ".json", ".txt"].iter().any(|ext| a.ends_with(ext))
+/// An argument without the C0 controls and spaces around it, as the URL
+/// parser strips them.
+fn trimmed(arg: &str) -> &str {
+    arg.trim_matches(|c: char| c <= ' ')
+}
+
+/// After trimming, `data:image/jai` and then `,` or `;`, ASCII
+/// case-insensitively: a `data:image/jai` URL. Prose that begins with "Data:"
+/// and other `data:` URLs are JAI text.
+pub fn is_data_url(arg: &str) -> bool {
+    let a = trimmed(arg).as_bytes();
+    a.len() > 14 && a[..14].eq_ignore_ascii_case(b"data:image/jai") && matches!(a[14], b',' | b';')
+}
+
+/// After trimming, one line ending in `.jai`, in any case: the name of a
+/// `.jai` file.
+pub fn is_jai_path(arg: &str) -> bool {
+    let a = trimmed(arg).to_ascii_lowercase();
+    !a.contains(['\n', '\r']) && a.ends_with(".jai")
+}
+
+/// `jai_js::validate` on a document, off the async threads.
+pub async fn validate_doc(input: DocInput) -> anyhow::Result<ValidateResult> {
+    tokio::task::spawn_blocking(move || jai_js::validate(input))
+        .await
+        .context("the validation task failed")?
+        .map_err(js_error)
 }
 
 /// Reads a file of at most `max` bytes.
@@ -578,25 +602,59 @@ mod tests {
 
     #[test]
     fn document_arguments() {
-        assert!(looks_like_file("castle.jai"));
-        assert!(looks_like_file("C:\\images\\Castle.JAI"));
-        assert!(looks_like_file("doc.json"));
-        assert!(!looks_like_file("prompt=a castle at dusk"));
-        assert!(!looks_like_file("a castle\nstyle=photo.jai"));
+        assert!(is_jai_path("castle.jai"));
+        assert!(is_jai_path("C:\\images\\Castle.JAI"));
+        assert!(!is_jai_path("doc.json"));
+        assert!(!is_jai_path("notes.txt"));
+        assert!(!is_jai_path("prompt=a castle at dusk"));
+        assert!(!is_jai_path("a castle\nstyle=photo.jai"));
+        assert!(!is_jai_path("a castle\rstyle=photo.jai"));
+        assert!(is_jai_path(" castle.jai\n"));
         let e = doc_input("definitely-missing-file.jai").unwrap_err();
         assert_eq!(exit_code(&e), 2);
+        // A data:image/jai URL is text for the host, even when it ends in .jai.
+        for url in [
+            "data:image/jai,photo.jai",
+            " DATA:Image/JAI;base64,QSBjYXN0bGU=\n",
+            "data:image/jai;x.jai",
+        ] {
+            assert!(is_data_url(url), "{url:?}");
+            match doc_input(url).unwrap() {
+                DocInput::Text(t) => assert_eq!(t, url),
+                other => panic!("{other:?}"),
+            }
+        }
+        // Anything else that begins with data: is JAI text, never sniffed.
+        for text in [
+            "Data: a bar chart of sales",
+            "data:text/plain,A castle",
+            "data:image/jai",
+            "data:image/jaix,A castle",
+            "data:image/jai ,A castle",
+        ] {
+            assert!(!is_data_url(text), "{text:?}");
+        }
+        assert!(
+            doc_input("data:image/jaix,photo.jai").is_err(),
+            "a .jai name"
+        );
         match doc_input("prompt=a castle").unwrap() {
-            (DocInput::Text(t), None) => assert_eq!(t, "prompt=a castle"),
+            DocInput::Text(t) => assert_eq!(t, "prompt=a castle"),
             other => panic!("{other:?}"),
         }
         let dir = tempfile::tempdir().unwrap();
+        // Only a .jai name is a file; any other existing file name is text.
+        let other = dir.path().join("x.txt");
+        std::fs::write(&other, b"a castle").unwrap();
+        let name = other.to_str().unwrap();
+        match doc_input(name).unwrap() {
+            DocInput::Text(t) => assert_eq!(t, name),
+            other => panic!("{other:?}"),
+        }
         let file = dir.path().join("x.jai");
         std::fs::write(&file, b"a castle").unwrap();
         match doc_input(file.to_str().unwrap()).unwrap() {
-            (DocInput::Bytes(b), Some(p)) => {
-                assert_eq!(b, b"a castle");
-                assert_eq!(p, file);
-            }
+            DocInput::Bytes(b) => assert_eq!(b, b"a castle"),
             other => panic!("{other:?}"),
         }
         assert!(read_limited(&file, 3).is_err());

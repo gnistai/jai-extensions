@@ -190,10 +190,9 @@ fn server(url: &str) -> ServerRef {
 fn validate_reads_a_real_jai_file() {
     let r = jai_js::validate(DocInput::Bytes(earthrise())).unwrap();
     assert!(r.ok && !r.fatal, "{r:?}");
-    assert_eq!(r.form.as_deref(), Some("gzip"));
     let text = r.text.unwrap();
     assert!(
-        text.starts_with("jai:Photograph of a distant Earthrise over the Moon"),
+        text.starts_with("Photograph of a distant Earthrise over the Moon"),
         "{text}"
     );
     assert!(
@@ -204,14 +203,17 @@ fn validate_reads_a_real_jai_file() {
 }
 
 #[test]
-fn validate_reports_text_json_and_fatal_inputs() {
-    let text =
-        jai_js::validate(DocInput::Text("prompt=a red fox\nstyle=watercolor".into())).unwrap();
-    assert_eq!((text.ok, text.form.as_deref()), (true, Some("text")));
+fn validate_reads_text_as_text_and_bytes_as_a_jai_file_only() {
+    let text = jai_js::validate(DocInput::Text("a red fox;style=watercolor".into())).unwrap();
+    assert_eq!(
+        (text.ok, text.text.as_deref()),
+        (true, Some("a red fox;style=watercolor"))
+    );
+    // JSON in text is prose like any other: there is no JSON text form.
     let json = jai_js::validate(DocInput::Text("{\"prompt\":[\"a red fox\"]}".into())).unwrap();
     assert_eq!(
-        (json.ok, json.form.as_deref(), json.text.as_deref()),
-        (true, Some("json"), Some("jai:a red fox"))
+        (json.ok, json.text.as_deref()),
+        (true, Some("{\"prompt\":[\"a red fox\"]}"))
     );
     let broken = jai_js::validate(DocInput::Bytes(vec![
         0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255, 1, 2, 3,
@@ -228,15 +230,49 @@ fn validate_reports_text_json_and_fatal_inputs() {
             .any(|d| d.code == "malformed-container"),
         "{broken:?}"
     );
-    let undecodable = jai_js::validate(DocInput::Bytes(vec![0x70, 0xff, 0xfe])).unwrap();
-    assert!(
-        undecodable.fatal
-            && undecodable
-                .diagnostics
-                .iter()
-                .any(|d| d.code == "undecodable"),
-        "{undecodable:?}"
+    // Bytes that are not one gzip member are not a .jai file: no fallback to
+    // JSON or text.
+    // An unreadable document is not validated: only the decoder's diagnostic,
+    // no no-prompt for the empty document it decoded to.
+    for raw in [&b"a red fox"[..], br#"{"jai":1,"prompt":"a red fox"}"#, b""] {
+        let r = jai_js::validate(DocInput::Bytes(raw.to_vec())).unwrap();
+        let codes: Vec<&str> = r.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(
+            r.fatal && r.text.is_none() && codes == ["malformed-container"],
+            "{r:?}"
+        );
+    }
+}
+
+#[test]
+fn validate_reads_data_image_jai_urls_and_nothing_else_that_begins_with_data() {
+    let codes = |r: &jai_js::ValidateResult| -> Vec<String> {
+        r.diagnostics.iter().map(|d| d.code.clone()).collect()
+    };
+    // The body is the text form; `;base64` is a media-type parameter.
+    let b64 = jai_js::validate(DocInput::Text(
+        "data:image/jai;base64,QSBjYXN0bGU7c3R5bGU9aW5r".into(),
+    ))
+    .unwrap();
+    assert_eq!(
+        (b64.ok, b64.text.as_deref(), codes(&b64)),
+        (
+            true,
+            Some("A castle;style=ink"),
+            vec!["data-url-parameter".into()]
+        )
     );
+    let bad = jai_js::validate(DocInput::Text("data:image/jai,%FF".into())).unwrap();
+    assert!(bad.fatal && bad.text.is_none(), "{bad:?}");
+    assert_eq!(codes(&bad), ["undecodable"]);
+    // Prose that begins with "Data:" and other data: URLs are JAI text.
+    for prose in ["Data: a bar chart of sales", "data:text/plain,A castle"] {
+        let r = jai_js::validate(DocInput::Text(prose.into())).unwrap();
+        assert_eq!((r.ok, r.text.as_deref()), (true, Some(prose)), "{r:?}");
+    }
+    // A data:image/jai URL that carries no document is refused.
+    let e = jai_js::validate(DocInput::Text("data:image/jai;base64".into())).unwrap_err();
+    assert!(format!("{e:#}").contains("carries no document"), "{e:#}");
 }
 
 #[tokio::test]
@@ -246,9 +282,7 @@ async fn render_against_a_mock_server() {
     let opts = RenderOptions {
         server: server(&url),
         seed: Some("42".into()),
-        model: None,
         output_format: None,
-        scale: None,
     };
     let out = jai_js::render(DocInput::Bytes(earthrise()), opts)
         .await
@@ -284,7 +318,69 @@ async fn render_against_a_mock_server() {
     assert!(out
         .description
         .starts_with("Photograph of a distant Earthrise"));
-    assert!(out.document_text.starts_with("jai:Photograph"));
+    assert!(out.document_text.starts_with("Photograph"));
+}
+
+/// An ISO BMFF box.
+fn bmff(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut b = u32::try_from(body.len() + 8)
+        .unwrap()
+        .to_be_bytes()
+        .to_vec();
+    b.extend_from_slice(kind);
+    b.extend_from_slice(body);
+    b
+}
+
+#[tokio::test]
+async fn render_takes_the_ratio_of_the_preview_without_an_aspect() {
+    let url = mock_studio(Studio::default()).await;
+    // Headers only: the host reads a preview's size and never decodes it.
+    let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+    png.extend_from_slice(&1600u32.to_be_bytes());
+    png.extend_from_slice(&900u32.to_be_bytes());
+    let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10];
+    jpeg.extend_from_slice(&[0; 14]);
+    jpeg.extend_from_slice(&[0xff, 0xc0, 0x00, 0x11, 0x08, 0x04, 0xb0, 0x03, 0x84, 0x03]);
+    let mut ispe = vec![0; 4];
+    ispe.extend_from_slice(&900u32.to_be_bytes());
+    ispe.extend_from_slice(&2100u32.to_be_bytes());
+    let mut meta = vec![0; 4];
+    meta.extend(bmff(b"iprp", &bmff(b"ipco", &bmff(b"ispe", &ispe))));
+    let mut avif = bmff(b"ftyp", b"avif\0\0\0\0mif1");
+    avif.extend(bmff(b"meta", &meta));
+    let preview = |mime: &str, bytes: &[u8]| {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        format!("preview=data:{mime};base64,{b64}")
+    };
+    for (doc, size) in [
+        (
+            format!("A castle;{}", preview("image/png", &png)),
+            (1344, 768),
+        ),
+        (
+            format!("A castle;{}", preview("image/jpeg", &jpeg)),
+            (896, 1152),
+        ),
+        (
+            format!("A castle;{}", preview("image/avif", &avif)),
+            (640, 1536),
+        ),
+        (
+            format!("A castle;aspect=1:1;{}", preview("image/png", &png)),
+            (1024, 1024),
+        ),
+    ] {
+        let opts = RenderOptions {
+            server: server(&url),
+            seed: None,
+            output_format: None,
+        };
+        let out = jai_js::render(DocInput::Text(doc.clone()), opts)
+            .await
+            .unwrap();
+        assert_eq!((out.width, out.height), size, "{doc}");
+    }
 }
 
 #[tokio::test]
@@ -296,9 +392,7 @@ async fn render_errors_name_the_cause() {
             token: "wrong".into(),
         },
         seed: None,
-        model: None,
         output_format: None,
-        scale: None,
     };
     let e = jai_js::render(DocInput::Bytes(earthrise()), wrong)
         .await
@@ -307,14 +401,19 @@ async fn render_errors_name_the_cause() {
     let opts = RenderOptions {
         server: server(&url),
         seed: None,
-        model: None,
         output_format: None,
-        scale: None,
     };
-    let e = jai_js::render(DocInput::Bytes(vec![0x1f, 0x8b, 1, 2]), opts)
+    let e = jai_js::render(DocInput::Bytes(vec![0x1f, 0x8b, 1, 2]), opts.clone())
         .await
         .unwrap_err();
     assert!(format!("{e:#}").contains("malformed-container"), "{e:#}");
+    let e = jai_js::render(DocInput::Text("data:image/jai,%FF".into()), opts)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{e:#}").contains("The document cannot be read: undecodable"),
+        "{e:#}"
+    );
 }
 
 #[tokio::test]
@@ -338,9 +437,7 @@ async fn dropping_a_render_closes_its_connection() {
     let opts = RenderOptions {
         server: server(&url),
         seed: None,
-        model: None,
         output_format: None,
-        scale: None,
     };
     let render = jai_js::render(DocInput::Bytes(earthrise()), opts);
     assert!(
@@ -416,7 +513,7 @@ async fn encode_against_a_mock_server() {
         .unwrap();
 
     // The result document, as text and as a .jai file.
-    assert!(out.text.starts_with("jai:"), "{}", out.text);
+    assert!(out.text.starts_with("A small blue planet"), "{}", out.text);
     assert!(
         out.text.contains("model=black-forest-labs/flux-schnell"),
         "{}",
@@ -424,10 +521,7 @@ async fn encode_against_a_mock_server() {
     );
     assert_eq!(out.jai[..2], [0x1f, 0x8b]);
     let check = jai_js::validate(DocInput::Bytes(out.jai.clone())).unwrap();
-    assert!(
-        check.ok && check.form.as_deref() == Some("gzip"),
-        "{check:?}"
-    );
+    assert!(check.ok && check.diagnostics.is_empty(), "{check:?}");
     assert_eq!(check.text.as_deref(), Some(out.text.as_str()));
     assert!(
         ["generations", "goal", "plateau"].contains(&out.stop_reason.as_str()),
@@ -547,9 +641,7 @@ fn the_async_api_can_run_on_any_executor_thread() {
     let opts = RenderOptions {
         server: server("http://127.0.0.1:1"),
         seed: None,
-        model: None,
         output_format: None,
-        scale: None,
     };
     send(jai_js::render(DocInput::Text(String::new()), opts));
     let sink = EncodeSink {

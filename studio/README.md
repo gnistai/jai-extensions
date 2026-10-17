@@ -67,8 +67,8 @@ jai serve [--host H] [--port P] [--allow-lan]      headless server in the foregr
 jai models status | download [--yes] [--no-reuse] [--only <ids,…>] | verify | path
 jai generate "<prompt>" [--size WxH] [--seed N] [--steps N] [--n N] [--format png|jpeg|webp] [--out FILE]
 jai chat "<prompt>" [--image FILE]… [--system TEXT] [--think] [--max-tokens N] [--json]
-jai render <file.jai|text> [--seed S] [--out FILE]
-jai validate <file.jai|text>
+jai render <file.jai|data:image/jai,…|text> [--seed S] [--out FILE]
+jai validate <file.jai|data:image/jai,…|text>
 jai encode <image> [--generations N=8] [--population N=4] [--seeds 1,2] [--restarts N=1] [--goal F=0.9]
                    [--scale F=1] [--think off|propose|all] [--out F.jai] [--report DIR] [--force]
 jai status                            server and engine status
@@ -85,9 +85,23 @@ jai --version | --help
   that is about to stop. To share the loaded models between commands, keep JAI Studio, its
   tray or `jai serve` running. `status` reports the shared server, or the local install and
   GPU when there is none.
-- `validate` prints the canonical text and any diagnostics. Exit code 1 means the input is
-  not a readable JAI document (`invalid-json`, `malformed-container`, `undecodable`).
-- `render --out` takes a `.png`, `.jpg` or `.jpeg` file name (`generate` also writes WebP).
+- A document argument that begins with `data:image/jai` followed by `,` or `;` (ignoring
+  case and surrounding spaces) is a `data:image/jai` URL, read as its text body. Otherwise
+  one line ending in `.jai` is a `.jai` file, read as the file form only (one gzip member of
+  JSON; nothing else is tried); a missing one is a usage error. Any other argument, prose
+  that begins with "Data:" and other `data:` URLs included, is JAI text. The Node CLI reads
+  document arguments the same way.
+- `validate` prints the canonical text and any diagnostics, for a `data:image/jai` URL its
+  own advisories too (such as `data-url-parameter` for `;base64`). Exit code 1 means the
+  document cannot be read: `malformed-container` or `invalid-json` for a `.jai` file,
+  `undecodable` for a `data:` URL, or a `data:image/jai` URL that carries no document (no
+  `,`, or a `;base64` body that is not base64). For a fatal code `validate` prints only the
+  decoder's diagnostics (and a URL's advisories), with no canonical text; for a URL that
+  carries no document it says so. `render` refuses an unreadable document the same way,
+  before it looks for a server.
+- `render` renders at the document's `aspect`, else at its `preview`'s ratio, else square.
+  `render --seed` takes 1 to 20 digits and replaces the document's seed; `render --out`
+  takes a `.png`, `.jpg` or `.jpeg` file name (`generate` also writes WebP).
 - `encode` writes `<image>.jai` and a report folder (`<out>.report`: `target.jpg`,
   `renders/`, `report.json` and an `index.html` contact sheet). It checks before it starts
   that the output can be written; if the `.jai` still cannot be written at the end, the

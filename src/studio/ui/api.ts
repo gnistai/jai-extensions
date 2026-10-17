@@ -175,9 +175,9 @@ export const api = {
   /** Waits for the installer; how it ended. */
   installVcRuntime: (): Promise<VcInstallReply> => invoke('install_vc_runtime'),
   readDocument: (path: string): Promise<DocumentInfo> => invoke('read_document', { path }),
-  viewerRender: (args: { path?: string; text?: string; seed?: string }): Promise<ViewerRender> => invoke('viewer_render', args),
+  viewerRender: (args: { path: string; seed?: string }): Promise<ViewerRender> => invoke('viewer_render', args),
   /** Through a save dialog; null when the user cancels. */
-  saveFile: (args: { dataUrl?: string; text?: string; bytesB64?: string; suggestedName: string }): Promise<PathReply | null> => invoke('save_file', args),
+  saveFile: (args: { dataUrl: string; suggestedName: string } | { bytesB64: string; suggestedName: string }): Promise<PathReply | null> => invoke('save_file', args),
   openDialog: (kind: 'jai' | 'image'): Promise<PathReply | null> => invoke('open_dialog', { kind }),
   imagePreview: (path: string): Promise<ImagePreview> => invoke('image_preview', { path }),
   /** Events arrive as encode-event, the end as encode-done. */

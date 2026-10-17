@@ -2,7 +2,7 @@
 // cancellation by id, and failures that must not orphan provider work.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { sanitizeInput, allowedModel, allowedImage, PortLedger, GEMINI, CLAUDE, CLIP, LUNA, costOf } from '../dist/test/encode-guard.js';
+import { sanitizeInput, allowedModel, allowedImage, PortLedger, GEMINI, LUNA, costOf } from '../dist/test/encode-guard.js';
 import { HttpReplicateClient } from '../dist/test/replicate-client.js';
 import { cleanText, toDrafts, encode } from '../dist/encoder.mjs';
 
@@ -12,7 +12,8 @@ test('guard: only allow-listed models, versions pinned', () => {
   assert.ok(allowedModel(FLUX));
   assert.equal(allowedModel({ ...FLUX, version: 'x' }), null);
   assert.equal(allowedModel({ id: 'stability-ai/sdxl' }), null);
-  assert.ok(allowedModel(CLIP));
+  assert.ok(allowedModel(GEMINI));
+  assert.ok(allowedModel(LUNA));
   assert.equal(allowedModel({ id: 'evil/model' }), null);
 });
 
@@ -29,8 +30,6 @@ test('guard: inputs are rebuilt from an allow-list; fixed fields come from the r
   const g2 = sanitizeInput(GEMINI, { prompt: 'p', images: ['data:image/jpeg;base64,AAAA', 'https://replicate.delivery/a/b.webp'], thinking_budget: 1024 });
   assert.deepEqual(Object.keys(g2.input).sort(), ['images', 'max_output_tokens', 'prompt', 'thinking_budget']);
   assert.ok('error' in sanitizeInput(GEMINI, { prompt: 'p', images: ['http://192.168.0.1/secret.png'] }));
-  assert.ok('error' in sanitizeInput(CLAUDE, { prompt: 'p', image: 'https://evil.example/a.png' }));
-  assert.ok('error' in sanitizeInput(CLIP, { text: 'x' }));
   const l = sanitizeInput(LUNA, { prompt: 'p', system_prompt: 's', image_input: ['data:image/jpeg;base64,AAAA'], reasoning_effort: 'low', max_completion_tokens: 99999, tools: [1] });
   assert.deepEqual(Object.keys(l.input).sort(), ['image_input', 'max_completion_tokens', 'prompt', 'reasoning_effort', 'system_prompt']);
   assert.equal(l.input.max_completion_tokens, 4096);
@@ -113,15 +112,15 @@ test('engine: an inspection failure is one failed render, not a crash; nothing r
 });
 
 test('fetch guard: only .jai over http(s), no private targets from public pages, rate limited', async () => {
-  const { isPrivateHost, refuseJaiFetch, RateLimit } = await import('../dist/test/fetch-guard.js');
+  const { isPrivateHost, privilegedFetchAllowed, RateLimit } = await import('../dist/test/fetch-guard.js');
   for (const h of ['localhost', 'a.localhost', '127.0.0.1', '10.1.2.3', '172.20.0.1', '192.168.1.1', '169.254.1.1', '100.64.0.1', '0.0.0.0', '[::1]', 'fd12:3456::1', 'fe80::1', '::ffff:192.168.0.1', 'router', 'nas.local', 'printer.lan']) assert.equal(isPrivateHost(h), true, h);
   for (const h of ['example.org', '8.8.8.8', '172.32.0.1', '2001:db8::1', 'cdn.example.com']) assert.equal(isPrivateHost(h), false, h);
-  assert.equal(refuseJaiFetch('https://cdn.example/a.jai', 'https://site.example'), null);
-  assert.match(refuseJaiFetch('https://cdn.example/a.png', 'https://site.example'), /\.jai/);
-  assert.match(refuseJaiFetch('ftp://cdn.example/a.jai', 'https://site.example'), /http/);
-  assert.match(refuseJaiFetch('http://192.168.1.1/x.jai', 'https://site.example'), /private/);
-  assert.match(refuseJaiFetch('http://router/x.jai', 'https://site.example'), /private/);
-  assert.equal(refuseJaiFetch('http://192.168.1.1/x.jai', 'http://intranet.local'), null, 'a local page may use local resources');
+  assert.equal(privilegedFetchAllowed('https://cdn.example/a.jai', 'https://site.example'), true);
+  assert.equal(privilegedFetchAllowed('https://cdn.example/a.png', 'https://site.example'), false, 'only .jai paths');
+  assert.equal(privilegedFetchAllowed('ftp://cdn.example/a.jai', 'https://site.example'), false, 'only http(s)');
+  assert.equal(privilegedFetchAllowed('http://192.168.1.1/x.jai', 'https://site.example'), false, 'no private address for a public page');
+  assert.equal(privilegedFetchAllowed('http://router/x.jai', 'https://site.example'), false, 'no single-label host for a public page');
+  assert.equal(privilegedFetchAllowed('http://192.168.1.1/x.jai', 'http://intranet.local'), true, 'a local page may use local resources');
   const rl = new RateLimit(2, 1000);
   assert.ok(rl.allow('t', 0)); assert.ok(rl.allow('t', 1)); assert.equal(rl.allow('t', 2), false); assert.ok(rl.allow('t', 1500));
 });

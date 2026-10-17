@@ -1,10 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildInput, REPLICATE_MODELS, ReplicateRenderer, sniffImage } from '../dist/test/replicate.js';
+import { buildInput, REPLICATE_MODELS, ReplicateRenderer } from '../dist/test/replicate.js';
+import { sniffImage } from '../dist/encoder.mjs';
 
 const model = id => REPLICATE_MODELS.find(m => m.id === id);
-const intent = (o = {}) => ({ description: 'A castle', style: [], avoid: [], aspect: null, mode: 'generate', strength: null, seed: null, animate: false, ...o });
-const req = (o = {}) => ({ intent: intent(o.intent), modelId: o.modelId ?? 'black-forest-labs/flux-schnell', inputImage: o.inputImage ?? null, governingRatio: o.governingRatio ?? null, target: o.target ?? null });
+const intent = (o = {}) => ({ description: 'A castle', style: [], avoid: [], aspect: null, mode: 'generate', strength: null, seed: null, ...o });
+const req = (o = {}) => ({ intent: intent(o.intent), modelId: o.modelId ?? 'black-forest-labs/flux-schnell', inputImage: o.inputImage ?? null, governingRatio: o.governingRatio ?? null, previewRatio: o.previewRatio ?? null, target: o.target ?? null });
 const codes = r => r.diagnostics.map(d => d.code + (d.key ? ':' + d.key : ''));
 
 test('flux: style appended, aspect snapped to the enum, avoid folded and reported', () => {
@@ -45,6 +46,25 @@ test('without a governing ratio, aspect decides; the displayed size of an unsize
   assert.equal(none.input.aspect_ratio, undefined);
 });
 
+test("without a governing ratio or aspect, the preview's ratio decides, else the model default", () => {
+  const flux = o => buildInput(model('black-forest-labs/flux-schnell'), req(o), { foldAvoid: true });
+  const wide = flux({ previewRatio: 16 / 9 });
+  assert.equal(wide.input.aspect_ratio, '16:9');
+  assert.deepEqual(codes(wide), []);
+  assert.equal(flux({ previewRatio: 16 / 9, intent: { aspect: { width: 1, height: 1 } } }).input.aspect_ratio, '1:1');
+  assert.equal(flux({ previewRatio: 16 / 9, governingRatio: 0.75 }).input.aspect_ratio, '3:4');
+  // Snapping a preview's ratio is no adjusted aspect: the document has none.
+  assert.deepEqual(codes(flux({ previewRatio: 1.6 })), []);
+  const sdxl = buildInput(model('stability-ai/sdxl'), req({ modelId: 'stability-ai/sdxl', previewRatio: 2 / 3 }), { foldAvoid: true });
+  assert.ok(Math.abs(sdxl.input.width / sdxl.input.height - 2 / 3) < 0.02, `${sdxl.input.width}x${sdxl.input.height}`);
+  // An extreme ratio is clamped to 4:1 and reported when aspect decided it.
+  const extreme = buildInput(model('stability-ai/sdxl'), req({ modelId: 'stability-ai/sdxl', intent: { aspect: { width: 100, height: 1 } } }), { foldAvoid: true });
+  assert.deepEqual([extreme.input.width, extreme.input.height], [2048, 512]);
+  assert.ok(extreme.diagnostics.some(d => d.code === 'adjusted-value' && d.key === 'aspect'));
+  const tallPreview = buildInput(model('stability-ai/sdxl'), req({ modelId: 'stability-ai/sdxl', previewRatio: 1 / 50 }), { foldAvoid: true });
+  assert.deepEqual([tallPreview.input.width, tallPreview.input.height], [512, 2048]);
+});
+
 test('flux-dev transform: input image and departure strength', () => {
   const img = { bytes: new Uint8Array([1, 2, 3]), mime: 'image/webp' };
   const r = buildInput(model('black-forest-labs/flux-dev'), req({ modelId: 'black-forest-labs/flux-dev', inputImage: img, intent: { mode: 'transform', strength: 0.7 } }), { foldAvoid: true });
@@ -72,10 +92,6 @@ test('seed: passed through, or reduced deterministically above the model range',
   const r = buildInput(model('black-forest-labs/flux-schnell'), req({ intent: { seed: '12345678901234567890' } }), { foldAvoid: true });
   assert.equal(r.input.seed, Number(12345678901234567890n % 4294967296n));
   assert.ok(codes(r).includes('adjusted-value:seed'));
-});
-
-test('animate on a still model is reported', () => {
-  assert.ok(codes(buildInput(model('black-forest-labs/flux-schnell'), req({ intent: { animate: true } }), { foldAvoid: true })).includes('unsupported-parameter:animate'));
 });
 
 test('an empty description is still sent explicitly (never the provider default)', () => {

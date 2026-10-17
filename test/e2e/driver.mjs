@@ -14,6 +14,8 @@ if (!token) throw new Error('no token in env file');
 const results = [];
 const check = (name, ok, detail = '') => { results.push({ name, ok: !!ok, detail }); console.log(`${ok ? 'PASS' : 'FAIL'} ${name}${detail ? ' — ' + detail : ''}`); };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+/** page.html's alt-only image: JAI text in an alt, with no data-jai, so not a carrier. */
+const ALT_ONLY = 'A red lighthouse on a rocky island at sunset;style=watercolor';
 
 const browser = await puppeteer.launch({
   executablePath: chrome, headless: true, userDataDir: join(out, 'profile'),
@@ -45,7 +47,7 @@ try {
   await page.goto(`${base}/page.html`, { waitUntil: 'load' });
   const origin = new URL(base).origin;
   await page.screenshot({ path: join(out, 'before.png'), fullPage: true });
-  const sizeOf = () => page.evaluate(() => ['c1', 'c2', 'c3', 'c4'].map(id => { const r = document.getElementById(id).getBoundingClientRect(); return `${r.width}x${r.height}`; }));
+  const sizeOf = () => page.evaluate(() => ['picture-img', 'attribute-alt', 'src-data', 'alt-only'].map(id => { const r = document.getElementById(id).getBoundingClientRect(); return `${r.width}x${r.height}`; }));
   const sizesBefore = await sizeOf();
 
   const tabId = await sw.evaluate(async url => (await chrome.tabs.query({ url: url + '*' }))[0].id, `${base}/page.html`);
@@ -53,43 +55,50 @@ try {
   await sw.evaluate(async id => { await chrome.scripting.executeScript({ target: { tabId: id }, files: ['content.js'] }); }, tabId);
   await sleep(500);
   const list = await sw.evaluate(async id => chrome.tabs.sendMessage(id, { type: 'list' }), tabId);
-  check('discovers the three carriers and ignores alt', list.length === 5 && ['picture', 'attribute', 'src'].every(c => list.some(i => i.carrier === c)), JSON.stringify(list.map(i => i.carrier)));
+  check('discovers the three carriers and ignores an alt without data-jai', list.length === 6 && ['picture', 'attribute', 'src'].every(c => list.some(i => i.carrier === c)), JSON.stringify(list.map(i => i.carrier)));
   check('a src .jai file is not fetched before use', list.filter(i => i.carrier === 'src' && i.jai === null).length === 1, JSON.stringify(list.map(i => [i.carrier, i.jai && i.jai.slice(0, 20)])));
-  const refusedFetch = await sw.evaluate(async id => (await chrome.scripting.executeScript({ target: { tabId: id }, func: () => chrome.runtime.sendMessage({ type: 'fetchJai', url: location.origin + '/page.html' }) }))[0].result, tabId);
-  check('the privileged fetch refuses anything but a .jai path', !!refusedFetch?.error && !refusedFetch.b64, JSON.stringify(refusedFetch));
-  check('documents parsed', list.filter(i => i.jai === 'jai:A red lighthouse on a rocky island at sunset;style=watercolor').length === 3 && list.some(i => i.jai === 'jai:A red lighthouse on a rocky island at sunset;prompt/flux=seen from the sea;prompt/sdxl=from a cliff top;aspect=1:1;style=watercolor'));
+  // The privileged route, on a second host the test copy grants: a cross-origin .jai resource comes back as bytes,
+  // and any other path on the same host is declined ({ page: true }) without a fetch.
+  const other = new URL(base); other.hostname = other.hostname === 'localhost' ? '127.0.0.1' : 'localhost';
+  const probe = await sw.evaluate(async (id, o) => ({
+    granted: await chrome.permissions.contains({ origins: [o + '/*'] }),
+    ...(await chrome.scripting.executeScript({ target: { tabId: id }, args: [o], func: async o => ({ jai: await chrome.runtime.sendMessage({ type: 'fetchJai', url: o + '/lighthouse.jai' }), html: await chrome.runtime.sendMessage({ type: 'fetchJai', url: o + '/page.html' }) }) }))[0].result,
+  }), tabId, other.origin);
+  check('the privileged fetch declines anything but a .jai path', probe.granted && typeof probe.jai?.b64 === 'string' && probe.html?.page === true && !probe.html.b64, JSON.stringify({ granted: probe.granted, jai: probe.jai && Object.keys(probe.jai), html: probe.html }));
+  // attribute-alt takes its prompt from the alt, attribute-own from data-jai (its alt plays no part): the same document as picture-img and src-data.
+  check('documents parsed; alt is the prompt unless data-jai gives one', list.filter(i => i.jai === 'A red lighthouse on a rocky island at sunset;style=watercolor').length === 4 && list.some(i => i.jai === 'A red lighthouse on a rocky island at sunset;prompt/flux=seen from the sea;prompt/sdxl=from a cliff top;aspect=1:1;style=watercolor'), JSON.stringify(list.map(i => i.jai)));
   check('no image changed before the user asks', await page.evaluate(() => [...document.images].every(i => !i.getAttribute('srcset') && !i.currentSrc.startsWith('data:image/webp'))));
 
   // Rendering is refused until the provider notice is accepted for the site.
   await sw.evaluate(async o => { const { settings = {} } = await chrome.storage.local.get('settings'); settings.disclosed = { ...(settings.disclosed || {}), [o]: true }; await chrome.storage.local.set({ settings }); }, origin);
   await sw.evaluate(async id => chrome.tabs.sendMessage(id, { type: 'renderAll' }), tabId);
   const t0 = Date.now();
-  const ok = await page.waitForFunction(() => ['c1', 'c2', 'c3', 'c5', 'c6'].every(id => { const i = document.getElementById(id); return /^data:image\/(webp|png|jpeg)/.test(i.currentSrc) && i.complete && i.naturalWidth > 0; }), { timeout: 120000, polling: 500 }).then(() => true, () => false);
+  const ok = await page.waitForFunction(() => ['picture-img', 'attribute-alt', 'src-data', 'src-aspect', 'src-file', 'attribute-own'].every(id => { const i = document.getElementById(id); return /^data:image\/(webp|png|jpeg)/.test(i.currentSrc) && i.complete && i.naturalWidth > 0; }), { timeout: 120000, polling: 500 }).then(() => true, () => false);
   if (!ok) {
     const l2 = await sw.evaluate(async id => chrome.tabs.sendMessage(id, { type: 'list' }), tabId);
-    const imgs = await page.evaluate(() => ['c1', 'c2', 'c3', 'c5', 'c6'].map(id => { const i = document.getElementById(id); return { id, currentSrc: i.currentSrc.slice(0, 40), srcset: (i.getAttribute('srcset') || '').slice(0, 30), complete: i.complete, w: i.naturalWidth }; }));
+    const imgs = await page.evaluate(() => ['picture-img', 'attribute-alt', 'src-data', 'src-aspect', 'src-file', 'attribute-own'].map(id => { const i = document.getElementById(id); return { id, currentSrc: i.currentSrc.slice(0, 40), srcset: (i.getAttribute('srcset') || '').slice(0, 30), complete: i.complete, w: i.naturalWidth }; }));
     throw new Error('render did not appear: ' + JSON.stringify({ list: l2, imgs }));
   }
-  check('all five JAI images replaced, including the .jai file in src', true, `${Math.round((Date.now() - t0) / 1000)}s`);
+  check('all six JAI images replaced, including the .jai file in src', true, `${Math.round((Date.now() - t0) / 1000)}s`);
   const st = await page.evaluate(() => ({
-    p1First: document.getElementById('p1').firstElementChild.localName === 'source' && document.getElementById('p1').firstElementChild.srcset.startsWith('data:image/'),
-    c1src: document.getElementById('c1').getAttribute('src'),
-    alts: ['c1', 'c2', 'c3', 'c4', 'c6'].map(id => document.getElementById(id).getAttribute('alt')),
-    desc: ['c1', 'c2', 'c3'].map(id => !!document.getElementById(id).getAttribute('aria-description')),
-    c4: { src: document.getElementById('c4').currentSrc.endsWith('original.png'), srcset: document.getElementById('c4').hasAttribute('srcset'), desc: document.getElementById('c4').hasAttribute('aria-description') },
+    pictureSource: document.getElementById('picture').firstElementChild.localName === 'source' && document.getElementById('picture').firstElementChild.srcset.startsWith('data:image/'),
+    pictureImgSrc: document.getElementById('picture-img').getAttribute('src'),
+    alts: ['picture-img', 'attribute-alt', 'src-data', 'alt-only', 'src-file', 'attribute-own'].map(id => document.getElementById(id).getAttribute('alt')),
+    desc: ['picture-img', 'attribute-alt', 'src-data', 'attribute-own'].map(id => !!document.getElementById(id).getAttribute('aria-description')),
+    altOnly: { src: document.getElementById('alt-only').currentSrc.endsWith('original.png'), srcset: document.getElementById('alt-only').hasAttribute('srcset'), desc: document.getElementById('alt-only').hasAttribute('aria-description') },
     plain: document.getElementById('plain').currentSrc.endsWith('original.png') && !document.getElementById('plain').getAttribute('srcset'),
-    sizes: ['c1', 'c2', 'c3', 'c4'].map(id => { const r = document.getElementById(id).getBoundingClientRect(); return `${r.width}x${r.height}`; }),
+    sizes: ['picture-img', 'attribute-alt', 'src-data', 'alt-only'].map(id => { const r = document.getElementById(id).getBoundingClientRect(); return `${r.width}x${r.height}`; }),
   }));
-  check('carrier 1 replaced by a viewer <source>, src untouched', st.p1First && st.c1src === 'original.png');
-  check('human alt kept everywhere', st.alts[0] === 'A placeholder' && st.alts[1] === 'A red lighthouse on a rocky island at sunset' && st.alts[2] === 'A red lighthouse on a rocky island at sunset' && st.alts[3].startsWith('jai:') && st.alts[4] === 'Lighthouse at sunset', JSON.stringify(st.alts));
-  check('alt beginning with jai: is never rendered', st.c4.src && !st.c4.srcset && !st.c4.desc, JSON.stringify(st.c4));
+  check('picture carrier replaced by a viewer <source>, src untouched', st.pictureSource && st.pictureImgSrc === 'original.png');
+  check('human alt kept everywhere', st.alts[0] === 'A placeholder' && st.alts[1] === 'A red lighthouse on a rocky island at sunset' && st.alts[2] === 'A red lighthouse on a rocky island at sunset' && st.alts[3] === ALT_ONLY && st.alts[4] === 'Lighthouse at sunset' && st.alts[5] === 'Lighthouse', JSON.stringify(st.alts));
+  check('JAI text in an alt without data-jai is never rendered', st.altOnly.src && !st.altOnly.srcset && !st.altOnly.desc, JSON.stringify(st.altOnly));
   check('AI-rendered state exposed', st.desc.every(Boolean));
   check('plain image untouched', st.plain);
   check('layout boxes preserved', st.sizes.join() === sizesBefore.join(), `${sizesBefore.join(' ')} -> ${st.sizes.join(' ')}`);
   const history = await sw.evaluate(async () => new Promise(r => { const q = indexedDB.open('jai-viewer'); q.onsuccess = () => { const g = q.result.transaction('history').objectStore('history').getAll(); g.onsuccess = () => r(g.result); }; }));
-  check('identical documents shared one prediction', history.length <= 2, `${history.length} provider job(s) in this profile (4 identical, one of them a .jai file, + 1 distinct document)`);
-  const c5 = await page.evaluate(() => { const i = document.getElementById('c5'); const r = i.getBoundingClientRect(); return { natural: i.naturalWidth / i.naturalHeight, fit: getComputedStyle(i).objectFit, box: `${r.width}x${r.height}` }; });
-  check('sized 3:2 box with aspect=1:1: rendered near 3:2 and never stretched', Math.abs(Math.log(c5.natural / 1.5)) < 0.08 && c5.fit !== 'fill', JSON.stringify(c5));
+  check('identical documents shared one prediction', history.length <= 2, `${history.length} provider job(s) in this profile (5 identical, one of them a .jai file, + 1 distinct document)`);
+  const aspect = await page.evaluate(() => { const i = document.getElementById('src-aspect'); const r = i.getBoundingClientRect(); return { natural: i.naturalWidth / i.naturalHeight, fit: getComputedStyle(i).objectFit, box: `${r.width}x${r.height}` }; });
+  check('sized 3:2 box with aspect=1:1: rendered near 3:2 and never stretched', Math.abs(Math.log(aspect.natural / 1.5)) < 0.08 && aspect.fit !== 'fill', JSON.stringify(aspect));
   const sent = await sw.evaluate(async () => new Promise(r => { const q = indexedDB.open('jai-viewer'); q.onsuccess = () => { const g = q.result.transaction('cache').objectStore('cache').getAll(); g.onsuccess = () => r(g.result.map(e => e.sentPrompt)); }; }));
   check('flux render got the flux refinement only', sent.some(p => p.includes('seen from the sea')) && !sent.some(p => p.includes('cliff top')), JSON.stringify(sent));
   await page.screenshot({ path: join(out, 'after.png'), fullPage: true });
@@ -97,12 +106,12 @@ try {
   await sw.evaluate(async id => chrome.tabs.sendMessage(id, { type: 'restoreAll' }), tabId);
   await sleep(800);
   const restored = await page.evaluate(() => ({
-    src: ['c1', 'c2', 'c4'].every(id => document.getElementById(id).currentSrc.endsWith('original.png')),
-    srcset: ['c1', 'c2', 'c3', 'c4'].every(id => !document.getElementById(id).hasAttribute('srcset')),
-    alt4: document.getElementById('c4').getAttribute('alt'),
-    sources: document.getElementById('p1').querySelectorAll('source').length,
+    src: ['picture-img', 'attribute-alt', 'alt-only', 'attribute-own'].every(id => document.getElementById(id).currentSrc.endsWith('original.png')),
+    srcset: ['picture-img', 'attribute-alt', 'src-data', 'alt-only', 'attribute-own'].every(id => !document.getElementById(id).hasAttribute('srcset')),
+    altOnly: document.getElementById('alt-only').getAttribute('alt'),
+    sources: document.getElementById('picture').querySelectorAll('source').length,
   }));
-  check('restore puts every original back', restored.src && restored.srcset && restored.sources === 1 && restored.alt4.startsWith('jai:'), JSON.stringify(restored));
+  check('restore puts every original back', restored.src && restored.srcset && restored.sources === 1 && restored.altOnly === ALT_ONLY, JSON.stringify(restored));
 
   // Strict CSP page (img-src 'self'). Chrome exempts content-script loads from the page CSP; other engines may not,
   // in which case the viewer must paint a canvas. Either way the render must be visible. (Cache hit, no cost.)
@@ -113,11 +122,11 @@ try {
   await sw.evaluate(async id => { await chrome.scripting.executeScript({ target: { tabId: id }, files: ['content.js'] }); }, cspTab);
   await sleep(400);
   await sw.evaluate(async id => chrome.tabs.sendMessage(id, { type: 'renderAll' }), cspTab);
-  await csp.waitForFunction(() => document.querySelector('canvas[role=img]') || /^data:image\//.test(document.getElementById('c2').currentSrc) && document.getElementById('c2').naturalWidth > 0, { timeout: 30000 }).catch(() => null);
-  const cspState = await csp.evaluate(() => { const i = document.getElementById('c2'); return { viaImg: /^data:image\//.test(i.currentSrc) && i.naturalWidth > 0, viaCanvas: !!document.querySelector('canvas[role=img]') && i.style.display === 'none' }; });
+  await csp.waitForFunction(() => document.querySelector('canvas[role=img]') || /^data:image\//.test(document.getElementById('attribute-alt').currentSrc) && document.getElementById('attribute-alt').naturalWidth > 0, { timeout: 30000 }).catch(() => null);
+  const cspState = await csp.evaluate(() => { const i = document.getElementById('attribute-alt'); return { viaImg: /^data:image\//.test(i.currentSrc) && i.naturalWidth > 0, viaCanvas: !!document.querySelector('canvas[role=img]') && i.style.display === 'none' }; });
   check('strict CSP page: render visible (image or canvas fallback)', cspState.viaImg || cspState.viaCanvas, JSON.stringify(cspState));
-  const c7 = await csp.waitForFunction(() => { const i = document.getElementById('c7'); return (/^data:image\//.test(i.currentSrc) && i.naturalWidth > 0) || (i.style.display === 'none' && i.nextElementSibling?.localName === 'canvas'); }, { timeout: 30000 }).then(() => true, () => false);
-  check('strict CSP page: a .jai file in src renders too (no original pixels)', c7);
+  const srcFile = await csp.waitForFunction(() => { const i = document.getElementById('src-file'); return (/^data:image\//.test(i.currentSrc) && i.naturalWidth > 0) || (i.style.display === 'none' && i.nextElementSibling?.localName === 'canvas'); }, { timeout: 30000 }).then(() => true, () => false);
+  check('strict CSP page: a .jai file in src renders too (no original pixels)', srcFile);
   await csp.screenshot({ path: join(out, 'csp.png') });
 
   // A content script must not be able to use the encoder's provider port.
@@ -147,7 +156,7 @@ try {
   await enc.click('#start');
   await enc.waitForFunction(() => !document.getElementById('result-card').hidden || /Encoding failed/.test(document.getElementById('log').textContent), { timeout: 240000 });
   const encState = await enc.evaluate(() => ({ text: document.getElementById('result-text').textContent, note: document.getElementById('result-note').textContent, log: document.getElementById('log').textContent, renders: document.querySelectorAll('.cand img').length }));
-  check('encode page: tiny real run returns a JAI document', /^jai:.+;aspect=3:2;(?:.*;)?model=black-forest-labs\/flux-schnell(?:;|$)/.test(encState.text) && encState.renders === 4, JSON.stringify(encState).slice(0, 400));
+  check('encode page: tiny real run returns a JAI document as canonical text', /^(?!jai:).+;aspect=3:2;(?:.*;)?model=black-forest-labs\/flux-schnell(?:;|$)/.test(encState.text) && encState.renders === 4, JSON.stringify(encState).slice(0, 400));
   const spent = Number(/\$(\d+\.\d+) in/.exec(encState.note)?.[1] ?? NaN);
   check('encode page: estimated spend within the limit', spent > 0 && spent <= 0.10, encState.note);
   await enc.screenshot({ path: join(out, 'encode.png'), fullPage: true });

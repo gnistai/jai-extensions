@@ -5,15 +5,17 @@ Loads the built extension into Chrome for Testing (branded Chrome ignores
 
 1. saves the Replicate token through the options page and checks it is not in
    `chrome.storage`, and tests it against Replicate;
-2. opens `page.html` (all three carriers, including a `.jai` file in `src`,
-   an `alt` beginning with `jai:` that must be ignored, and one plain image),
+2. opens `page.html` (all three carriers, including a `.jai` file in `src`, a
+   `data-jai` whose `alt` is the prompt and one with its own prompt, JAI text in
+   an `alt` without `data-jai` that must be ignored, and one plain image),
    injects the content script as the popup would, and checks discovery, that
    the `.jai` file is not fetched before use, and that the privileged fetch
-   refuses anything but a `.jai` path;
+   returns a cross-origin `.jai` resource but declines any other path on the
+   same host;
 3. checks nothing changes before the user asks, accepts the provider notice,
    renders everything, and checks replacement mechanics, accessible names,
    the AI-rendered description, layout boxes, that the plain image is untouched,
-   and that the four identical documents shared **one** provider job;
+   and that the five identical documents shared **one** provider job;
    checks that a sized box with a different `aspect` is not stretched and that
    the flux render received only the `prompt/flux` refinement;
 4. restores originals and checks every recorded state came back;
@@ -21,15 +23,19 @@ Loads the built extension into Chrome for Testing (branded Chrome ignores
    is visible either in the image or through the canvas fallback;
 6. checks that a content script cannot use the encoder's provider port;
 7. opens the encode page, checks that it needs consent, and runs a tiny real
-   encode (one generation of two candidates with FLUX.1 schnell, no judge,
-   limit $0.10, typically spends about $0.03).
+   encode (one generation of two candidates, each rendered with FLUX.1 schnell
+   at two seeds and measured by GPT-5.6 luna; limit $0.10).
 
-It costs about $0.03 on a fresh profile: two FLUX.1 schnell renders for the viewer, and one Gemini call, two renders and three CLIP embeddings for the encoder.
+It costs about $0.03 on a fresh profile: two FLUX.1 schnell renders for the
+viewer; for the encoder, GPT-5.6 luna calls and four FLUX.1 schnell renders
+(two candidates by two seeds).
 
 ```sh
 npm run build
-# copy dist/extension somewhere Chrome can read, and add the test server to
-# host_permissions in that copy only: "http://localhost:8766/*"
+# copy dist/extension somewhere Chrome can read, and add the test server under
+# both host names to host_permissions in that copy only:
+# "http://localhost:8766/*", "http://127.0.0.1:8766/*" (the second one is the
+# cross-origin host for the privileged-fetch check)
 (cd test/e2e && python3 -m http.server 8766)
 npx @puppeteer/browsers install chrome@stable
 node test/e2e/driver.mjs <chrome> <extension-copy> http://localhost:8766 <file-with-REPLICATE_API_TOKEN> <out-dir>

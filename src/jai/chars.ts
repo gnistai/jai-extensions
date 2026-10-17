@@ -16,7 +16,6 @@ export interface Diagnostic {
 /** The 25 code points with the Unicode White_Space property, as a regex class body. */
 export const WS_CLASS = '\\t\\n\\v\\f\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000';
 export const WS_ONLY_RE = new RegExp(`^[${WS_CLASS}]*$`);
-export const LEADING_WS_RE = new RegExp(`^[${WS_CLASS}]*`);
 
 export const KEY_SRC = '[a-z0-9][a-z0-9_-]*(?:\\.[a-z0-9][a-z0-9_-]*)*(?:/[a-z0-9][a-z0-9_-]*)?';
 /** Names that take a per-model target (spec §Per-model refinements). */
@@ -24,8 +23,8 @@ export const QUALIFIABLE: ReadonlySet<string> = new Set(['prompt', 'style', 'avo
 /** The key grammar (lowercase). */
 export const KEY_RE = new RegExp(`^${KEY_SRC}$`);
 
-export const STANDARD_KEYS: readonly string[] = ['prompt', 'style', 'avoid', 'model', 'aspect', 'mode', 'strength', 'seed', 'source', 'preview', 'animate'];
-export const SINGLE_VALUED: ReadonlySet<string> = new Set(['aspect', 'mode', 'strength', 'seed', 'source', 'preview', 'animate']);
+export const STANDARD_KEYS: readonly string[] = ['prompt', 'style', 'avoid', 'model', 'aspect', 'mode', 'strength', 'seed', 'source', 'preview'];
+export const SINGLE_VALUED: ReadonlySet<string> = new Set(['aspect', 'mode', 'strength', 'seed', 'source', 'preview']);
 export const RASTER_TYPES: ReadonlySet<string> = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/avif']);
 
 /** One of the WS_CLASS code points (all in the BMP, so one UTF-16 code unit each). */

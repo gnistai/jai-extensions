@@ -4,7 +4,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { gzipSync } from 'node:zlib';
 import * as host from '../dist/studio/host.mjs';
 import * as J from '../dist/jai.mjs';
 
@@ -78,50 +82,129 @@ const encodeOptions = (o = {}) => ({ server: SERVER, target: TARGET, targetThumb
 
 // ---------------------------------------------------------------- validate
 
-test('host validate: bytes, JSON and text forms; canonical text; validator advisories', async () => {
+test('host validate: a .jai file and JAI text; canonical text without a prefix; validator advisories', async () => {
   assert.equal(host.version, JSON.parse((await import('node:fs')).readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version);
   const doc = J.fromObject({ prompt: 'A lighthouse at dusk', style: 'oil painting', aspect: '16:9' });
   const gz = host.validate({ bytes: await J.encode(doc) });
-  assert.deepEqual(gz, { ok: true, fatal: false, form: 'gzip', text: J.serialize(doc), diagnostics: [] });
-  const json = host.validate({ text: '  {"jai":1,"prompt":"A castle","vendor":"x"}' });
-  assert.equal(json.form, 'json');
-  assert.equal(json.text, 'jai:A castle;vendor=x');
-  assert.deepEqual(codes(json.diagnostics), ['unknown-key:vendor']);
-  const text = host.validate({ text: 'jai: A castle ; style=ink ; aspect=wide' });
-  assert.equal(text.form, 'text');
+  assert.deepEqual(gz, { ok: true, fatal: false, text: 'A lighthouse at dusk;aspect=16:9;style=oil painting', diagnostics: [] });
+  const text = host.validate({ text: 'A castle ; style=ink ; aspect=wide' });
   assert.equal(text.ok, true);
+  assert.equal(text.text, 'A castle;aspect=wide;style=ink');
   assert.ok(codes(text.diagnostics).includes('invalid-value:aspect'));
+  // Text is the text form only: "jai:" and JSON are prose like any other.
+  assert.equal(host.validate({ text: 'jai:A castle' }).text, 'jai:A castle');
+  const json = host.validate({ text: '{"jai":1,"prompt":"A castle"}' });
+  assert.equal(json.ok, true);
+  assert.equal(json.text, '{"jai":1,"prompt":"A castle"}');
+  // A data:image/jai URL is read as its text body; a body that is not UTF-8 is fatal.
+  assert.deepEqual(host.validate({ text: 'data:image/jai,A%20cat;style=ink' }), { ok: true, fatal: false, text: 'A cat;style=ink', diagnostics: [] });
+  assert.equal(host.validate({ text: ' \tDATA:Image/JAI,photo.jai\n' }).text, 'photo.jai', 'trimmed, any case, and a URL before a .jai name');
+  const bad = host.validate({ text: 'data:image/jai,%FF' });
+  assert.deepEqual({ fatal: bad.fatal, text: bad.text, codes: codes(bad.diagnostics) }, { fatal: true, text: null, codes: ['undecodable'] });
+  // The URL's own advisories still come with an unreadable body.
+  assert.deepEqual(codes(host.validate({ text: 'data:image/jai;charset=utf-8,%FF' }).diagnostics), ['undecodable', 'data-url-parameter']);
+  // The URL's own advisories come from validateDataURL: ;base64 and charset are parameters.
+  const b64 = host.validate({ text: `data:image/jai;base64,${Buffer.from('A castle;style=ink').toString('base64')}` });
+  assert.deepEqual({ ok: b64.ok, text: b64.text, codes: codes(b64.diagnostics) }, { ok: true, text: 'A castle;style=ink', codes: ['data-url-parameter'] });
+  assert.deepEqual(codes(host.validate({ text: 'data:image/jai;charset=utf-8,A castle' }).diagnostics), ['data-url-parameter', 'unencoded-url-text']);
+  // Only data:image/jai and then "," or ";" is a URL; other text is the text form, never sniffed.
+  for (const prose of ['Data: a bar chart of sales', 'data:text/plain,A cat', 'data:image/jaix,A cat', 'data:image/jai']) {
+    const r = host.validate({ text: prose });
+    assert.equal(r.ok, true, prose);
+    assert.equal(r.text, J.serialize(J.parse(prose).document), prose);
+    assert.ok(!codes(r.diagnostics).some(c => c.startsWith('data-url') || c === 'undecodable'), prose);
+  }
+  assert.equal(host.validate({ text: 'Data: a bar chart of sales' }).text, 'Data: a bar chart of sales');
+  // A data:image/jai URL that the data: URL processor rejects carries no document.
+  for (const url of ['data:image/jai;base64', 'data:image/jai;base64,@@@']) assert.throws(() => host.validate({ text: url }), /cannot be read: this data:image\/jai URL carries no document/, url);
   assert.throws(() => host.validate({}), TypeError);
 });
 
-test('host validate: unreadable documents are fatal, with the reason', () => {
-  const bad = host.validate({ text: '{"jai":1,' });
-  assert.deepEqual({ ok: bad.ok, fatal: bad.fatal, form: bad.form, text: bad.text }, { ok: false, fatal: true, form: 'json', text: null });
-  assert.ok(codes(bad.diagnostics).includes('invalid-json'));
+test('host validate: bytes are a .jai file only; anything else is fatal, with the reason', async () => {
   const gz = host.validate({ bytes: new Uint8Array([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255, 1, 2, 3, 4, 5, 6, 7, 8]) });
-  assert.equal(gz.fatal, true);
-  assert.equal(gz.form, null);
+  assert.deepEqual({ ok: gz.ok, fatal: gz.fatal, text: gz.text }, { ok: false, fatal: true, text: null });
   const mc = gz.diagnostics.find(d => d.code === 'malformed-container');
   assert.equal(typeof mc.reason, 'string');
-  assert.equal(host.validate({ bytes: new Uint8Array([0xff, 0xfe, 0x41, 0x00]) }).diagnostics[0].code, 'undecodable');
-  assert.equal(host.validate({ bytes: [0x41, 0x20, 0x63, 0x61, 0x74] }).text, 'jai:A cat', 'byte arrays from the host are accepted');
+  // Uncompressed JSON or text in a file is not the file form: no fallback.
+  for (const raw of ['{"jai":1,"prompt":"x"}', 'A cat', '']) {
+    const r = host.validate({ bytes: new TextEncoder().encode(raw) });
+    assert.deepEqual({ fatal: r.fatal, text: r.text }, { fatal: true, text: null }, raw);
+    // An unreadable document is not validated: no no-prompt for the empty document it decoded to.
+    assert.deepEqual(codes(r.diagnostics), ['malformed-container'], raw);
+  }
+  const badJSON = host.validate({ bytes: gzipSync('{"jai":1,') });
+  assert.equal(badJSON.fatal, true);
+  assert.deepEqual(codes(badJSON.diagnostics), ['invalid-json']);
+  assert.equal(host.validate({ bytes: Array.from(await J.encode(J.parse('A cat').document)) }).text, 'A cat', 'byte arrays from the host are accepted');
 });
 
-test('host validate mirrors `jai validate`: the same text, codes and verdict', () => {
-  for (const input of ['jai: A castle ; Style=ink;foo=bar', '{"jai":1,"prompt":"x","prompt ":"y"}', 'prompt=a;prompt=b;seed=12x', '{"jai":1,']) {
-    const cli = spawnSync(process.execPath, [CLI, 'validate', input], { encoding: 'utf8' });
-    const r = host.validate({ text: input });
-    const lines = cli.stdout.trimEnd().split('\n');
-    assert.equal(cli.status === 0, r.ok, input);
-    if (r.text !== null) assert.equal(lines[0], r.text, input);
-    assert.deepEqual(lines.slice(1).map(l => l.trim()), r.diagnostics.map(d => `${d.code}${d.key ? ` (${d.key})` : ''}`), input);
+test('host validate mirrors `jai validate`: the same text, codes and verdict for text, data:image/jai URLs and .jai files', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'jai-validate-'));
+  const files = {
+    'good.jai': await J.encode(J.fromObject({ prompt: 'A castle', style: 'ink', foo: 'bar' })),
+    'text.jai': new TextEncoder().encode('A castle;style=ink'),
+    'broken.jai': gzipSync('{"jai":1,'),
+  };
+  const texts = ['A castle ; Style=ink;foo=bar', 'prompt=a;prompt=b;seed=12x', '{"jai":1,', 'Data: a bar chart of sales', 'data:text/plain,A castle',
+    'data:image/jai,photo.jai', `data:image/jai;base64,${Buffer.from('A castle;style=ink').toString('base64')}`, 'data:image/jai,%FF', 'data:image/jai;base64,/w=='];
+  const cases = [
+    ...texts.map(text => ({ arg: text, input: { text } })),
+    ...Object.entries(files).map(([name, bytes]) => { const path = join(dir, name); writeFileSync(path, bytes); return { arg: path, input: { bytes } }; }),
+  ];
+  for (const { arg, input } of cases) {
+    const cli = spawnSync(process.execPath, [CLI, 'validate', arg], { encoding: 'utf8' });
+    const r = host.validate(input);
+    assert.equal(cli.status, r.ok ? 0 : 1, arg);
+    // The canonical text (none for an unreadable document), then one line per diagnostic.
+    const expected = [...(r.text === null ? [] : [r.text]), ...r.diagnostics.map(d => `  ${d.code}${d.key ? ` (${d.key})` : ''}`)];
+    assert.deepEqual(cli.stdout.split('\n').slice(0, -1), expected, arg);
   }
+  const missing = spawnSync(process.execPath, [CLI, 'validate', join(dir, 'missing.jai')], { encoding: 'utf8' });
+  assert.equal(missing.status, 2, 'a .jai argument is a file, never text');
+  assert.match(missing.stderr, /no such file/);
+  // As in JAI Studio's CLI: no such file (a folder included) is a usage error; a file that cannot be read is a failure.
+  mkdirSync(join(dir, 'folder.jai'));
+  assert.equal(spawnSync(process.execPath, [CLI, 'validate', join(dir, 'folder.jai')], { encoding: 'utf8' }).status, 2);
+  if (process.platform !== 'win32' && process.getuid?.() !== 0) {
+    const locked = join(dir, 'locked.jai');
+    writeFileSync(locked, files['good.jai']);
+    chmodSync(locked, 0);
+    const r = spawnSync(process.execPath, [CLI, 'validate', locked], { encoding: 'utf8' });
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /^Cannot read .*locked\.jai: /);
+  }
+  // A data:image/jai URL that carries no document cannot be read, as in the host.
+  const noDoc = spawnSync(process.execPath, [CLI, 'validate', 'data:image/jai;base64,@@@'], { encoding: 'utf8' });
+  assert.equal(noDoc.status, 1);
+  assert.equal(noDoc.stdout, '');
+  assert.match(noDoc.stderr, /^The document cannot be read: this data:image\/jai URL carries no document/);
+});
+
+test('`jai render` refuses an unreadable document as `jai validate` does, before any provider is reached', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'jai-render-'));
+  const text = join(dir, 'text.jai');
+  writeFileSync(text, 'A castle;style=ink');
+  const broken = join(dir, 'broken.jai');
+  writeFileSync(broken, gzipSync('{"jai":1,'));
+  // No token: a render that went ahead would stop at the missing REPLICATE_API_TOKEN instead.
+  const env = { ...process.env, REPLICATE_API_TOKEN: '' };
+  for (const [arg, why] of [[text, /malformed-container \(/], [broken, /invalid-json/], ['data:image/jai,%FF', /undecodable \(not-utf8\)/], ['data:image/jai;base64', /carries no document/]]) {
+    for (const extra of [[], ['--local']]) {
+      const r = spawnSync(process.execPath, [CLI, 'render', arg, ...extra], { encoding: 'utf8', env: { ...env, JAI_HOME: join(dir, 'no-studio') } });
+      assert.equal(r.status, 1, `${arg} ${extra}`);
+      assert.match(r.stderr, /^The document cannot be read: /, arg);
+      assert.match(r.stderr, why, arg);
+      assert.equal(r.stdout, '', arg);
+    }
+  }
+  await assert.rejects(host.render({ text: 'data:image/jai,%FF' }, { server: SERVER }), /cannot be read: undecodable/);
+  await assert.rejects(host.render({ text: 'data:image/jai;base64' }, { server: SERVER }), /carries no document/);
 });
 
 // ---------------------------------------------------------------- render
 
 test('host render: one-model interpretation, the exact sent prompt, the reported seed and size', () => withStudio({}, async ({ calls }) => {
-  const input = { text: 'jai: A lighthouse at dusk ; style=oil painting ; aspect=16:9 ; seed=42 ; model=stability-ai/sdxl' };
+  const input = { text: 'A lighthouse at dusk ; style=oil painting ; aspect=16:9 ; seed=42 ; model=stability-ai/sdxl' };
   const r = await host.render(input, { server: SERVER });
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, `${SERVER.url}/v1/images/generations`);
@@ -130,42 +213,56 @@ test('host render: one-model interpretation, the exact sent prompt, the reported
   assert.deepEqual({ ...r, bytes: undefined }, {
     bytes: undefined, mime: 'image/png', model: 'black-forest-labs/flux-schnell', modelLabel: 'FLUX.1 schnell',
     sentPrompt: 'A lighthouse at dusk\n\nStyle: oil painting.', seed: 42, width: 1344, height: 768,
-    description: 'A lighthouse at dusk', documentText: 'jai:A lighthouse at dusk;aspect=16:9;model=stability-ai/sdxl;seed=42;style=oil painting',
+    description: 'A lighthouse at dusk', documentText: 'A lighthouse at dusk;aspect=16:9;model=stability-ai/sdxl;seed=42;style=oil painting',
     diagnostics: [{ code: 'no-matching-model', key: 'model' }],
   });
   assert.ok(r.bytes instanceof Uint8Array && r.bytes[0] === 0x89);
 }));
 
-test('host render: seed and model options, output format and scale', () => withStudio({}, async ({ calls }) => {
-  const text = { text: 'jai: A castle ; seed=5 ; model=flux-dev' };
-  const r = await host.render(text, { server: SERVER, seed: ' 7 ', outputFormat: 'jpeg', scale: 0.5 });
-  assert.deepEqual(calls[0].body, { prompt: 'A castle', width: 512, height: 512, output_format: 'jpeg', seed: 7 });
+test('host render: the seed option and the output format', () => withStudio({}, async ({ calls }) => {
+  const text = { text: 'A castle ; seed=5 ; model=flux-dev' };
+  const r = await host.render(text, { server: SERVER, seed: ' 7 ', outputFormat: 'jpeg' });
+  assert.deepEqual(calls[0].body, { prompt: 'A castle', width: 1024, height: 1024, output_format: 'jpeg', seed: 7 });
   assert.equal(r.seed, 7);
   assert.equal(r.mime, 'image/jpeg');
   assert.deepEqual(codes(r.diagnostics), ['substituted-model:model']);
-  const picked = await host.render({ text: 'A castle' }, { server: SERVER, seed: null, model: 'flux-schnell' });
+  const picked = await host.render({ text: 'A castle;model=flux-schnell' }, { server: SERVER, seed: null });
   assert.equal('seed' in calls[1].body, false);
   assert.equal(picked.seed, 99, 'the seed the server picked');
   assert.deepEqual(picked.diagnostics, []);
   const big = await host.render({ text: 'A castle;seed=99999999999999999999' }, { server: SERVER });
   // A document without a model value is reported with no-matching-model too (spec: Model matching).
   assert.deepEqual(big.diagnostics, [{ code: 'no-matching-model', key: 'model' }, { code: 'adjusted-value', key: 'seed', requested: '99999999999999999999', actual: String(Number(99999999999999999999n % 4294967296n)) }]);
-  await assert.rejects(host.render(text, { server: SERVER, model: 'stability-ai/sdxl' }), RangeError);
   await assert.rejects(host.render(text, { server: SERVER, seed: '-1' }), RangeError);
+  await assert.rejects(host.render(text, { server: SERVER, seed: '123456789012345678901' }), /1 to 20 digits/);
   await assert.rejects(host.render(text, {}), TypeError);
 }));
 
 test('host render: modes, interpreter reports, file bytes and unreadable documents', () => withStudio({}, async ({ calls }) => {
-  const transform = await host.render({ text: 'jai: A castle in snow ; mode=transform ; strength=0.4 ; aspect=4:3 ; aspect=3:2' }, { server: SERVER });
+  const transform = await host.render({ text: 'A castle in snow ; mode=transform ; strength=0.4 ; aspect=4:3 ; aspect=3:2' }, { server: SERVER });
   assert.deepEqual(codes(transform.diagnostics), ['repeated-single:aspect', 'no-matching-model:model', 'original-not-readable:mode']);
   assert.equal(calls[0].body.width, 1216, 'the last aspect value counts');
-  const keep = await host.render({ text: 'jai: A castle ; mode=keep' }, { server: SERVER });
+  const keep = await host.render({ text: 'A castle ; mode=keep' }, { server: SERVER });
   assert.deepEqual(codes(keep.diagnostics), ['no-matching-model:model'], 'a requested render of a keep document is a generate render');
   const file = await host.render({ bytes: await J.encode(J.fromObject({ prompt: 'A red kite', seed: 'abc' })) }, { server: SERVER });
   assert.equal(file.sentPrompt, 'A red kite');
   assert.deepEqual(codes(file.diagnostics), ['invalid-value:seed', 'no-matching-model:model']);
-  await assert.rejects(host.render({ bytes: new Uint8Array([0xff, 0xfe, 0x00]) }, { server: SERVER }), /cannot be read: undecodable/);
+  await assert.rejects(host.render({ bytes: new TextEncoder().encode('A castle') }, { server: SERVER }), /cannot be read: malformed-container/);
   assert.equal(calls.length, 3);
+}));
+
+test("host render: a standalone document renders at its aspect, else its preview's ratio, else 1:1", () => withStudio({}, async ({ calls }) => {
+  const sharp = (await import('sharp')).default;
+  const preview = async (width, height) => `data:image/webp;base64,${(await sharp({ create: { width, height, channels: 3, background: '#336699' } }).webp().toBuffer()).toString('base64')}`;
+  const size = async text => { const r = await host.render({ text }, { server: SERVER }); return [r.width, r.height, codes(r.diagnostics)]; };
+  assert.deepEqual(await size(`A castle;preview=${await preview(16, 9)}`), [1344, 768, ['no-matching-model:model']]);
+  assert.deepEqual(await size(`A castle;preview=${await preview(9, 21)}`), [640, 1536, ['no-matching-model:model']]);
+  assert.deepEqual(await size(`A castle;aspect=1:1;preview=${await preview(16, 9)}`), [1024, 1024, ['no-matching-model:model']]);
+  assert.deepEqual(await size('A castle;preview=data:image/png;base64,iVBORw0KGgo='), [1024, 1024, ['no-matching-model:model']], 'a preview whose size cannot be read');
+  // A transform document's source is never fetched: the renderer reports it, the interpreter's mode-degraded is not shown.
+  const transform = await size(`A castle in snow;mode=transform;source=https://example.com/c.png;preview=${await preview(4, 3)}`);
+  assert.deepEqual(transform, [1152, 896, ['no-matching-model:model', 'original-not-readable:mode']]);
+  assert.equal(calls.length, 5);
 }));
 
 // ---------------------------------------------------------------- encode
@@ -179,7 +276,7 @@ test('host encode: renders streamed to saveRender, events as JSON with render re
   assert.deepEqual(Object.keys(out.best), ['id', 'fitness']);
   assert.ok(typeof out.seconds === 'number');
   const decoded = J.decode(out.jai);
-  assert.equal(decoded.form, 'gzip');
+  assert.deepEqual(decoded.diagnostics, []);
   assert.ok(J.documentsEqual(decoded.document, J.parse(out.text).document));
   assert.deepEqual(decoded.document.get('model'), ['black-forest-labs/flux-schnell']);
 
@@ -243,7 +340,7 @@ test('host encode: globalThis.__jaiAbort cancels, keeping the best so far', () =
   assert.equal(typeof hook, 'function');
   assert.equal(out.stopReason, 'canceled');
   assert.equal(rec.events.filter(e => e.type === 'generation').length, 1);
-  assert.ok(out.text.startsWith('jai:Photograph'));
+  assert.ok(out.text.startsWith('Photograph'));
   assert.equal(globalThis.__jaiAbort, undefined);
 }));
 
@@ -256,7 +353,7 @@ test('host encode: a run that stops on an error returns its best with the error,
   assert.equal(out.stopReason, 'error');
   assert.equal(out.error, 'Chat completion failed (HTTP 500): llama-server exited');
   assert.equal(out.report.error, out.error);
-  assert.ok(out.text.startsWith('jai:Photograph'), 'the best of the first generation');
+  assert.ok(out.text.startsWith('Photograph'), 'the best of the first generation');
   assert.deepEqual(rec.events.filter(e => e.type === 'log').map(e => e.message), [`Stopped: ${out.error}`]);
 }));
 

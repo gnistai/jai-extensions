@@ -205,7 +205,7 @@ function draftOf(s: Scene): Draft {
 }
 
 const VIEW_PROMPT = 'A red-and-white lighthouse on a rocky island at sunset, calm sea, a small sailing boat far left';
-const VIEW_DOC = `jai:${VIEW_PROMPT};style=watercolour, soft washes;aspect=16:10`;
+const VIEW_DOC = `${VIEW_PROMPT};aspect=16:10;style=watercolour, soft washes`;
 
 // ---------------------------------------------------------------- the backend
 
@@ -262,7 +262,7 @@ export class MockBackend {
       // Like the app: it returns when the installer has exited (here, asking for a restart that is not needed).
       case 'install_vc_runtime': await sleep(4000); this.vcOk = true; return { outcome: 'finished', exitCode: 3010 } satisfies VcInstallReply;
       case 'read_document': return this.readDocument(str('path'));
-      case 'viewer_render': return this.render(typeof args.path === 'string' ? args.path : 'text', typeof args.seed === 'string' ? args.seed : null);
+      case 'viewer_render': return this.render(String(args.path), typeof args.seed === 'string' ? args.seed : null);
       case 'save_file': return { path: `C:\\Users\\you\\Documents\\${str('suggestedName')}` };
       case 'open_dialog': return { path: args.kind === 'image' ? 'C:\\Users\\you\\Pictures\\harbour-lighthouse.jpg' : 'C:\\Users\\you\\Pictures\\lighthouse.jai' };
       case 'image_preview': { const c = paint(1024, 683, TARGET); return { dataUrl: c.toDataURL('image/jpeg', 0.85), width: 1024, height: 683 } satisfies ImagePreview; }
@@ -302,8 +302,8 @@ export class MockBackend {
 
   private readDocument(path: string): DocumentInfo {
     const name = path.split(/[\\/]/).pop() || path;
-    if (/broken/i.test(name)) return { name, path, validate: { ok: false, fatal: true, form: null, text: null, diagnostics: [{ code: 'invalid-json', reason: 'Unexpected end of JSON input' }] } };
-    return { name, path, validate: { ok: true, fatal: false, form: 'gzip', text: VIEW_DOC, diagnostics: [] } };
+    if (/broken/i.test(name)) return { name, path, validate: { ok: false, fatal: true, text: null, diagnostics: [{ code: 'malformed-container', reason: 'truncated' }] } };
+    return { name, path, validate: { ok: true, fatal: false, text: VIEW_DOC, diagnostics: [] } };
   }
 
   // ---------------------------------------------------------------- engines
@@ -548,7 +548,7 @@ export class MockBackend {
   private result(jobId: string, dir: string, name: string, best: CandidateRef | null, stopReason: string): EncodeDone {
     if (!best) return { jobId, ok: false, reportDir: dir, error: 'No candidate was evaluated.', stopReason };
     const d = best.draft;
-    const text = `jai:${d.prompt};style=${d.style.join(', ')};avoid=${d.avoid.join(', ')};aspect=3:2`;
+    const text = `${d.prompt};aspect=3:2;avoid=${d.avoid.join(', ')};style=${d.style.join(', ')}`;
     return { jobId, ok: true, text, jaiPath: `${dir}\\${name}.jai`, reportDir: dir, stopReason };
   }
 }

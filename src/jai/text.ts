@@ -1,20 +1,21 @@
 // The text form: parsing algorithm and canonical serialisation.
-import { KEY_SRC, LEADING_WS_RE, WS_CLASS, WS_ONLY_RE, asciiLower, byCodePoint, orderedKeys, diag, isKey, normalizeValue, toScalarValueString, trim, type Diagnostic, type JaiDocument } from './chars.ts';
+import { KEY_SRC, WS_CLASS, WS_ONLY_RE, asciiLower, orderedKeys, diag, isKey, normalizeValue, toScalarValueString, trim, type Diagnostic, type JaiDocument } from './chars.ts';
 import { addValue, createDocument } from './document.ts';
 
 const ASSIGNMENT_PATTERN_RE = new RegExp(`^[${WS_CLASS}]*${KEY_SRC}[${WS_CLASS}]*=`, 'i');
 const ESCAPE_VALUE_RE = new RegExp(`\\\\(?=[;=\\\\]|$)|^;|;(?=[${WS_CLASS}]*(?:$|;|${KEY_SRC}[${WS_CLASS}]*=))`, 'gi');
 
 export type SegmentInfo =
-  | { kind: 'assignment'; key: string; index: number }
-  | { kind: 'prompt'; key: 'prompt'; index: number }
-  | { kind: 'continuation'; key: string; index: number; raw: string }
+  | { kind: 'assignment'; key: string }
+  | { kind: 'prompt'; key: 'prompt' }
+  | { kind: 'continuation'; key: string; raw: string }
   | { kind: 'reserved'; key: string }
   | { kind: 'dropped' };
 
-interface Pending { key: string; text: string; kind: 'assignment' | 'prose'; continued: number; value?: string; dropped?: boolean }
+interface Pending { key: string; text: string }
 
-export interface ParseInfo { prefixed: boolean; segments: SegmentInfo[]; pending: Pending[] }
+/** Implementation detail used by validate(). */
+export interface ParseInfo { segments: SegmentInfo[] }
 export interface ParseResult { document: JaiDocument; diagnostics: Diagnostic[]; info: ParseInfo }
 
 function unescapeText(s: string): string {
@@ -43,13 +44,10 @@ export function parse(rawInput: string): ParseResult {
   let i = 0;
   while (input.charCodeAt(i) === 0xfeff) i++;
   input = input.slice(i).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-  i = (LEADING_WS_RE.exec(input)?.[0] ?? '').length;
-  let prefixed = false;
-  if (/^jai:/i.test(input.slice(i, i + 4))) { i += 4; prefixed = true; }
 
   const raws: string[] = [];
   let cur = '';
-  for (let j = i; j < input.length; j++) {
+  for (let j = 0; j < input.length; j++) {
     const c = input.charAt(j);
     if (c === '\\' && j + 1 < input.length) { cur += c + input.charAt(j + 1); j++; continue; }
     if (c === ';') { raws.push(cur); cur = ''; continue; }
@@ -57,7 +55,7 @@ export function parse(rawInput: string): ParseResult {
   }
   raws.push(cur);
 
-  const DISCARD: Pending = { key: '', text: '', kind: 'assignment', continued: 0, dropped: true };
+  const DISCARD: Pending = { key: '', text: '' };
   const pending: Pending[] = [];
   let current: Pending | null = null;
   const segments: SegmentInfo[] = [];
@@ -76,47 +74,49 @@ export function parse(rawInput: string): ParseResult {
           segments.push({ kind: 'reserved', key });
           return;
         }
-        const p: Pending = { key, text: raw.slice(eq + 1), kind: 'assignment', continued: 0 };
+        const p: Pending = { key, text: raw.slice(eq + 1) };
         pending.push(p); current = p;
-        segments.push({ kind: 'assignment', key, index: pending.length - 1 });
+        segments.push({ kind: 'assignment', key });
         return;
       }
     }
     if (current === null) {
-      const p: Pending = { key: 'prompt', text: raw, kind: 'prose', continued: 0 };
+      const p: Pending = { key: 'prompt', text: raw };
       pending.push(p); current = p;
-      segments.push({ kind: 'prompt', key: 'prompt', index: pending.length - 1 });
+      segments.push({ kind: 'prompt', key: 'prompt' });
     } else if (current === DISCARD) {
       segments.push({ kind: 'dropped' });
     } else {
       const c: Pending = current;
-      c.text += ';' + raw; c.continued++;
-      segments.push({ kind: 'continuation', key: c.key, index: pending.indexOf(c), raw });
+      c.text += ';' + raw;
+      segments.push({ kind: 'continuation', key: c.key, raw });
     }
   });
   for (const p of pending) {
     const v = normalizeValue(unescapeText(p.text));
-    if (v === null) { diagnostics.push(diag('empty-value', p.key)); p.dropped = true; }
-    else { addValue(doc, p.key, v); p.value = v; }
+    if (v === null) diagnostics.push(diag('empty-value', p.key));
+    else addValue(doc, p.key, v);
   }
-  return { document: doc, diagnostics, info: { prefixed, segments, pending } };
+  return { document: doc, diagnostics, info: { segments } };
 }
 
 /** escape-value: one left-to-right pass (spec §Canonical text serialisation). */
 export function escapeValue(v: string): string { return v.replace(ESCAPE_VALUE_RE, m => '\\' + m); }
 
 /** escape-prose: escape every \ ; = (spec §Escaping arbitrary text). */
-export function escapeProse(s: string): string { return s.replace(/[\;=]/g, m => '\\' + m); }
+export function escapeProse(s: string): string { return s.replace(/[\\;=]/g, m => '\\' + m); }
 
-/** Canonical text serialisation; {bare: true} omits the prefix and adds the bare protections. */
-export function serialize(doc: JaiDocument, { bare = false }: { bare?: boolean } = {}): string {
+/**
+ * Canonical text serialisation (spec §Canonical text serialisation). The first prompt
+ * value is written as prompt=… when it matches the assignment pattern or begins with
+ * U+FEFF (which the parser removes); later prompt values always are.
+ */
+export function serialize(doc: JaiDocument): string {
   const segments: string[] = [];
   (doc.get('prompt') ?? []).forEach((v, n) => {
-    let promptForm = n > 0 || ASSIGNMENT_PATTERN_RE.test(v);
-    if (!promptForm && bare && (/^jai:/i.test(v) || v.charCodeAt(0) === 0xfeff || v.charAt(0) === '{')) promptForm = true;
+    const promptForm = n > 0 || ASSIGNMENT_PATTERN_RE.test(v) || v.charCodeAt(0) === 0xfeff;
     segments.push(promptForm ? 'prompt=' + escapeValue(v) : escapeValue(v));
   });
-  const keys = orderedKeys(doc);
-  for (const k of keys) for (const v of doc.get(k) ?? []) segments.push(k + '=' + escapeValue(v));
-  return (bare ? '' : 'jai:') + segments.join(';');
+  for (const k of orderedKeys(doc)) for (const v of doc.get(k) ?? []) segments.push(k + '=' + escapeValue(v));
+  return segments.join(';');
 }

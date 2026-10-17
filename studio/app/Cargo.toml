@@ -77,4 +77,5 @@ libc.workspace = true
 tauri-build = { workspace = true, optional = true }
 
 [dev-dependencies]
+flate2.workspace = true
 tempfile.workspace = true

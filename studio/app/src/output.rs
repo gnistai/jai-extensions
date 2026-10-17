@@ -3,7 +3,7 @@
 //! timestamps. Everything here is pure, so it is unit-tested on every OS.
 
 use jai_engines::{EngineKind, EngineState, SchedulerStatus};
-use jai_js::Diag;
+use jai_js::{Diag, ValidateResult};
 use serde_json::Value;
 
 /// Decimal units, as disk and download sizes are usually shown: "30.3 GB",
@@ -75,6 +75,29 @@ pub fn format_diag(d: &Diag) -> String {
         s.push_str(&details.join(", "));
     }
     s
+}
+
+/// Why a document cannot be read (`ValidateResult.fatal`), in the words of
+/// `jai_js::render`: `The document cannot be read: malformed-container
+/// (reason)`. The fatal codes are `malformed-container` and `invalid-json`
+/// (a `.jai` file that is not the file form) and `undecodable` (a
+/// `data:image/jai` body that is not UTF-8 text within the text bound).
+pub fn fatal_message(validated: &ValidateResult) -> String {
+    let fatal = validated.diagnostics.iter().find(|d| {
+        matches!(
+            d.code.as_str(),
+            "malformed-container" | "invalid-json" | "undecodable"
+        )
+    });
+    match fatal {
+        Some(Diag {
+            code,
+            reason: Some(reason),
+            ..
+        }) => format!("The document cannot be read: {code} ({reason})"),
+        Some(d) => format!("The document cannot be read: {}", d.code),
+        None => "The document cannot be read".into(),
+    }
 }
 
 /// The state of one engine in a word: the scheduler's state for the loaded
@@ -429,6 +452,27 @@ mod tests {
         let mut m = d("malformed-container");
         m.reason = Some("truncated gzip".into());
         assert_eq!(format_diag(&m), "malformed-container: truncated gzip");
+        // An unreadable document, in the host's words: the first fatal code.
+        let validated = |diagnostics: Vec<Diag>| ValidateResult {
+            ok: false,
+            fatal: true,
+            text: None,
+            diagnostics,
+        };
+        assert_eq!(
+            fatal_message(&validated(vec![d("adjusted-value"), m.clone()])),
+            "The document cannot be read: malformed-container (truncated gzip)"
+        );
+        for code in ["invalid-json", "undecodable"] {
+            assert_eq!(
+                fatal_message(&validated(vec![d(code), d("missing-prompt")])),
+                format!("The document cannot be read: {code}")
+            );
+        }
+        assert_eq!(
+            fatal_message(&validated(vec![])),
+            "The document cannot be read"
+        );
     }
 
     fn status(loaded: Option<EngineKind>, state: EngineState) -> SchedulerStatus {

@@ -120,7 +120,7 @@ pub mod xdg {
     /// The desktop entry and MIME package names (the Tauri identifier).
     pub const APP_ID: &str = "ai.gnist.jai";
     /// The MIME type of `.jai` files.
-    pub const MIME: &str = "image/x-jai";
+    pub const MIME: &str = "image/jai";
 
     fn home() -> anyhow::Result<PathBuf> {
         std::env::var_os("HOME")
@@ -309,9 +309,9 @@ pub mod xdg {
             assert!(a.contains("\nExec=\"/opt/jai/jai\" tray\n"));
             let e = association_entry("/opt/jai/jai");
             assert!(e.contains("\nExec=\"/opt/jai/jai\" %f\n"));
-            assert!(e.contains("\nMimeType=image/x-jai;\n"));
+            assert!(e.contains("\nMimeType=image/jai;\n"));
             let m = mime_package();
-            assert!(m.contains("<mime-type type=\"image/x-jai\">"));
+            assert!(m.contains("<mime-type type=\"image/jai\">"));
             assert!(m.contains("<glob pattern=\"*.jai\"/>"));
         }
 

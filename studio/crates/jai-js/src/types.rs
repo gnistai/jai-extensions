@@ -14,7 +14,11 @@ pub struct ServerRef {
     pub token: String,
 }
 
-/// A document as file bytes (`.jai`, JSON or text) or as text.
+/// A document: the bytes of a `.jai` file, decoded as the file form only, or
+/// text. Text that is a `data:image/jai` URL (after trimming C0 controls and
+/// spaces, `data:image/jai` and then `,` or `;`, ASCII case-insensitively) is
+/// decoded as its text body, and the host refuses one that carries no
+/// document; any other text is JAI text, parsed as the text form.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DocInput {
     Bytes(Vec<u8>),
@@ -56,12 +60,14 @@ pub struct Diag {
 #[serde(rename_all = "camelCase")]
 pub struct ValidateResult {
     pub ok: bool,
-    /// `invalid-json`, `malformed-container` or `undecodable` was reported.
+    /// `malformed-container` or `invalid-json` (a `.jai` file that is not the
+    /// file form) or `undecodable` (a `data:image/jai` body that is not UTF-8
+    /// text within the text bound) was reported: the document cannot be read.
     pub fatal: bool,
-    /// `gzip`, `json` or `text`.
-    pub form: Option<String>,
-    /// The canonical text.
+    /// The canonical text; `None` when fatal.
     pub text: Option<String>,
+    /// The decoder's, then a `data:image/jai` URL's own advisories, then the
+    /// validator's on the document (none when fatal).
     pub diagnostics: Vec<Diag>,
 }
 
@@ -71,13 +77,9 @@ pub struct RenderOptions {
     pub server: ServerRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
     /// `png` or `jpeg`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_format: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scale: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

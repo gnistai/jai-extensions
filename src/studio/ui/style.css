@@ -150,6 +150,9 @@ body.dragging .stage-card.locked .drop { border-color: var(--border-strong); bac
 .render { margin: 0; position: relative; display: grid; place-items: center; border-radius: 8px; border: 2px solid transparent; }
 .render img { display: block; max-width: 100%; max-height: calc(100vh - 124px); width: auto; height: auto; border-radius: 8px; }
 .render.empty { aspect-ratio: 16 / 9; width: 100%; background: var(--bg-sunken); }
+/* A document's preview (a few pixels) scaled up to the panel, at its own ratio. */
+.render img.preview { width: 100%; object-fit: contain; }
+.render-fallback { margin: 0; padding: 24px; max-width: 40em; text-align: center; overflow-wrap: anywhere; }
 .render-wait { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 10px; text-align: center; font-weight: 600; background: color-mix(in srgb, var(--bg-raised) 72%, transparent); border-radius: 8px; }
 .spinner { width: 28px; height: 28px; border: 3px solid var(--track); border-top-color: var(--accent); border-radius: 50%; animation: spin .9s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }

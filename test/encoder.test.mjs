@@ -3,7 +3,7 @@
 // boxes, so the tests check that the loop really converges on the target.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { encode, measure, fitnessOf, describeObservation, Budget, BudgetExceeded, reduceAspect, thumbnailSimilarity, parseAnswer, toDrafts, toObservation, refinementTargets, buildDocument, cosine } from '../dist/encoder.mjs';
+import { encode, measure, fitnessOf, describeObservation, Budget, BudgetExceeded, reduceAspect, thumbnailSimilarity, parseAnswer, toDrafts, toObservation, refinementTargets, buildDocument } from '../dist/encoder.mjs';
 import { parse, interpret } from '../dist/jai.mjs';
 
 const MODELS = [
@@ -336,7 +336,7 @@ test('encoder: cancel stops with the best so far', async () => {
   const ac = new AbortController();
   const r = await encode({ target, models: ['acme/alpha'], renderer: mockRenderer(), analyst: mockAnalyst([], { step: 0.1 }), budgetUSD: 2, population: 2, maxGenerations: 20, goal: 1, signal: ac.signal, onEvent: e => { if (e.type === 'generation' && e.generation.index === 1) ac.abort(); } });
   assert.equal(r.stopReason, 'canceled');
-  assert.ok(r.text.startsWith('jai:Photograph'));
+  assert.ok(r.text.startsWith('Photograph'));
 });
 
 test('encoder helpers', () => {
@@ -347,7 +347,6 @@ test('encoder helpers', () => {
   assert.equal(reduceAspect(3000, 2000), '3:2');
   assert.equal(reduceAspect(997, 211), '19:4');
   assert.equal(reduceAspect(30000, 100), '100:1');
-  assert.equal(cosine([1, 0], [1, 0]), 1);
   const px = (r, g, b) => ({ width: 1, height: 1, data: new Uint8Array([r, g, b, 255]) });
   assert.equal(thumbnailSimilarity(px(10, 20, 30), px(10, 20, 30)), 1);
   assert.deepEqual(parseAnswer('Sure!\n```json\n{"a": "x}y", "b": {"c": 1}}\n```'), { a: 'x}y', b: { c: 1 } });

@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  OpenAIChatClient, LocalAnalyst, LocalRenderer, LOCAL_FLUX, FLUX_SIZES, REPLICATE_MODELS, base64ToBytes, encode,
+  OpenAIChatClient, LocalAnalyst, LocalRenderer, LOCAL_FLUX, FLUX_SIZES, REPLICATE_MODELS, base64ToBytes, encode, previewRatio,
   SYSTEM, inspectSystem, describePrompt, inspectTargetPrompt, inspectRenderPrompt, proposePrompt, describeObservation,
 } from '../dist/encoder.mjs';
 import { buildInput } from '../dist/test/replicate.js';
@@ -118,7 +118,7 @@ test("chat client: the HTTP client's own time limits are timeouts, not network f
     });
   }
   const renderer = new LocalRenderer(BASE, TOKEN, { fetch: async () => { throw new TypeError('fetch failed', { cause: { code: 'UND_ERR_HEADERS_TIMEOUT' } }); } });
-  await assert.rejects(renderer.render({ intent: { description: 'A castle', style: [], avoid: [], aspect: null, mode: 'generate', strength: null, seed: null, animate: false }, modelId: LOCAL_FLUX.id, inputImage: null, governingRatio: null, target: null }), e => e.kind === 'timeout' && /^Image generation timed out/.test(e.message));
+  await assert.rejects(renderer.render({ intent: { description: 'A castle', style: [], avoid: [], aspect: null, mode: 'generate', strength: null, seed: null }, modelId: LOCAL_FLUX.id, inputImage: null, governingRatio: null, target: null }), e => e.kind === 'timeout' && /^Image generation timed out/.test(e.message));
 });
 
 // ---------------------------------------------------------------- LocalAnalyst
@@ -304,8 +304,8 @@ test('analyst answers: a leading reasoning block is skipped; a cut-off answer sa
 
 // ---------------------------------------------------------------- LocalRenderer
 
-const intent = (o = {}) => ({ description: 'A castle', style: [], avoid: [], aspect: null, mode: 'generate', strength: null, seed: null, animate: false, ...o });
-const req = (o = {}) => ({ intent: intent(o.intent), modelId: o.modelId ?? 'black-forest-labs/flux-schnell', inputImage: o.inputImage ?? null, governingRatio: o.governingRatio ?? null, target: null, signal: o.signal });
+const intent = (o = {}) => ({ description: 'A castle', style: [], avoid: [], aspect: null, mode: 'generate', strength: null, seed: null, ...o });
+const req = (o = {}) => ({ intent: intent(o.intent), modelId: o.modelId ?? 'black-forest-labs/flux-schnell', inputImage: o.inputImage ?? null, governingRatio: o.governingRatio ?? null, previewRatio: o.previewRatio ?? null, target: null, signal: o.signal });
 const codes = r => r.diagnostics.map(d => d.code + (d.key ? ':' + d.key : ''));
 const rendererWith = (opts = {}, images = body => imageReply(body)) => {
   const f = studio({ images });
@@ -353,7 +353,7 @@ test('render: the prompt and its diagnostics are what the Replicate renderer wou
   const cases = [
     { style: ['watercolor', 'loose'], avoid: ['text'], aspect: { width: 16, height: 10 } },
     { description: '', style: ['anime'] },
-    { avoid: ['people', 'cars'], seed: '12345678901234567890', animate: true },
+    { avoid: ['people', 'cars'], seed: '12345678901234567890' },
     { description: 'Line one\nLine two', aspect: { width: 21, height: 9 } },
   ];
   for (const it of cases) {
@@ -365,10 +365,10 @@ test('render: the prompt and its diagnostics are what the Replicate renderer wou
   }
 });
 
-test('render: aspect snaps to the nearest FLUX size; the governing ratio wins without a report', async () => {
-  const size = async (aspect, governingRatio = null) => {
+test("render: aspect snaps to the nearest FLUX size; the governing ratio wins without a report; else the preview's ratio, else 1:1", async () => {
+  const size = async (aspect, governingRatio = null, previewRatio = null) => {
     const { f, renderer } = rendererWith();
-    const r = await renderer.render(req({ intent: { aspect }, governingRatio }));
+    const r = await renderer.render(req({ intent: { aspect }, governingRatio, previewRatio }));
     return [f.calls[0].body.width, f.calls[0].body.height, codes(r).includes('adjusted-value:aspect')];
   };
   assert.deepEqual(await size(null), [1024, 1024, false]);
@@ -379,6 +379,10 @@ test('render: aspect snaps to the nearest FLUX size; the governing ratio wins wi
   assert.deepEqual(await size({ width: 100, height: 1 }), [1536, 640, true]);
   assert.deepEqual(await size({ width: 1, height: 1 }, 1.5), [1216, 832, false]);
   assert.deepEqual(await size(null, 0.75), [896, 1152, false]);
+  assert.deepEqual(await size(null, null, 16 / 9), [1344, 768, false]);
+  assert.deepEqual(await size(null, null, 1.6), [1216, 832, false], 'a snapped preview ratio is no adjusted aspect');
+  assert.deepEqual(await size({ width: 1, height: 1 }, null, 16 / 9), [1024, 1024, false]);
+  assert.deepEqual(await size(null, 0.75, 16 / 9), [896, 1152, false]);
   const { renderer } = rendererWith();
   const r = await renderer.render(req({ intent: { aspect: { width: 16, height: 10 } } }));
   assert.deepEqual(r.diagnostics.find(d => d.key === 'aspect'), { code: 'adjusted-value', key: 'aspect', requested: '16:10', actual: '3:2' });
@@ -439,11 +443,10 @@ test('render: seeds reduce modulo 2^32 with a report; with no seed the server pi
   await assert.rejects(rendererWith().renderer.render(req({ intent: { seed: '-5' } })), e => e.kind === 'config');
 });
 
-test('render: transform, animate and avoid are reported as the Replicate renderer reports them', async () => {
+test('render: transform and avoid are reported as the Replicate renderer reports them', async () => {
   const run = async o => codes(await rendererWith().renderer.render(req(o)));
   assert.deepEqual(await run({ intent: { mode: 'transform', strength: 0.4 } }), ['original-not-readable:mode']);
   assert.deepEqual(await run({ intent: { mode: 'transform' }, inputImage: { bytes: new Uint8Array([1]), mime: 'image/png' } }), ['mode-degraded:mode']);
-  assert.deepEqual(await run({ intent: { animate: true } }), ['unsupported-parameter:animate']);
   assert.deepEqual(await run({ intent: { avoid: ['text'] } }), ['folded-into-prompt:avoid']);
 });
 
@@ -477,6 +480,29 @@ test('render: errors become RenderErrors with a kind', async () => {
   const p = rendererWith({}, (body, init) => waitAbort(init.signal)).renderer.render(req({ signal: ac.signal }));
   ac.abort();
   await assert.rejects(p, e => e.kind === 'canceled');
+});
+
+test("previewRatio: a preview's size from its header, for every raster type a preview may have", async () => {
+  const sharp = (await import('sharp')).default;
+  const picture = (width, height, alpha = false) => sharp({ create: { width, height, channels: alpha ? 4 : 3, background: { r: 40, g: 90, b: 200, alpha: 0.5 } } });
+  const url = (mime, bytes) => `data:${mime};base64,${Buffer.from(bytes).toString('base64')}`;
+  const cases = [
+    ['image/png', await picture(16, 9).png().toBuffer(), 16 / 9],
+    ['image/jpeg', await picture(9, 16).jpeg().toBuffer(), 9 / 16],
+    ['image/jpeg', await picture(30, 20).jpeg({ progressive: true }).withMetadata().toBuffer(), 3 / 2],
+    ['image/webp', await picture(8, 6).webp().toBuffer(), 4 / 3],
+    ['image/webp', await picture(5, 4).webp({ lossless: true }).toBuffer(), 5 / 4],
+    ['image/webp', await picture(7, 3, true).webp().toBuffer(), 7 / 3],
+    ['image/gif', await picture(3, 4).gif().toBuffer(), 3 / 4],
+    ['image/avif', await picture(64, 32).avif().toBuffer(), 2],
+  ];
+  for (const [mime, bytes, ratio] of cases) assert.equal(previewRatio(url(mime, bytes)), ratio, `${mime} ${bytes.length} bytes`);
+  assert.equal(new TextDecoder().decode(cases[5][1].subarray(12, 16)), 'VP8X', 'an extended WebP');
+  // Percent-encoded as well as base64; the data: URL's own type does not matter, the bytes do.
+  assert.equal(previewRatio(`data:image/webp,${[...cases[0][1]].map(b => `%${b.toString(16).padStart(2, '0')}`).join('')}`), 16 / 9);
+  // Nothing to read: no preview, a header cut short, not an image, or not a data: URL (never fetched).
+  for (const v of [null, '', url('image/png', cases[0][1].subarray(0, 20)), url('image/jpeg', cases[1][1].subarray(0, 40)), url('image/png', new TextEncoder().encode('A castle')), 'https://example.com/p.png'])
+    assert.equal(previewRatio(v), null, String(v).slice(0, 60));
 });
 
 test('base64ToBytes: standard base64 with optional padding and whitespace; anything else throws', () => {
@@ -610,7 +636,7 @@ test('CLI --local: renders through JAI Studio over node:http, not Node\'s fetch 
   const fake = await fakeStudio();
   try {
     const out = join(fake.home, 'castle.png');
-    const r = await runCLI(['render', 'jai:A castle;seed=5', '--local', '--out', out], { JAI_HOME: fake.home });
+    const r = await runCLI(['render', 'A castle;seed=5', '--local', '--out', out], { JAI_HOME: fake.home });
     assert.equal(r.code, 0, r.stderr);
     assert.match(r.stdout, /FLUX\.1 schnell on JAI Studio -> .*castle\.png \(seed 5, 1024x1024\)/);
     assert.deepEqual([...readFileSync(out)], [...imageBytes('png', 'A castle')]);
@@ -622,11 +648,27 @@ test('CLI --local: renders through JAI Studio over node:http, not Node\'s fetch 
   } finally { await fake.close(); }
 });
 
+test("CLI --local render: the preview's ratio without an aspect; transform without an input image is reported by the renderer only", async () => {
+  const sharp = (await import('sharp')).default;
+  const preview = `data:image/png;base64,${(await sharp({ create: { width: 16, height: 9, channels: 3, background: '#336699' } }).png().toBuffer()).toString('base64')}`;
+  const fake = await fakeStudio();
+  try {
+    const out = join(fake.home, 'castle.png');
+    const r = await runCLI(['render', `A castle in snow;mode=transform;source=https://example.com/c.png;preview=${preview}`, '--local', '--out', out], { JAI_HOME: fake.home });
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, /\(seed 7, 1344x768\)/);
+    const sent = fake.requests.find(q => q.url === '/v1/images/generations');
+    assert.deepEqual([sent.body.width, sent.body.height], [1344, 768]);
+    // The source is never fetched: original-not-readable, never mode-degraded beside it.
+    assert.deepEqual(r.stdout.split('\n').filter(l => l.startsWith('  ')), ['  no-matching-model (model)', '  original-not-readable (mode)']);
+  } finally { await fake.close(); }
+});
+
 test('CLI --local: the token goes only to a server that proves it holds it', async () => {
   for (const proofToken of ['jai_another-users-token', null]) {
     const fake = await fakeStudio({ proofToken });
     try {
-      const r = await runCLI(['render', 'jai:A castle;seed=5', '--local', '--out', join(fake.home, 'castle.png')], { JAI_HOME: fake.home });
+      const r = await runCLI(['render', 'A castle;seed=5', '--local', '--out', join(fake.home, 'castle.png')], { JAI_HOME: fake.home });
       assert.equal(r.code, 1);
       assert.match(r.stderr, /did not prove that it holds your JAI Studio token/);
       assert.deepEqual(fake.requests.map(q => new URL(q.url, 'http://x').pathname), ['/health'], 'nothing but the probe');

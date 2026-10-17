@@ -23,15 +23,13 @@ export function isPrivateHost(hostname: string): boolean {
   return !h.includes('.'); // single-label names resolve on the local network
 }
 
-/** Why the background must refuse to fetch `url` for a page at `pageOrigin`, or null when allowed. */
-export function refuseJaiFetch(url: string, pageOrigin: string | null): string | null {
+/** Whether the background may fetch `url` for a page at `pageOrigin`: an http(s) .jai path, and no local or private address for a public page. */
+export function privilegedFetchAllowed(url: string, pageOrigin: string | null): boolean {
   const abs = jaiResourceURL(url);
-  if (!abs) return 'Only http(s) URLs whose path ends in .jai';
-  const target = new URL(abs);
+  if (!abs) return false;
   let pagePrivate = false;
   try { pagePrivate = pageOrigin ? isPrivateHost(new URL(pageOrigin).hostname) : false; } catch { /* treat as public */ }
-  if (isPrivateHost(target.hostname) && !pagePrivate) return 'A public page may not make the viewer fetch from a local or private address';
-  return null;
+  return pagePrivate || !isPrivateHost(new URL(abs).hostname);
 }
 
 /** At most `max` privileged fetches per key (tab) per window. */

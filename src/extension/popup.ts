@@ -21,6 +21,8 @@ async function main(): Promise<void> {
   try { await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] }); }
   catch { $('list').textContent = 'This page cannot be scanned.'; return; }
   const items = (await chrome.tabs.sendMessage(tab.id, { type: 'list' })) as Array<{ carrier: string; status: string; jai: string | null; error: string | null }>;
+  // Render all renders only the images not rendered yet.
+  const renderable = (items ?? []).filter(i => i.status === 'found').length;
   const list = $('list');
   list.textContent = '';
   if (!items?.length) { list.textContent = 'No JAI images found. Ordinary images are never touched.'; }
@@ -36,12 +38,12 @@ async function main(): Promise<void> {
     }
     list.append(ol);
     const canRender = state.hasToken && state.mode !== 'never';
-    $<HTMLButtonElement>('render-all').disabled = !canRender || !state.disclosed;
+    $<HTMLButtonElement>('render-all').disabled = !canRender || !state.disclosed || !renderable;
     $<HTMLButtonElement>('restore-all').disabled = false;
     if (canRender && !state.disclosed) $('usage').textContent += ' · open an image’s JAI control once to accept the provider notice for this site';
   }
   $('render-all').addEventListener('click', async () => {
-    if (!confirm(`Render ${items.length} image(s) with Replicate? This costs money under your account.`)) return;
+    if (!confirm(`Render ${renderable} image(s) with Replicate? This costs money under your account.`)) return;
     await chrome.tabs.sendMessage(tab.id!, { type: 'renderAll' });
     window.close();
   });

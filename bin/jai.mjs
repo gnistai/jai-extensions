@@ -1,8 +1,17 @@
 #!/usr/bin/env node
 // jai: command-line app for JAI (Just AI Images).
 //   jai encode <image>      image -> .jai by analysis by synthesis (Replicate, or JAI Studio with --local)
-//   jai render <doc>        .jai, JAI text or JSON -> image (Replicate, or JAI Studio with --local)
+//   jai render <doc>        document -> image (Replicate, or JAI Studio with --local)
 //   jai validate <doc>      parse, validate and normalise
+// A document argument, after trimming C0 controls and spaces: one that begins
+// with `data:image/jai` and then `,` or `;` (ASCII case-insensitively) is a
+// data:image/jai URL, read as its text body; else one line ending in .jai is a
+// .jai file, read as the file form only; anything else is JAI text (the text
+// form). A document that cannot be read (malformed-container, invalid-json,
+// undecodable, a data:image/jai URL that carries no document, or a .jai file
+// that exists but cannot be read) exits 1, for render as for validate; usage
+// errors, a missing .jai file included, exit 2. render renders at the
+// document's aspect, else its preview's ratio, else the model's default.
 // The Replicate token comes from REPLICATE_API_TOKEN (or --env <file>). With
 // --local, the address and token of JAI Studio's local server come from its
 // data folder (studio/DESIGN.md section 2). Tokens are never printed or
@@ -36,8 +45,11 @@ const HELP = `jai encode <image> [options]
   --think <mode>        with --local: when Qwen thinks: off (default), propose or all
   --scale <f>           with --local: render size factor from 0.25 to 1.25, 1 is about a
                         megapixel (default 1)
-jai render <file.jai | text> [--model <id>] [--out <image>] [--local]
-jai validate <file.jai | text>
+jai render <file.jai | data:image/jai,... | text> [--model <id>] [--out <image>] [--local]
+jai validate <file.jai | data:image/jai,... | text>
+  A document is a data:image/jai URL (read as its text body), else a .jai file
+  (one line ending in .jai, read as the file form only), else JAI text.
+  Exit codes: 1 when the document cannot be read, 2 for usage errors.
 Common: --env <file>  read REPLICATE_API_TOKEN from a dotenv file
         --local       use the JAI Studio server running on this computer instead of Replicate;
                       no token needed. It is found through server.json and token in Studio's
@@ -151,13 +163,37 @@ function localFetch(url, init = {}) {
   });
 }
 
+/** Codes that leave a document unreadable: a .jai file that is not the file form, or a data:image/jai body that is not UTF-8 text within the text bound. */
+const FATAL = new Set(['malformed-container', 'invalid-json', 'undecodable']);
+
+/** Exits 1: the document cannot be read (as JAI Studio's host words it). */
+function unreadable(why) { console.error(`The document cannot be read: ${why}`); process.exit(1); }
+
+/**
+ * A document argument. After trimming C0 controls and spaces (as the URL parser
+ * does): `data:image/jai` and then `,` or `;`, ASCII case-insensitively, is a
+ * data:image/jai URL, decoded as its text body; else one line ending in .jai is a
+ * .jai file, decoded as the file form only; anything else is JAI text. Nothing is
+ * sniffed: prose that begins with "Data:" and other data: URLs are text.
+ * Returns the decoder's result, with `url` for a data:image/jai URL.
+ */
 function readDocument(arg) {
-  if (existsSync(arg)) {
-    const r = J.decode(new Uint8Array(readFileSync(arg)));
-    return { document: r.document, diagnostics: r.diagnostics, info: r.info };
+  const s = J.trimBy(arg, c => c <= 0x20);
+  if (/^data:image\/jai[,;]/i.test(s)) {
+    const r = J.decodeDataURL(s);
+    if (!r) unreadable('this data:image/jai URL carries no document (no "," or a ";base64" body that is not base64)');
+    return { ...r, url: s };
   }
-  const r = arg.trimStart().startsWith('{') ? J.readJSON(arg) : J.parse(arg);
-  return { document: r.document, diagnostics: r.diagnostics, info: r.info };
+  if (!/[\n\r]/.test(s) && /\.jai$/i.test(s)) {
+    let bytes;
+    try { bytes = readFileSync(arg); } catch (e) {
+      // No such file is a usage error, as in JAI Studio's CLI; a file that exists but cannot be read is a failure.
+      if (['ENOENT', 'ENOTDIR', 'EISDIR'].includes(e.code)) { console.error(`${arg}: no such file`); process.exit(2); }
+      console.error(`Cannot read ${arg}: ${e.message}`); process.exit(1);
+    }
+    return J.decode(new Uint8Array(bytes));
+  }
+  return J.parse(arg);
 }
 
 /** A number option: finite, within [lo, hi], an integer when asked; exits with code 2 otherwise. */
@@ -174,33 +210,39 @@ function numberOption(name, fallback, lo, hi, integer = false) {
 
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const usd = n => `$${n.toFixed(4)}`;
-const scoreLine = c => Object.entries(c.perModel).map(([m, s]) => `${m.split('/')[1]} ${s.toFixed(3)}`).join(', ');
 
 if (cmd === 'validate') {
   const r = readDocument(input);
-  console.log(J.serialize(r.document));
-  const all = [...r.diagnostics, ...J.validate(r.document, r.info)];
+  const fatal = r.diagnostics.some(d => FATAL.has(d.code));
+  // An unreadable document has no canonical text and is not validated: it decoded to the
+  // empty document, which would only report no-prompt. Its diagnostics remain.
+  if (!fatal) console.log(J.serialize(r.document));
+  const all = [...r.diagnostics, ...(r.url ? J.validateDataURL(r.url) : []), ...(fatal ? [] : J.validate(r.document, r.info))];
   for (const d of all) console.log(`  ${d.code}${d.key ? ` (${d.key})` : ''}`);
-  process.exit(r.diagnostics.some(d => ['invalid-json', 'malformed-container', 'undecodable'].includes(d.code)) ? 1 : 0);
+  process.exit(fatal ? 1 : 0);
 }
 
 if (cmd === 'render') {
   const r = readDocument(input);
+  // Never render (or pay for) the empty document that an unreadable one decodes to.
+  const fatal = r.diagnostics.find(d => FATAL.has(d.code));
+  if (fatal) unreadable(`${fatal.code}${typeof fatal.reason === 'string' ? ` (${fatal.reason})` : ''}`);
   const local = o.local ? await localServer() : null;
   const models = local ? [E.LOCAL_FLUX] : E.REPLICATE_MODELS;
   const catalog = models.map(m => ({ id: m.id, aliases: m.aliases, family: m.family, imageInput: m.imageInput, default: m.id === 'black-forest-labs/flux-schnell' }));
   const selected = o.model ? findModel(o.model, models).id : null;
   const { interpreted: it, diagnostics } = J.interpret(r.document, { catalog, families: E.FAMILIES, selected });
-  if (it.mode !== 'generate') { console.error(`mode=${it.mode} needs an input image; the CLI renders generate only.`); process.exit(2); }
   const model = models.find(m => m.id === it.matched);
   const renderer = local ? new E.LocalRenderer(local.url, local.token, { fetch: localFetch, outputFormat: /\.jpe?g$/i.test(o.out ?? '') ? 'jpeg' : 'png' }) : new E.ReplicateRenderer(token(), { foldAvoid: true });
-  const res = await renderer.render({ intent: { description: it.modelDescription, style: it.modelStyle, avoid: it.modelAvoid, aspect: it.aspect ? { width: it.aspect.width, height: it.aspect.height } : null, mode: 'generate', strength: null, seed: it.seed, animate: false }, modelId: model.id, inputImage: null, governingRatio: null, target: null })
+  // A standalone document has no governing ratio; the source is never fetched, so transform renders as generate.
+  const res = await renderer.render({ intent: { description: it.modelDescription, style: it.modelStyle, avoid: it.modelAvoid, aspect: it.aspect ? { width: it.aspect.width, height: it.aspect.height } : null, mode: it.mode === 'keep' ? 'generate' : it.mode, strength: it.strength, seed: it.seed }, modelId: model.id, inputImage: null, governingRatio: null, previewRatio: E.previewRatio(it.preview), target: null })
     .catch(e => { console.error(`Render failed: ${e.message}`); process.exit(1); });
   const out = o.out ?? `render-${Date.now()}.${res.mime.split('/')[1]}`;
   writeFileSync(out, res.bytes);
   console.log(local ? `${model.label} on JAI Studio -> ${out} (seed ${res.sentInput.seed}, ${res.sentInput.width}x${res.sentInput.height})` : `${model.label} -> ${out} (about ${usd(model.costHint)})`);
   console.log(`sent: ${res.sentPrompt}`);
-  for (const d of [...diagnostics, ...res.diagnostics]) console.log(`  ${d.code}${d.key ? ` (${d.key})` : ''}`);
+  // The renderer, not the interpreter, decides mode-degraded (it knows there is no input image).
+  for (const d of [...diagnostics.filter(d => E.INTERPRETER_CODES.has(d.code)), ...res.diagnostics]) console.log(`  ${d.code}${d.key ? ` (${d.key})` : ''}`);
   process.exit(0);
 }
 

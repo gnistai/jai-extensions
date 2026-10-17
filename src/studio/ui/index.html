@@ -43,6 +43,7 @@
         </div>
         <figure class="render empty" id="view-figure" hidden>
           <img id="view-img" alt="" hidden>
+          <p class="render-fallback" id="view-fallback" hidden></p>
           <div class="render-wait" id="view-wait" hidden><span class="spinner" aria-hidden="true"></span><span id="view-wait-text">Rendering…</span></div>
         </figure>
       </div>
@@ -59,11 +60,11 @@
         <div id="view-details" hidden>
           <h3>Description</h3>
           <p id="view-desc" class="desc"></p>
-          <dl class="kv">
+          <dl class="kv" id="view-kv">
             <dt>Seed</dt><dd><span id="view-seed" class="mono"></span> <span class="badge" id="view-cached" hidden>from cache</span></dd>
             <dt>Size</dt><dd id="view-size"></dd>
           </dl>
-          <details class="more">
+          <details class="more" id="view-prompt-box">
             <summary>Sent prompt</summary>
             <pre id="view-prompt"></pre>
           </details>

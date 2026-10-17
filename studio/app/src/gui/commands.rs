@@ -723,28 +723,20 @@ pub async fn read_document(path: PathBuf) -> CommandResult<DocumentInfo> {
 #[tauri::command]
 pub async fn viewer_render(
     state: State<'_, AppState>,
-    path: Option<PathBuf>,
-    text: Option<String>,
+    path: PathBuf,
     seed: Option<String>,
 ) -> CommandResult<ViewerRender> {
     if let Some(s) = &seed {
         crate::cli::render::check_seed(s).map_err(err)?;
     }
-    let input = match (path, text) {
-        (Some(p), _) => blocking(move || read_limited(&p, MAX_DOC_BYTES))
-            .await
-            .map(DocInput::Bytes)?,
-        (None, Some(t)) => DocInput::Text(t),
-        (None, None) => return Err("give the path or the text of a document".into()),
-    };
-    let check_input = input.clone();
-    let validated =
-        blocking(move || jai_js::validate(check_input).map_err(output::js_error)).await?;
+    let bytes = blocking(move || read_limited(&path, MAX_DOC_BYTES)).await?;
+    let input = DocInput::Bytes(bytes.clone());
+    let validated = blocking(move || jai_js::validate(input).map_err(output::js_error)).await?;
     if validated.fatal {
-        return Err(gui_support::fatal_message(&validated));
+        return Err(output::fatal_message(&validated));
     }
     let key = RenderCache::key(
-        &gui_support::input_identity(&validated, &input),
+        &gui_support::input_identity(&validated, &bytes),
         seed.as_deref(),
         RENDER_SIZE_TAG,
     );
@@ -757,13 +749,11 @@ pub async fn viewer_render(
     }
     let server = state.server_ref().await.map_err(err)?;
     let out = jai_js::render(
-        input,
+        DocInput::Bytes(bytes),
         RenderOptions {
             server,
             seed,
-            model: None,
             output_format: Some("png".into()),
-            scale: None,
         },
     )
     .await
@@ -807,13 +797,11 @@ fn viewer_reply(bytes: &[u8], meta: CachedRender, cached: bool) -> ViewerRender 
 pub async fn save_file<R: Runtime>(
     app: AppHandle<R>,
     data_url: Option<String>,
-    text: Option<String>,
     bytes_b64: Option<String>,
     suggested_name: String,
 ) -> CommandResult<Option<PathReply>> {
     let bytes =
-        gui_support::save_payload(data_url.as_deref(), text.as_deref(), bytes_b64.as_deref())
-            .map_err(err)?;
+        gui_support::save_payload(data_url.as_deref(), bytes_b64.as_deref()).map_err(err)?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     let mut dialog = app.dialog().file().set_file_name(&suggested_name);
     if let Some((name, extensions)) = gui_support::save_filter(&suggested_name) {

@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { ENCODE_LIMITS, IMAGE_FILE, IMAGE_FORMATS, checkEncodeSettings, checkPort, stopSentence, vcInstallNote } from '../dist/test/studio-ui-rules.js';
+import { ENCODE_LIMITS, IMAGE_FILE, IMAGE_FORMATS, JAI_FILE, checkEncodeSettings, checkPort, stopSentence, vcInstallNote } from '../dist/test/studio-ui-rules.js';
 
 const HTML = readFileSync(new URL('../src/studio/ui/index.html', import.meta.url), 'utf8');
 const DEFAULTS = { generations: '8', population: '4', seeds: '1, 2', restarts: '1', goal: '0.90', scale: '1', thinking: 'off' };
@@ -39,6 +39,11 @@ test('images: the formats the app decodes (PNG, JPEG, WebP, GIF); no BMP', () =>
   assert.ok(HTML.includes(`<p class="muted">${IMAGE_FORMATS}. `), 'the Encode drop zone names the same formats');
   assert.doesNotMatch(HTML, /BMP/);
   assert.match(HTML, /id="enc-scale" min="0\.25" max="1\.25"/);
+});
+
+test('documents: only .jai files, by name; no JSON or text files', () => {
+  for (const f of ['castle.jai', 'C:\\Docs\\Castle.JAI']) assert.ok(JAI_FILE.test(f), f);
+  for (const f of ['castle.json', 'castle.txt', 'castle.jai.png', 'jai']) assert.ok(!JAI_FILE.test(f), f);
 });
 
 test('stop sentence: why a run with a result stopped, with the error when it stopped on one', () => {

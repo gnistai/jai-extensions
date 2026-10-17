@@ -1,11 +1,11 @@
 // The JSON form: reading, canonical JSON and identity.
-import { asciiLower, byCodePoint, orderedKeys, diag, isKey, normalizeValue, type Diagnostic, type JaiDocument } from './chars.ts';
+import { asciiLower, orderedKeys, diag, isKey, normalizeValue, type Diagnostic, type JaiDocument } from './chars.ts';
 import { addValue, createDocument } from './document.ts';
 
 /** ECMAScript Number::toString, as RFC 8785 §3.2.2.3 requires. */
 export function numberToString(n: number): string { return String(n); }
 
-export interface ReadResult { document: JaiDocument; diagnostics: Diagnostic[]; isJAI: boolean }
+export interface ReadResult { document: JaiDocument; diagnostics: Diagnostic[] }
 
 /** True when arrays/objects nest deeper than `max` anywhere (the top-level object has depth 1). */
 function jsonDepthExceeds(s: string, max: number): boolean {
@@ -20,22 +20,22 @@ function jsonDepthExceeds(s: string, max: number): boolean {
   return false;
 }
 
-/** JSON reading algorithm (spec §Reading). `text` may be a JSON string or a parsed value. */
-export function readJSON(text: string | unknown, { inContext = true }: { inContext?: boolean } = {}): ReadResult {
+/** JSON reading algorithm (spec §Reading) on a JSON text. */
+export function readJSON(text: string): ReadResult {
   const diagnostics: Diagnostic[] = [];
   const doc = createDocument();
-  const fail = (): ReadResult => { diagnostics.push(diag('invalid-json')); return { document: createDocument(), diagnostics, isJAI: false }; };
+  const fail = (): ReadResult => { diagnostics.push(diag('invalid-json')); return { document: createDocument(), diagnostics }; };
+  const s = String(text);
+  if (jsonDepthExceeds(s, 32)) return fail();
   let obj: unknown;
-  if (typeof text === 'string') {
-    if (jsonDepthExceeds(text, 32)) return fail();
-    try {
-      obj = JSON.parse(text, (_k, v: unknown) => { if (typeof v === 'number' && !Number.isFinite(v)) throw new RangeError('overflow'); return v; });
-    } catch { return fail(); }
-  } else obj = text;
+  try {
+    // A number that rounds to an infinite binary64 value makes the text invalid.
+    obj = JSON.parse(s, (_k, v: unknown) => { if (typeof v === 'number' && !Number.isFinite(v)) throw new RangeError('overflow'); return v; });
+  } catch { return fail(); }
   if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) return fail();
   const rec = obj as Record<string, unknown>;
+  // JSON.parse already applied "an exact repeat replaces in place"; readers do not diagnose it.
   if (!Object.prototype.hasOwnProperty.call(rec, 'jai')) {
-    if (!inContext) return { document: doc, diagnostics, isJAI: false };
     diagnostics.push(diag('missing-marker'));
   } else {
     const m = rec['jai'];
@@ -64,7 +64,7 @@ export function readJSON(text: string | unknown, { inContext = true }: { inConte
       addValue(doc, key, v);
     }
   }
-  return { document: doc, diagnostics, isJAI: true };
+  return { document: doc, diagnostics };
 }
 
 /** Canonical JSON form (spec §Canonical JSON). */

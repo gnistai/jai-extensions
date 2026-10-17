@@ -4,8 +4,9 @@
 // small control, and on the user's request renders and replaces the image
 // (spec §Replacement) while keeping the original one click away. All UI lives
 // in a closed shadow root; every document value is written as text.
-import { QUALIFIABLE, canonicalJSON, decode, discover, interpret, serialize, validate, validateDelivery, type Diagnostic, type Discovery, type JaiDocument } from '../jai/index.ts';
-import { b64decode, b64encode, type RenderPortReply, type RenderPortRequest, type StateReply } from './shared.ts';
+import { QUALIFIABLE, canonicalJSON, decode, discover, discoverAll, firstSrcsetURL, interpret, parse, serialize, validate, validateDelivery, type Diagnostic, type Discovery, type ElementLike, type JaiDocument } from '../jai/index.ts';
+import { imageSize, previewRatio } from '../renderers/image-size.ts';
+import { MAX_JAI_BYTES, b64decode, b64encode, readCapped, type RenderPortReply, type RenderPortRequest, type StateReply } from './shared.ts';
 
 declare global { interface Window { __jaiViewer?: { rescan(): void; list(): unknown[]; renderAll(): void; restoreAll(): void } } }
 
@@ -28,12 +29,25 @@ function init(): void {
     saved?: SavedState;
     render?: Extract<RenderPortReply, { type: 'done' }>;
     badge?: HTMLButtonElement;
+    /** The page's own aria-busy, kept while the viewer marks a render pending (undefined otherwise). */
+    busy?: string | null;
   }
-  interface SavedState { srcset: string | null; sizes: string | null; alt: string | null; ariaDescription: string | null; ariaBusy: string | null; insertedSource: HTMLSourceElement | null; canvas: HTMLCanvasElement | null; display: string; objectFit: string | null; sizeStyle: { width: string; aspectRatio: string } | null }
+  interface SavedState {
+    srcset: string | null; sizes: string | null; alt: string | null; ariaDescription: string | null; insertedSource: HTMLSourceElement | null; canvas: HTMLCanvasElement | null; display: string; objectFit: string | null; sizeStyle: { width: string; aspectRatio: string } | null;
+    /** The delivery advisories of the element as the page had it, before the viewer's first write. */
+    advisories: Diagnostic[];
+  }
 
   const items = new Map<HTMLImageElement, Item>();
-  const ours = new WeakSet<Element>();
+  /** Whether an item is still the one held for its element (discovery may have re-run during an await). */
+  const live = (item: Item): boolean => items.get(item.img) === item;
+  /** Per element, the documents (canonical JSON, from which identity is computed) it has been replaced with. */
+  const replacedWith = new WeakMap<HTMLImageElement, Set<string>>();
+  /** Per element, the discovery for which the viewer removed its control for good: no document, or the viewer stood down. */
+  const dismissed = new WeakMap<HTMLImageElement, Discovery>();
   let state: StateReply | null = null;
+  let reported = -1;
+  const report = (): void => { if (items.size !== reported) { reported = items.size; void send({ type: 'found', count: items.size }); } };
 
   // ------------------------------------------------------------ overlay UI (closed shadow root)
   const host = document.createElement('jai-viewer-ui');
@@ -94,7 +108,6 @@ function init(): void {
     } catch { visible = true; }
     return () => visible && performance.now() - shownAt > 400;
   }
-  ours.add(host);
   document.documentElement.append(host);
 
   const el = <K extends keyof HTMLElementTagNameMap>(tag: K, props: Partial<HTMLElementTagNameMap[K]> = {}, ...kids: Array<Node | string>): HTMLElementTagNameMap[K] => {
@@ -105,79 +118,122 @@ function init(): void {
   };
 
   // ------------------------------------------------------------ discovery
-  // .jai resources (picture or src carrier) are fetched on use only: when the user opens the
-  // panel or a render starts, never during discovery (spec §Replacement, §Permitted inputs).
-  const fetches = new Map<string, Promise<{ bytes: Uint8Array | null; notJai: boolean; error: string | null }>>();
-  function fetchJai(url: string): Promise<{ bytes: Uint8Array | null; notJai: boolean; error: string | null }> {
+  // A resource named by the picture or src carrier is fetched on use only (when the user opens
+  // the panel or a render starts, never during discovery) and at most once per page (spec
+  // §Permitted inputs). The background picks the one route before anything is sent: it fetches a
+  // cross-origin .jai resource itself where the user granted host permission; otherwise it
+  // declines without fetching, and the content script fetches with the page's own privileges.
+  type Fetched = { bytes: Uint8Array | null; notJai: boolean; error: string | null };
+  const fetches = new Map<string, Promise<Fetched>>();
+  function fetchJai(address: string): Promise<Fetched> {
+    // One resource per URL without its fragment, which never goes over the network.
+    const url = address.split('#')[0] ?? address;
     let p = fetches.get(url);
     if (!p) {
-      p = (async () => {
+      p = (async (): Promise<Fetched> => {
         try {
+          const r = await send<{ b64?: string; error?: string; notJai?: boolean; page?: boolean } | undefined>({ type: 'fetchJai', url });
+          if (!r?.page) return typeof r?.b64 === 'string' ? { bytes: b64decode(r.b64), notJai: false, error: null } : { bytes: null, notJai: !!r?.notJai, error: r?.error ?? 'blocked' };
           const res = await fetch(url, { mode: 'cors', credentials: 'omit', redirect: 'error' });
-          if (res.ok) {
-            if (/^text\/html\b/i.test(res.headers.get('content-type') ?? '')) return { bytes: null, notJai: true, error: null };
-            return { bytes: new Uint8Array(await res.arrayBuffer()), notJai: false, error: null };
-          }
-        } catch { /* fall back to the background, which applies its own checks */ }
-        const r = await send<{ b64?: string; error?: string; notJai?: boolean }>({ type: 'fetchJai', url });
-        if (r?.b64) return { bytes: b64decode(r.b64), notJai: false, error: null };
-        return { bytes: null, notJai: !!r?.notJai, error: r?.error ?? 'blocked' };
+          if (!res.ok) { void res.body?.cancel(); return { bytes: null, notJai: false, error: `HTTP ${res.status}` }; }
+          if (/^text\/html\b/i.test(res.headers.get('content-type') ?? '')) { void res.body?.cancel(); return { bytes: null, notJai: true, error: null }; }
+          // The same bound as the background's route.
+          const bytes = await readCapped(res, MAX_JAI_BYTES);
+          return bytes ? { bytes, notJai: false, error: null } : { bytes: null, notJai: false, error: 'Too large' };
+        } catch (e) { return { bytes: null, notJai: false, error: String((e as Error)?.message ?? e) }; }
       })();
       fetches.set(url, p);
     }
     return p;
   }
 
-  /** Load the document of an item; false when the resource turned out not to be JAI (the item is dropped quietly). */
+  /**
+   * Load an item's document. False when there is none to use: the resource carries no document
+   * (the item is dropped quietly), the fetch failed (the error is shown in the panel), or
+   * discovery re-ran for the element meanwhile (the item is gone).
+   */
   async function resolve(item: Item): Promise<boolean> {
     if (item.doc) return true;
     if (item.disc.kind === 'inline') { item.doc = item.disc.document ?? null; item.diagnostics = item.disc.diagnostics ?? []; return true; }
     item.status = 'loading'; placeBadge(item);
     const url = item.disc.url ?? '';
     const r = await fetchJai(url);
+    if (!live(item)) return false;
     item.status = 'found';
     if (r.bytes) {
-      const d = decode(r.bytes, { inContext: true });
-      if (d.diagnostics.some(x => ['undecodable', 'malformed-container', 'invalid-json'].includes(x.code))) { drop(item); return false; }
-      item.doc = d.document; item.diagnostics = [...d.diagnostics, ...validateDelivery({ decoded: d })];
+      // A .jai resource holds the file form and nothing else (spec §Decoding).
+      const d = decode(r.bytes);
+      if (d.diagnostics.some(x => x.code === 'malformed-container' || x.code === 'invalid-json')) { dismiss(item); return false; }
+      item.doc = d.document; item.diagnostics = d.diagnostics;
       placeBadge(item);
       return true;
     }
-    if (r.notJai) { drop(item); return false; }
+    if (r.notJai) { dismiss(item); return false; }
     item.error = `Could not fetch ${url}: ${r.error}`;
     placeBadge(item);
     return false;
   }
 
-  /** Not a JAI image after all (an HTML page or pixels at a .jai address): remove our control, leave the page alone. */
+  /** Forget an item, cancel its render (the background then cancels the provider job) and remove its control. */
   function drop(item: Item): void {
+    item.port?.disconnect(); item.port = undefined;
+    unbusy(item);
     item.badge?.remove();
     if (panel?.isConnected && panelItem === item) panel.remove();
+    if (!live(item)) return;
     items.delete(item.img);
-    void send({ type: 'found', count: items.size });
+    io.unobserve(item.img);
+    report();
   }
 
-  /** Spec §Discovery: a src .jai address that delivered pixels (service worker, gateway) is the page's image. */
+  /**
+   * Remove an item's control without reporting a failure (spec §Discovery): its resource carries no
+   * document, or its address delivered pixels. It stays removed while discovery finds the same.
+   */
+  function dismiss(item: Item): void {
+    if (live(item)) dismissed.set(item.img, item.disc);
+    drop(item);
+  }
+
+  /**
+   * Spec §Discovery: the viewer stands down when the element shows the URL that the picture or src
+   * carrier selected, complete and with a natural width: the user agent decoded it itself, or the
+   * address delivered pixels.
+   */
   function pixelsArrived(item: Item): boolean {
-    return item.disc.carrier === 'src' && item.disc.kind === 'url' && item.img.currentSrc === item.disc.url && item.img.complete && item.img.naturalWidth > 0;
+    const { img, disc } = item;
+    if (disc.carrier === 'attribute' || !img.complete || img.naturalWidth === 0) return false;
+    // Discovery keeps the URL of a resource; a data: URL is the <source>'s first candidate or the src.
+    const selected = disc.kind === 'url' ? disc.url : disc.carrier === 'picture' ? firstSrcsetURL(disc.source?.getAttribute('srcset') ?? null) : img.getAttribute('src');
+    if (!selected) return false;
+    try { return img.currentSrc === new URL(selected, document.baseURI).href; } catch { return false; }
   }
 
+  /** Track an <img> that carries a document; discovery runs here unless the caller ran it. */
+  function add(img: HTMLImageElement, disc: Discovery | null = discover(img, { baseURL: document.baseURI })): void {
+    if (off || !disc || items.has(img) || !img.isConnected) return;
+    // An inline document that cannot be read carries no document, like a .jai resource that does not decode (spec §Discovery).
+    if (disc.kind === 'inline' && disc.diagnostics?.some(d => d.code === 'undecodable')) return;
+    const was = dismissed.get(img);
+    if (was) { if (sameDocument(was, disc)) return; dismissed.delete(img); }
+    const item: Item = { img, disc, doc: null, diagnostics: [], status: 'found' };
+    items.set(img, item);
+    if (disc.kind === 'inline') { item.doc = disc.document ?? null; item.diagnostics = disc.diagnostics ?? []; }
+    placeBadge(item);
+    maybeAuto(item);
+  }
+
+  /** Discovery over the document in tree order, open shadow roots included (spec §Discovery). */
   function scan(): void {
-    for (const img of Array.from(document.images)) {
-      if (ours.has(img) || items.has(img)) continue;
-      const disc = discover(img, { baseURL: document.baseURI });
-      if (!disc) continue;
-      const item: Item = { img, disc, doc: null, diagnostics: [], status: 'found' };
-      items.set(img, item);
-      if (disc.kind === 'inline') { item.doc = disc.document ?? null; item.diagnostics = disc.diagnostics ?? []; }
-      placeBadge(item);
-      maybeAuto(item);
-    }
-    void send({ type: 'found', count: items.size });
+    if (off) return; // the user set this site to ignore JAI
+    watchShadows(document);
+    for (const d of discoverAll(document, { baseURL: document.baseURI })) add(d.element as HTMLImageElement, d);
+    report();
   }
 
   // ------------------------------------------------------------ badges
   function placeBadge(item: Item): void {
+    if (!live(item)) return;
     if (!item.badge) {
       const b = el('button', { className: 'badge', type: 'button', textContent: 'JAI' });
       b.addEventListener('click', e => { if (e.isTrusted) openPanel(item); });
@@ -204,10 +260,11 @@ function init(): void {
   let panel: HTMLElement | null = null;
   let panelItem: Item | null = null;
   async function openPanel(item: Item, refocus = false): Promise<void> {
-    if (pixelsArrived(item)) { drop(item); return; }
-    if (!(await resolve(item)) && !items.has(item.img)) return;
+    if (pixelsArrived(item)) { dismiss(item); return; }
+    if (!(await resolve(item)) && !live(item)) return;
     panelItem = item;
     state = await send<StateReply>({ type: 'state', origin });
+    if (!live(item)) return;
     const focusedRole = refocus ? (shadow.activeElement as HTMLElement | null)?.dataset.role ?? null : null;
     panel?.remove();
     const p = el('div', { className: 'panel' });
@@ -217,9 +274,13 @@ function init(): void {
     close.setAttribute('aria-label', 'Close');
     close.addEventListener('click', () => { p.remove(); item.badge?.focus(); });
     p.addEventListener('keydown', e => { if (e.key === 'Escape') { p.remove(); item.badge?.focus(); } });
-    const carriers: Record<string, string> = { picture: '<picture><source type="image/jai">', attribute: 'alt + data-jai', src: item.disc.kind === 'url' ? 'a .jai file in src' : 'data:image/jai in src' };
+    const carriers: Record<string, string> = { picture: '<picture><source type="image/jai">', attribute: 'data-jai', src: item.disc.kind === 'url' ? 'a .jai file in src' : 'data:image/jai in src' };
     p.append(el('h2', {}, el('span', {}, 'JAI image'), close));
     p.append(el('div', { className: 'muted' }, `Found via ${carriers[item.disc.carrier]} on ${origin}`));
+    // Attribute carrier: alt is the prompt unless data-jai gives one (spec §Carriers).
+    if (item.disc.carrier === 'attribute' && item.doc?.has('prompt') && !parse(item.img.getAttribute('data-jai') ?? '').document.has('prompt')) {
+      p.append(el('div', { className: 'muted' }, 'The prompt is the image’s alt text, since data-jai gives none.'));
+    }
     if (item.error) p.append(el('div', { className: 'notice' }, item.error));
     const doc = item.doc;
     if (doc) {
@@ -237,7 +298,7 @@ function init(): void {
       if (it.seed) settings.push(`seed ${it.seed}`);
       vals('Settings', settings);
       p.append(el('h3', {}, 'Canonical JAI'), el('pre', {}, serialize(doc)));
-      const diags = [...item.diagnostics, ...validate(doc, item.disc.info), ...validateDelivery({ carrier: item.disc.carrier, element: item.img, decoded: { document: doc } })];
+      const diags = [...item.diagnostics, ...validate(doc, item.disc.info), ...delivery(item, doc)];
       if (diags.length) {
         const ul = el('ul', { className: 'diag' });
         for (const d of diags) ul.append(el('li', {}, d.code + (d.key ? ':' + d.key : '')));
@@ -302,8 +363,13 @@ function init(): void {
   }
 
   function statusText(item: Item): string {
-    return { found: 'Not rendered. The page shows its own image.', loading: 'Loading the .jai file…', rendering: 'Rendering…', rendered: 'Showing an AI render of the description.', failed: 'Render failed; the original is shown.', original: 'Showing the original (render kept).' }[item.status];
+    // A src image has no pixels: without a render the reader gets its alt text (spec §Carriers).
+    const page = item.disc.carrier === 'src' ? 'This image has no pixels; the page shows its alt text.' : 'The page shows its own image.';
+    return { found: `Not rendered. ${page}`, loading: 'Loading the .jai file…', rendering: 'Rendering…', rendered: 'Showing an AI render of the description.', failed: `Render failed. ${page}`, original: `Render kept. ${page}` }[item.status];
   }
+
+  /** Delivery advisories (spec §Carriers): for a replaced element, those of the page's own state, never of the viewer's writes. */
+  const delivery = (item: Item, doc: JaiDocument): Diagnostic[] => item.saved?.advisories ?? validateDelivery({ carrier: item.disc.carrier, element: item.img, decoded: { document: doc } });
 
   // ------------------------------------------------------------ input image (only pixels the page can read)
   async function readableInput(img: HTMLImageElement): Promise<{ b64: string; mime: string } | null> {
@@ -325,12 +391,16 @@ function init(): void {
   // ------------------------------------------------------------ render and replace
   async function render(item: Item, modelId: string | null, automatic: boolean, statusEl?: HTMLElement): Promise<void> {
     if (item.status === 'rendering') return;
-    if (pixelsArrived(item)) { drop(item); return; }
+    if (pixelsArrived(item)) { dismiss(item); return; }
     if (!(await resolve(item)) || !item.doc) return;
     const it = interpret(item.doc).interpreted;
+    // Never automatically: keep (spec §Rendering modes), a document with unsupported-version
+    // (§Consent, budgets and cancellation), or an element already replaced with this document (§Replacement).
+    if (automatic && (it.mode === 'keep' || item.diagnostics.some(d => d.code === 'unsupported-version') || replacedWith.get(item.img)?.has(canonicalJSON(item.doc)))) return;
     // The src carrier has no original pixels (spec §Modes and the original image).
     const hasOriginal = item.disc.carrier !== 'src' && item.img.naturalWidth > 0;
     const input = it.mode === 'transform' && hasOriginal ? await readableInput(item.img) : null;
+    if (!live(item) || item.port) return; // gone, or another render started meanwhile
     const rect = item.img.getBoundingClientRect();
     const req: RenderPortRequest = {
       type: 'render', canonicalJSON: canonicalJSON(item.doc), origin, topSite, pageId, modelId, automatic,
@@ -339,17 +409,21 @@ function init(): void {
       target: rect.width ? { width: Math.round(rect.width * devicePixelRatio), height: Math.round(rect.height * devicePixelRatio) } : null,
     };
     item.status = 'rendering'; placeBadge(item);
+    item.busy = item.img.getAttribute('aria-busy');
     item.img.setAttribute('aria-busy', 'true');
     const port = chrome.runtime.connect({ name: 'render' });
     item.port = port;
-    const setStatus = (t: string): void => { if (statusEl) statusEl.textContent = t; announce(t); };
+    // Spec §Accessibility: individual replacements are not announced; a render started from the panel reports there.
+    const setStatus = (t: string): void => { if (!statusEl) return; statusEl.textContent = t; announce(t); };
     setStatus('Rendering…');
     port.onMessage.addListener((m: RenderPortReply) => {
-      if (m.type === 'status') setStatus(`Rendering… (${m.status})`);
-      else if (m.type === 'done') { item.render = m; void apply(item, m).then(() => { announce(statusText(item)); if (panel?.isConnected && statusEl) void openPanel(item, true); }); port.disconnect(); }
-      else { item.status = 'failed'; item.error = m.message; restore(item, false); setStatus(m.message); placeBadge(item); port.disconnect(); }
+      if (!live(item)) return;
+      if (m.type === 'status') { setStatus(`Rendering… (${m.status})`); return; }
+      item.port = undefined; port.disconnect();
+      if (m.type === 'done') { item.render = m; void apply(item, m).then(() => { if (!live(item) || !statusEl) return; announce(statusText(item)); if (panel?.isConnected) void openPanel(item, true); }); }
+      else { item.status = 'failed'; item.error = m.message; restore(item, false); setStatus(m.message); placeBadge(item); }
     });
-    port.onDisconnect.addListener(() => { item.port = undefined; if (item.status === 'rendering') { item.status = 'failed'; restore(item, false); placeBadge(item); } });
+    port.onDisconnect.addListener(() => { if (!live(item) || item.port !== port) return; item.port = undefined; if (item.status === 'rendering') { item.status = 'failed'; restore(item, false); placeBadge(item); } });
     port.postMessage(req);
   }
 
@@ -365,36 +439,49 @@ function init(): void {
     return null;
   }
 
-  function save(img: HTMLImageElement): SavedState {
-    return { srcset: img.getAttribute('srcset'), sizes: img.getAttribute('sizes'), alt: img.getAttribute('alt'), ariaDescription: img.getAttribute('aria-description'), ariaBusy: img.getAttribute('aria-busy'), insertedSource: null, canvas: null, display: img.style.display, objectFit: null, sizeStyle: null };
+  function save(item: Item): SavedState {
+    const img = item.img;
+    return { srcset: img.getAttribute('srcset'), sizes: img.getAttribute('sizes'), alt: img.getAttribute('alt'), ariaDescription: img.getAttribute('aria-description'), insertedSource: null, canvas: null, display: img.style.display, objectFit: null, sizeStyle: null, advisories: item.doc ? delivery(item, item.doc) : [] };
+  }
+
+  /** Spec §Size and aspect without a governing ratio: aspect, the preview's ratio, else the renderer's default, which is the render's own ratio. */
+  function layoutRatio(doc: JaiDocument, r: Extract<RenderPortReply, { type: 'done' }>): number | null {
+    const it = interpret(doc).interpreted;
+    if (it.aspect) return it.aspect.width / it.aspect.height;
+    const size = imageSize(b64decode(r.dataURL.split(',')[1] ?? ''));
+    return previewRatio(it.preview) ?? (size ? size.width / size.height : null);
   }
 
   async function apply(item: Item, r: Extract<RenderPortReply, { type: 'done' }>): Promise<void> {
     const img = item.img;
-    item.saved ??= save(img);
+    item.saved ??= save(item);
     const saved = item.saved;
     const picture = img.parentElement?.localName === 'picture' ? img.parentElement : null;
-    // A src image with no size (for example Markdown output) gets the document's shape at the available width.
-    const box = img.getBoundingClientRect();
-    if (item.disc.carrier === 'src' && (box.width < 2 || box.height < 2) && saved.sizeStyle === null) {
-      saved.sizeStyle = { width: img.style.width, aspectRatio: img.style.aspectRatio };
-      const a = item.doc ? interpret(item.doc).interpreted.aspect : null;
-      img.style.width = '100%';
-      img.style.aspectRatio = a ? `${a.width} / ${a.height}` : '1 / 1';
-    }
-    // Spec §Replacement: setting src alone is a no-op under srcset or a matching <source>.
-    if (picture) {
-      if (!saved.insertedSource) {
-        const s = document.createElement('source');
-        ours.add(s);
-        picture.insertBefore(s, picture.firstChild);
-        saved.insertedSource = s;
+    own(() => {
+      // A src image with no size (for example Markdown output) is laid out at the available width, at the ratio spec §Size and aspect chooses.
+      const box = img.getBoundingClientRect();
+      const ratio = item.disc.carrier === 'src' && item.doc && (box.width < 2 || box.height < 2) && saved.sizeStyle === null ? layoutRatio(item.doc, r) : null;
+      if (ratio) {
+        saved.sizeStyle = { width: img.style.width, aspectRatio: img.style.aspectRatio };
+        img.style.width = '100%';
+        img.style.aspectRatio = String(ratio);
       }
-      saved.insertedSource.srcset = r.dataURL;
-    } else {
-      img.removeAttribute('sizes');
-      img.setAttribute('srcset', r.dataURL);
-    }
+      // Spec §Replacement: setting src alone is a no-op under srcset or a matching <source>.
+      if (picture) {
+        if (saved.insertedSource) setAttr(saved.insertedSource, 'srcset', r.dataURL);
+        else {
+          const s = document.createElement('source');
+          s.srcset = r.dataURL;
+          placeNode(picture, () => picture.insertBefore(s, picture.firstChild));
+          saved.insertedSource = s;
+        }
+      } else {
+        setAttr(img, 'sizes', null);
+        setAttr(img, 'srcset', r.dataURL);
+      }
+    });
+    // Counted from the first write, so a page that undoes the replacement cannot make automatic rendering loop.
+    if (item.doc) { let docs = replacedWith.get(img); if (!docs) replacedWith.set(img, (docs = new Set())); docs.add(canonicalJSON(item.doc)); }
     const loaded = await new Promise<boolean>(res => {
       if (img.currentSrc === r.dataURL && img.complete && img.naturalWidth > 0) return res(true);
       const done = (ok: boolean): void => { img.removeEventListener('load', onLoad); img.removeEventListener('error', onErr); res(ok); };
@@ -404,14 +491,15 @@ function init(): void {
       img.addEventListener('load', onLoad); img.addEventListener('error', onErr);
       setTimeout(() => done(img.currentSrc === r.dataURL && img.naturalWidth > 0), 4000);
     });
+    if (!live(item)) return;
     if (!loaded) {
       // The page's CSP refused data: images. Paint into a canvas instead: no page-initiated fetch.
       undoReplacement(img, saved);
       try {
         const bmp = await createImageBitmap(new Blob([b64decode(r.dataURL.split(',')[1] ?? '')], { type: r.mime }));
+        if (!live(item)) return;
         const rect = img.getBoundingClientRect();
         const c = document.createElement('canvas');
-        ours.add(c);
         c.width = Math.round(rect.width * devicePixelRatio) || bmp.width; c.height = Math.round(rect.height * devicePixelRatio) || bmp.height;
         c.style.cssText = `width:${rect.width}px;height:${rect.height}px;display:inline-block;vertical-align:${getComputedStyle(img).verticalAlign}`;
         // Cover-crop, centred: never stretch (spec §Size and aspect).
@@ -419,22 +507,31 @@ function init(): void {
         const sw = c.width / scale, sh = c.height / scale;
         c.getContext('2d')?.drawImage(bmp, (bmp.width - sw) / 2, (bmp.height - sh) / 2, sw, sh, 0, 0, c.width, c.height);
         c.setAttribute('role', 'img');
-        img.after(c);
-        img.style.display = 'none';
-        saved.canvas = c;
         describe(c, item);
-      } catch { item.status = 'failed'; item.error = 'This page does not allow replacement images.'; placeBadge(item); return; }
+        const parent = img.parentNode;
+        own(() => { if (parent) placeNode(parent, () => img.after(c)); img.style.display = 'none'; });
+        saved.canvas = c;
+      } catch { item.status = 'failed'; item.error = 'This page does not allow replacement images.'; restore(item, false); return; }
     } else {
-      describe(img, item);
-      // Never stretch (spec §Size and aspect): honour the page's object-fit, else cover-crop.
-      if (getComputedStyle(img).objectFit === 'fill' && saved.objectFit === null) {
-        saved.objectFit = img.style.objectFit;
-        img.style.objectFit = 'cover';
-      }
+      own(() => {
+        describe(img, item);
+        // Never stretch (spec §Size and aspect): honour the page's object-fit, else cover-crop.
+        if (getComputedStyle(img).objectFit === 'fill' && saved.objectFit === null) {
+          saved.objectFit = img.style.objectFit;
+          img.style.objectFit = 'cover';
+        }
+      });
     }
-    img.removeAttribute('aria-busy');
+    unbusy(item);
     item.status = 'rendered';
     placeBadge(item);
+  }
+
+  /** Put back the page's own aria-busy once the viewer no longer marks a render pending. */
+  function unbusy(item: Item): void {
+    if (item.busy === undefined) return;
+    if (item.busy === null) item.img.removeAttribute('aria-busy'); else item.img.setAttribute('aria-busy', item.busy);
+    item.busy = undefined;
   }
 
   /** Accessible name and the AI-rendered state (spec §Accessibility). */
@@ -443,27 +540,36 @@ function init(): void {
     const noAlt = saved?.alt === null;
     // Spec §Accessibility: no alt → the description, in full (no length limit), control characters removed.
     const name = noAlt ? ((item.doc?.get('prompt') ?? []).join('\n') || 'Image').replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, ' ') : saved?.alt ?? '';
-    target.setAttribute(target === item.img ? 'alt' : 'aria-label', name);
-    target.setAttribute('aria-description', 'Rendered by an AI model from its description; it may differ from the publisher’s image. The original is available from the JAI control.');
+    own(() => {
+      if (target === item.img) setAttr(target, 'alt', name); else target.setAttribute('aria-label', name);
+      target.setAttribute('aria-description', 'Rendered by an AI model from its description; it may differ from the publisher’s image. The original is available from the JAI control.');
+    });
   }
 
   function undoReplacement(img: HTMLImageElement, saved: SavedState): void {
-    saved.insertedSource?.remove(); saved.insertedSource = null;
-    if (saved.srcset === null) img.removeAttribute('srcset'); else img.setAttribute('srcset', saved.srcset);
-    if (saved.sizes === null) img.removeAttribute('sizes'); else img.setAttribute('sizes', saved.sizes);
+    own(() => {
+      const s = saved.insertedSource, parent = s?.parentNode;
+      if (s && parent) placeNode(parent, () => s.remove());
+      saved.insertedSource = null;
+      setAttr(img, 'srcset', saved.srcset);
+      setAttr(img, 'sizes', saved.sizes);
+    });
   }
 
   function restore(item: Item, keepRender: boolean): void {
     const img = item.img, saved = item.saved;
-    img.removeAttribute('aria-busy');
-    if (!saved) return;
-    undoReplacement(img, saved);
-    saved.canvas?.remove(); saved.canvas = null;
-    img.style.display = saved.display;
-    if (saved.objectFit !== null) img.style.objectFit = saved.objectFit;
-    if (saved.sizeStyle) { img.style.width = saved.sizeStyle.width; img.style.aspectRatio = saved.sizeStyle.aspectRatio; }
-    if (saved.alt === null) img.removeAttribute('alt'); else img.setAttribute('alt', saved.alt);
-    if (saved.ariaDescription === null) img.removeAttribute('aria-description'); else img.setAttribute('aria-description', saved.ariaDescription);
+    unbusy(item);
+    if (saved) own(() => {
+      undoReplacement(img, saved);
+      const c = saved.canvas, parent = c?.parentNode;
+      if (c && parent) placeNode(parent, () => c.remove());
+      saved.canvas = null;
+      img.style.display = saved.display;
+      if (saved.objectFit !== null) img.style.objectFit = saved.objectFit;
+      if (saved.sizeStyle) { img.style.width = saved.sizeStyle.width; img.style.aspectRatio = saved.sizeStyle.aspectRatio; }
+      setAttr(img, 'alt', saved.alt);
+      if (saved.ariaDescription === null) img.removeAttribute('aria-description'); else img.setAttribute('aria-description', saved.ariaDescription);
+    });
     item.saved = undefined;
     if (keepRender) item.status = 'original';
     placeBadge(item);
@@ -487,30 +593,172 @@ function init(): void {
       if (typeof img.checkVisibility === 'function' && !img.checkVisibility({ opacityProperty: true, visibilityProperty: true } as CheckVisibilityOptions)) continue;
       io.unobserve(img);
       // A .jai resource is fetched now: the image is on screen and the user enabled automatic rendering for this site.
-      void (async () => {
-        if (!(await resolve(item)) || !item.doc) return;
-        if (interpret(item.doc).interpreted.mode === 'keep') return; // never automatic for keep
-        await render(item, null, true);
-      })();
+      void render(item, null, true);
     }
   }, { rootMargin: '0px', threshold: [0.5], trackVisibility: true, delay: 100 } as IntersectionObserverInit);
   function maybeAuto(item: Item): void { if (autoOn) io.observe(item.img); }
 
-  // ------------------------------------------------------------ mutations: new images, external src changes
-  const mo = new MutationObserver(muts => {
-    let rescan = false;
+  // ------------------------------------------------------------ mutations (spec §Discovery, §Replacement)
+  // Discovery re-runs, in every state of an item, on the page's changes to an <img>'s src, srcset,
+  // sizes, alt and data-jai, to the children of a <picture>, and to srcset, media and type of a
+  // <source> in one (its sizes never changes the document the <source> carries). It never runs on
+  // the viewer's own changes (spec §Untrusted input and bounds): every DOM write the observer can
+  // see goes through own().
+  const IMG_ATTRS = ['src', 'srcset', 'sizes', 'alt', 'data-jai'];
+  const SOURCE_ATTRS = ['srcset', 'media', 'type'];
+  const WATCH: MutationObserverInit = { childList: true, subtree: true, attributes: true, attributeFilter: [...new Set([...IMG_ATTRS, ...SOURCE_ATTRS])] };
+  /**
+   * Images whose discovery re-runs at the next flush, with the attributes the page changed on them
+   * (the viewer leaves those alone) and PICTURE when the children of the <picture> they are in, or left, changed.
+   */
+  const dirty = new Map<HTMLImageElement, Set<string>>();
+  const PICTURE = '<picture>';
+  let rescan = false, flushQueued = false, off = false;
+  /** While own() runs: the writes it made, as [target, attribute name or 'childList']. */
+  let writes: Array<[Node, string]> | null = null;
+
+  function mark(img: HTMLImageElement, change: string): void {
+    let changed = dirty.get(img);
+    if (!changed) dirty.set(img, (changed = new Set()));
+    changed.add(change);
+  }
+  const markPicture = (picture: Element): void => { const img = Array.from(picture.children).find(c => c instanceof HTMLImageElement); if (img) mark(img, PICTURE); };
+  /** Whether an added subtree may hold images: an <img>, or a shadow host (its shadow tree is not in the subtree). */
+  function mayHoldImages(n: Element): boolean {
+    const walk = document.createTreeWalker(n, NodeFilter.SHOW_ELEMENT);
+    for (let e: Node | null = n; e; e = walk.nextNode()) if ((e as Element).localName === 'img' || (e as Element).shadowRoot) return true;
+    return false;
+  }
+
+  /** Take in the page's mutation records; discovery re-runs in a microtask. */
+  function note(muts: MutationRecord[]): void {
     for (const m of muts) {
-      if (m.type === 'childList') { for (const n of Array.from(m.addedNodes)) if (n instanceof Element && !ours.has(n) && (n.localName === 'img' || n.querySelector?.('img'))) rescan = true; }
-      else if (m.type === 'attributes' && m.target instanceof HTMLImageElement) {
-        const item = items.get(m.target);
-        // The page changed a replaced element: treat it as new and release saved state.
-        if (item && item.status === 'rendered' && m.attributeName === 'src') { item.saved = undefined; items.delete(m.target); item.badge?.remove(); rescan = true; }
-        else if (!item && ['data-jai', 'alt', 'src'].includes(m.attributeName ?? '')) rescan = true;
+      const t = m.target as Element;
+      if (m.type === 'attributes') {
+        const a = m.attributeName ?? '';
+        if (t instanceof HTMLImageElement && IMG_ATTRS.includes(a)) mark(t, a);
+        else if (t.localName === 'source' && SOURCE_ATTRS.includes(a) && t.parentElement?.localName === 'picture') markPicture(t.parentElement);
+        continue;
       }
+      if (t.localName === 'picture' && [...Array.from(m.addedNodes), ...Array.from(m.removedNodes)].some(n => n instanceof Element)) {
+        markPicture(t);
+        for (const n of Array.from(m.removedNodes)) if (n instanceof HTMLImageElement) mark(n, PICTURE);
+      }
+      // A moved <img> outside any <picture> keeps its item; the scan finds images new to the viewer.
+      for (const n of Array.from(m.addedNodes)) if (n instanceof Element && mayHoldImages(n)) rescan = true;
     }
-    if (rescan) scan();
-  });
-  mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'srcset', 'data-jai', 'alt', 'type', 'media'] });
+    if ((dirty.size || rescan) && !flushQueued) { flushQueued = true; queueMicrotask(flush); }
+  }
+
+  function flush(): void {
+    flushQueued = false;
+    for (const [img, changed] of dirty) { rediscover(img, changed); dirty.delete(img); }
+    if (rescan) { rescan = false; scan(); } else report();
+  }
+
+  const sameDocument = (a: Discovery, b: Discovery): boolean => a.carrier === b.carrier && a.kind === b.kind
+    && (a.kind === 'url' ? a.url === b.url : !!a.document && !!b.document && canonicalJSON(a.document) === canonicalJSON(b.document));
+
+  /** Discovery re-runs for one element, after the page made the changes in `changed`. */
+  function rediscover(img: HTMLImageElement, changed: Set<string>): void {
+    const item = items.get(img), saved = item?.saved;
+    // On a replaced element, what the page changed is the state to restore and what discovery reads.
+    if (saved) {
+      if (changed.has('sizes')) saved.sizes = img.getAttribute('sizes');
+      if (changed.has('alt')) saved.alt = img.getAttribute('alt');
+    }
+    if (item && keeps(item, changed)) {
+      // A replaced element keeps its render, named by the page's alt (setAttr writes alt once it is out of `changed`).
+      if (saved && changed.delete('alt')) describe(saved.canvas ?? img, item);
+      return;
+    }
+    if (item) {
+      // A new element: put back what the viewer changed, leaving the attributes the page changed,
+      // cancel any render and release the item (spec §Replacement).
+      restore(item, false);
+      drop(item);
+    }
+    add(img);
+  }
+
+  /** Whether an item survives the page's changes (it then takes in the fresh discovery): the same document, and nothing requires treating the element as new. */
+  function keeps(item: Item, changed: Set<string>): boolean {
+    const shown = changed.has('src') || changed.has('srcset') || changed.has(PICTURE);
+    if (item.saved) {
+      // Spec §Replacement: src, srcset or <picture> children changed on a replaced element: it is new.
+      if (shown) return false;
+      // Otherwise only alt, sizes or data-jai changed. sizes never matters to discovery; a JAI <source>
+      // outranks data-jai and alt; data-jai outranks the src carrier, whose document alt never touches. The
+      // attribute carrier is discovered afresh from the element as the page has it: the viewer's srcset,
+      // <source> and alt play no part in it.
+      if (item.disc.carrier === 'picture') return true;
+      if (item.disc.carrier === 'src') return !changed.has('data-jai');
+    } else if (item.port && shown && item.disc.carrier !== 'src' && item.doc && interpret(item.doc).interpreted.mode === 'transform') {
+      return false; // the render in flight was asked for with the pixels shown before
+    }
+    const next = discover(item.saved ? pageView(item.img, item.saved) : item.img, { baseURL: document.baseURI });
+    if (!next || !sameDocument(item.disc, next)) return false;
+    item.disc = next;
+    if (next.kind === 'inline') { item.doc = next.document ?? null; item.diagnostics = next.diagnostics ?? []; }
+    return true;
+  }
+
+  /**
+   * A replaced element as the page has it: the attributes the viewer writes on it read as the page left
+   * them, and its parent lists this view in the element's place, without the viewer's inserted <source>,
+   * so discovery stops at the element exactly as it does for the real one.
+   */
+  function pageView(img: HTMLImageElement, saved: SavedState): ElementLike {
+    const page = new Map([['srcset', saved.srcset], ['sizes', saved.sizes], ['alt', saved.alt]]);
+    const view: ElementLike = { localName: img.localName, parentElement: null, children: img.children, getAttribute: n => page.has(n) ? page.get(n) ?? null : img.getAttribute(n) };
+    const parent = img.parentElement;
+    if (parent) {
+      const siblings = Array.from(parent.children).filter(c => c !== saved.insertedSource).map(c => (c === img ? view : c));
+      view.parentElement = { localName: parent.localName, parentElement: parent.parentElement, children: siblings, getAttribute: n => parent.getAttribute(n) };
+    }
+    return view;
+  }
+
+  /**
+   * Run the viewer's own DOM writes. The page's records queued before them are taken in first, so
+   * the writes leave what the page changed alone (setAttr); of the records taken right after, those
+   * that match a write made here are dropped, and any other (a page reaction that ran synchronously
+   * inside a write) is still the page's.
+   */
+  function own(fn: () => void): void {
+    if (writes) { fn(); return; }
+    note(mo.takeRecords());
+    const mine: Array<[Node, string]> = (writes = []);
+    try { fn(); } finally { writes = null; }
+    note(mo.takeRecords().filter(m => {
+      const i = mine.findIndex(([n, what]) => n === m.target && what === (m.attributeName ?? m.type));
+      if (i >= 0) mine.splice(i, 1);
+      return i < 0;
+    }));
+  }
+  /** Set an attribute (remove it for null), unless it already has that value or the page changed it since discovery last ran. */
+  function setAttr(el: Element, name: string, value: string | null): void {
+    if (el.getAttribute(name) === value || (el instanceof HTMLImageElement && dirty.get(el)?.has(name))) return;
+    if (value === null) el.removeAttribute(name); else el.setAttribute(name, value);
+    writes?.push([el, name]);
+  }
+  /** Insert or remove a viewer-owned node under `parent`. */
+  function placeNode(parent: Node, change: () => void): void { change(); writes?.push([parent, 'childList']); }
+
+  // Open shadow roots are observed like the document; closed ones stay out of reach (spec §Discovery).
+  const shadows = new WeakSet<ShadowRoot>();
+  function watchShadows(root: Document | ShadowRoot): void {
+    const walk = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+    for (let n = walk.nextNode(); n; n = walk.nextNode()) {
+      const sr = (n as Element).shadowRoot;
+      if (!sr) continue;
+      if (!shadows.has(sr)) { shadows.add(sr); mo.observe(sr, WATCH); }
+      watchShadows(sr);
+    }
+  }
+
+  const mo = new MutationObserver(note);
+  mo.observe(document.documentElement, WATCH);
 
   window.__jaiViewer = {
     rescan: scan,
@@ -529,7 +777,7 @@ function init(): void {
   scan();
   void send<StateReply>({ type: 'state', origin }).then(s => {
     state = s;
-    if (s.mode === 'never') { for (const i of items.values()) i.badge?.remove(); mo.disconnect(); return; }
+    if (s.mode === 'never') { off = true; for (const i of items.values()) i.badge?.remove(); mo.disconnect(); return; }
     if (s.mode === 'auto' && s.hasToken && s.disclosed && window === window.top) { autoOn = true; for (const i of items.values()) maybeAuto(i); }
   });
 }

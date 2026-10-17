@@ -3,18 +3,20 @@
 <style>body{font-family:system-ui;margin:20px} img{display:block;margin:8px 0;border:1px solid #ccc}</style></head>
 <body>
 <h1>JAI viewer end-to-end test</h1>
-<p>Carrier 1</p>
-<picture id="p1"><source type="image/jai" srcset="data:image/jai,A%20red%20lighthouse%20on%20a%20rocky%20island%20at%20sunset;style=watercolor"><img id="c1" src="original.png" alt="A placeholder" width="300" height="200"></picture>
-<p>Carrier 2</p>
-<img id="c2" src="original.png" alt="A red lighthouse on a rocky island at sunset" width="300" height="200" data-jai="style=watercolor">
-<p>Carrier 3</p>
-<img id="c3" src="data:image/jai,A%20red%20lighthouse%20on%20a%20rocky%20island%20at%20sunset;style=watercolor" alt="A red lighthouse on a rocky island at sunset" width="300" height="200">
-<p>Not a carrier: alt beginning with jai: (must be ignored; alt is screen-reader text)</p>
-<img id="c4" src="original.png" alt="jai:A red lighthouse on a rocky island at sunset;style=watercolor" width="300" height="200">
-<p>Carrier 3 in a 3:2 box with aspect=1:1 (the box governs; never stretched), with per-model refinements for flux and sdxl</p>
-<img id="c5" src="data:image/jai,A%20red%20lighthouse%20on%20a%20rocky%20island%20at%20sunset;style=watercolor;aspect=1:1;prompt/flux=seen%20from%20the%20sea;prompt/sdxl=from%20a%20cliff%20top" alt="A red lighthouse on a rocky island at sunset" width="300" height="200">
-<p>src carrier: a .jai file (fetched only when rendering; its alt is the page's own, shorter text)</p>
-<img id="c6" src="lighthouse.jai" alt="Lighthouse at sunset" width="300" height="200">
+<p>Picture carrier</p>
+<picture id="picture"><source type="image/jai" srcset="data:image/jai,A%20red%20lighthouse%20on%20a%20rocky%20island%20at%20sunset;style=watercolor"><img id="picture-img" src="original.png" alt="A placeholder" width="300" height="200"></picture>
+<p>Attribute carrier: data-jai without a prompt, so the alt is the prompt</p>
+<img id="attribute-alt" src="original.png" alt="A red lighthouse on a rocky island at sunset" width="300" height="200" data-jai="style=watercolor">
+<p>Attribute carrier: data-jai with its own prompt, so the shorter alt plays no part</p>
+<img id="attribute-own" src="original.png" alt="Lighthouse" width="300" height="200" data-jai="A red lighthouse on a rocky island at sunset;style=watercolor">
+<p>Src carrier: a data:image/jai URL</p>
+<img id="src-data" src="data:image/jai,A%20red%20lighthouse%20on%20a%20rocky%20island%20at%20sunset;style=watercolor" alt="A red lighthouse on a rocky island at sunset" width="300" height="200">
+<p>Not a carrier: JAI text in an alt without data-jai (must be ignored; alt is screen-reader text)</p>
+<img id="alt-only" src="original.png" alt="A red lighthouse on a rocky island at sunset;style=watercolor" width="300" height="200">
+<p>Src carrier in a 3:2 box with aspect=1:1 (the box governs; never stretched), with per-model refinements for flux and sdxl</p>
+<img id="src-aspect" src="data:image/jai,A%20red%20lighthouse%20on%20a%20rocky%20island%20at%20sunset;style=watercolor;aspect=1:1;prompt/flux=seen%20from%20the%20sea;prompt/sdxl=from%20a%20cliff%20top" alt="A red lighthouse on a rocky island at sunset" width="300" height="200">
+<p>Src carrier: a .jai file (fetched only when rendering; its alt is the page's own, shorter text)</p>
+<img id="src-file" src="lighthouse.jai" alt="Lighthouse at sunset" width="300" height="200">
 <p>Plain image (must be ignored)</p>
 <img id="plain" src="original.png" alt="A plain grey picture" width="300" height="200">
 </body></html>

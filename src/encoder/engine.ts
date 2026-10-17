@@ -179,8 +179,8 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
         const it = interpret(doc, { catalog, selected: model }).interpreted;
         try {
           const result = await opts.renderer.render({
-            intent: { description: it.modelDescription, style: it.modelStyle, avoid: it.modelAvoid, aspect: it.aspect ? { width: it.aspect.width, height: it.aspect.height } : null, mode: 'generate', strength: null, seed: String(seed), animate: false },
-            modelId: model, inputImage: null, governingRatio: null, target: null, signal: opts.signal,
+            intent: { description: it.modelDescription, style: it.modelStyle, avoid: it.modelAvoid, aspect: it.aspect ? { width: it.aspect.width, height: it.aspect.height } : null, mode: 'generate', strength: null, seed: String(seed) },
+            modelId: model, inputImage: null, governingRatio: null, previewRatio: null, target: null, signal: opts.signal,
           });
           hold.charge('render', `${c.id} ${model}`, m.costHint);
           return { result };

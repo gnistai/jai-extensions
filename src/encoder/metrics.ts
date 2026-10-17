@@ -1,12 +1,5 @@
-// Pure helpers: similarity measures and aspect reduction.
+// Pure helpers: measurement, fitness and aspect reduction.
 import type { Box, Measure, Observation, SubjectMeasure, Thumbnail } from './types.ts';
-
-export function cosine(a: readonly number[], b: readonly number[]): number {
-  if (a.length !== b.length || !a.length) throw new RangeError('embeddings differ in length');
-  let dot = 0, na = 0, nb = 0;
-  for (let i = 0; i < a.length; i++) { const x = a[i]!, y = b[i]!; dot += x * y; na += x * x; nb += y * y; }
-  return na && nb ? dot / Math.sqrt(na * nb) : 0;
-}
 
 const srgbToLinear = (c: number): number => { const v = c / 255; return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; };
 function toLab(r: number, g: number, b: number): [number, number, number] {

@@ -5,7 +5,7 @@ import { api, ENGINE_WORDS, engineView, events, hasTauri, onFileDrop, usesMock, 
 import { $, errorText, toast } from './dom.ts';
 import { initEncode, type EncodeTab } from './encode.ts';
 import { initModels } from './models.ts';
-import { IMAGE_FILE, IMAGE_FORMATS } from './rules.ts';
+import { IMAGE_FILE, IMAGE_FORMATS, JAI_FILE } from './rules.ts';
 import { initServer } from './server.ts';
 import { initView, type ViewTab } from './view.ts';
 
@@ -119,11 +119,11 @@ $('status-pill').addEventListener('click', () => { navigated = true; show(status
 
 // ---------------------------------------------------------------- documents and images from outside
 
-/** A .jai document goes to View, an image to Encode. */
+/** A .jai file goes to View, an image to Encode; Studio opens nothing else. */
 function route(path: string): void {
   if (!view || !encode) { pendingPaths.push(path); return; }
   if (IMAGE_FILE.test(path)) { show('encode'); encode.useImage(path); return; }
-  if (current === 'encode' && !/\.jai$/i.test(path)) { toast(`Encode takes ${IMAGE_FORMATS} images.`, 'err'); return; }
+  if (!JAI_FILE.test(path)) { toast(`JAI Studio opens .jai files and ${IMAGE_FORMATS} images.`, 'err'); return; }
   show('view');
   view.open(path);
 }

@@ -7,22 +7,28 @@ import { encode as runEncoder } from '../encoder/engine.ts';
 import type { Candidate, EncodeEvent, ScoredRender, Thumbnail } from '../encoder/types.ts';
 import * as J from '../jai/index.ts';
 import { OpenAIChatClient, errorText } from '../providers/openai-chat.ts';
+import { previewRatio } from '../renderers/image-size.ts';
 import { LOCAL_FLUX, LocalRenderer } from '../renderers/local.ts';
 import { FAMILIES } from '../renderers/replicate.ts';
-import type { RenderResult } from '../renderers/types.ts';
+import { INTERPRETER_CODES, type RenderResult } from '../renderers/types.ts';
 
 /** jai-tools' package.json version, injected by scripts/build.mjs. */
 declare const JAI_TOOLS_VERSION: string;
 
+/**
+ * A document: the bytes of a .jai file (decoded as the file form only), or text. Text that
+ * is a data:image/jai URL (see readDocument) is decoded as its text body; any other text is
+ * JAI text, parsed as the text form.
+ */
 export type DocInput = { bytes: Uint8Array } | { text: string };
 
 export interface ServerRef { url: string; token: string }
 
 export interface Diag { code: string; key?: string; requested?: string; actual?: string; reason?: string }
 
-export interface ValidateResult { ok: boolean; fatal: boolean; form: 'gzip' | 'json' | 'text' | null; text: string | null; diagnostics: Diag[] }
+export interface ValidateResult { ok: boolean; fatal: boolean; text: string | null; diagnostics: Diag[] }
 
-export interface RenderOptions { server: ServerRef; seed?: string | null; model?: string | null; outputFormat?: 'png' | 'jpeg'; scale?: number }
+export interface RenderOptions { server: ServerRef; seed?: string | null; outputFormat?: 'png' | 'jpeg' }
 
 export interface RenderOutput {
   bytes: Uint8Array; mime: string; model: string; modelLabel: string; sentPrompt: string; seed: number;
@@ -48,10 +54,8 @@ export interface EncodeOutput {
 
 export const version: string = JAI_TOOLS_VERSION;
 
-/** Diagnostics that make a document unreadable (as `jai validate` treats them). */
+/** Diagnostics that make a document unreadable, as `jai validate` treats them: a .jai file that is not the file form, or a data:image/jai body that is not UTF-8 text within the text bound. */
 const FATAL = new Set(['invalid-json', 'malformed-container', 'undecodable']);
-/** Interpreter codes a viewer shows with a render, as the extension does. */
-const INTERPRETER_CODES = new Set(['repeated-single', 'invalid-value', 'adjusted-value', 'ignored-value', 'invalid-image', 'unsupported-preview', 'no-matching-model', 'substituted-model', 'version-ignored']);
 /** The one model Studio renders with, as a catalog entry. */
 const CATALOG: J.CatalogModel[] = [{ id: LOCAL_FLUX.id, aliases: LOCAL_FLUX.aliases, family: LOCAL_FLUX.family, imageInput: LOCAL_FLUX.imageInput, default: true }];
 const EXTENSIONS: Record<string, string> = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif', 'image/avif': 'avif' };
@@ -86,29 +90,27 @@ function serverOf(s: ServerRef | undefined): ServerRef {
   return s;
 }
 
-interface ReadDocument { document: J.JaiDocument; diagnostics: J.Diagnostic[]; form: ValidateResult['form']; info?: J.ParseInfo }
+/** A decoded document; `url` is the data:image/jai URL it came from, if any. */
+interface ReadDocument { document: J.JaiDocument; diagnostics: J.Diagnostic[]; info?: J.ParseInfo; url?: string }
 
-/** As `jai validate` reads its argument: bytes are decoded; text starting with "{" is JSON, other text is parsed. */
+/**
+ * As `jai validate` reads its argument. Bytes are a .jai file, decoded as the file form only.
+ * Text that, after trimming C0 controls and spaces (as the URL parser does), begins with
+ * `data:image/jai` and then `,` or `;` (ASCII case-insensitively) is a data:image/jai URL,
+ * decoded as its text body; a URL that carries no document is refused. Any other text,
+ * prose that begins with "Data:" and other data: URLs included, is parsed as the text form.
+ */
 function readDocument(input: DocInput): ReadDocument {
   if (input && typeof input === 'object' && 'text' in input && typeof input.text === 'string') {
-    if (input.text.trimStart().startsWith('{')) {
-      const r = J.readJSON(input.text);
-      return { document: r.document, diagnostics: r.diagnostics, form: 'json' };
-    }
-    const r = J.parse(input.text);
-    return { document: r.document, diagnostics: r.diagnostics, form: 'text', info: r.info };
+    const url = J.trimBy(input.text, c => c <= 0x20);
+    if (!/^data:image\/jai[,;]/i.test(url)) return J.parse(input.text);
+    const r = J.decodeDataURL(url);
+    if (!r) throw new Error('The document cannot be read: this data:image/jai URL carries no document (no "," or a ";base64" body that is not base64)');
+    return { ...r, url };
   }
   const bytes = input && typeof input === 'object' && 'bytes' in input ? toBytes(input.bytes) : null;
   if (!bytes) throw new TypeError('A document is {bytes: Uint8Array} or {text: string}');
-  const r = J.decode(bytes);
-  return { document: r.document, diagnostics: r.diagnostics, form: r.form, info: r.info };
-}
-
-/** A model the user chose: Studio has one, named by its id, an alias or its family. */
-function localModelId(name: string): string {
-  const n = J.asciiLower(name.trim());
-  if (n === LOCAL_FLUX.id || LOCAL_FLUX.aliases.includes(n) || n === LOCAL_FLUX.family) return LOCAL_FLUX.id;
-  throw new RangeError(`Unknown model "${name}": JAI Studio renders with ${LOCAL_FLUX.id}`);
+  return J.decode(bytes);
 }
 
 /** A seed the user chose, as the document's seed key takes it (1 to 20 digits); null for none. */
@@ -135,32 +137,40 @@ function renderName(n: number, candidate: string, seed: number, mime: string): s
 
 // ------------------------------------------------------------ entry points
 
-/** Mirrors `bin/jai.mjs validate`. Fatal codes: invalid-json, malformed-container, undecodable. */
+/**
+ * Mirrors `bin/jai.mjs validate`: the decoder's diagnostics, then a data:image/jai URL's own
+ * advisories (validateDataURL), then the document's. Fatal codes: malformed-container,
+ * invalid-json, undecodable; an unreadable document gets no canonical text and is not
+ * validated (it decoded to the empty document, which would only report no-prompt).
+ */
 export function validate(input: DocInput): ValidateResult {
   const r = readDocument(input);
   const fatal = r.diagnostics.some(d => FATAL.has(d.code));
-  const diagnostics = [...r.diagnostics, ...J.validate(r.document, r.info)].map(toDiag);
-  return { ok: !fatal, fatal, form: r.form, text: fatal ? null : J.serialize(r.document), diagnostics };
+  const diagnostics = [...r.diagnostics, ...(r.url ? J.validateDataURL(r.url) : []), ...(fatal ? [] : J.validate(r.document, r.info))].map(toDiag);
+  return { ok: !fatal, fatal, text: fatal ? null : J.serialize(r.document), diagnostics };
 }
 
-/** Interprets the document with a one-model catalog (FLUX schnell) and renders it with LocalRenderer. */
+/**
+ * Refuses an unreadable document as `validate` judges it; else interprets it with a one-model
+ * catalog (FLUX schnell) and renders it with LocalRenderer, at the document's aspect, else its
+ * preview's ratio, else 1:1 (a standalone document has no governing ratio).
+ */
 export async function render(input: DocInput, opts: RenderOptions): Promise<RenderOutput> {
   const server = serverOf(opts?.server);
   const r = readDocument(input);
   const fatal = r.diagnostics.find(d => FATAL.has(d.code));
   if (fatal) throw new Error(`The document cannot be read: ${fatal.code}${typeof fatal.reason === 'string' ? ` (${fatal.reason})` : ''}`);
-  const selected = opts.model ? localModelId(opts.model) : null;
-  const { interpreted: it, diagnostics: found } = J.interpret(r.document, { catalog: CATALOG, families: FAMILIES, selected });
-  const renderer = new LocalRenderer(server.url, server.token, { outputFormat: opts.outputFormat === 'jpeg' ? 'jpeg' : 'png', scale: opts.scale });
+  const { interpreted: it, diagnostics: found } = J.interpret(r.document, { catalog: CATALOG, families: FAMILIES });
+  const renderer = new LocalRenderer(server.url, server.token, { outputFormat: opts.outputFormat === 'jpeg' ? 'jpeg' : 'png' });
   const result = await renderer.render({
     intent: {
       description: it.modelDescription, style: it.modelStyle, avoid: it.modelAvoid,
       aspect: it.aspect ? { width: it.aspect.width, height: it.aspect.height } : null,
       // A render the user asks for is a generate render, keep documents included (spec: Rendering modes).
       mode: it.mode === 'keep' ? 'generate' : it.mode,
-      strength: it.strength, seed: seedOption(opts.seed) ?? it.seed, animate: it.animate,
+      strength: it.strength, seed: seedOption(opts.seed) ?? it.seed,
     },
-    modelId: LOCAL_FLUX.id, inputImage: null, governingRatio: null, target: null,
+    modelId: LOCAL_FLUX.id, inputImage: null, governingRatio: null, previewRatio: previewRatio(it.preview), target: null,
   });
   const sent = result.sentInput;
   return {
