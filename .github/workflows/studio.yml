@@ -1,0 +1,101 @@
+name: JAI Studio
+on:
+  push:
+    branches: [master]
+    paths: ['studio/**', 'src/**', 'scripts/build.mjs', 'package*.json', '.github/workflows/studio.yml']
+  pull_request:
+    paths: ['studio/**', 'src/**', 'scripts/build.mjs', 'package*.json', '.github/workflows/studio.yml']
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      JAI_SPEC_DIR: ${{ github.workspace }}\spec
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: gnistai/jai
+          path: spec
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: studio
+      # Licence notices for what the executable is built from (studio/scripts/notices.sh).
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --features cli --version 0.9.2
+      - run: npm ci
+      - run: npm run build
+      - name: Test
+        working-directory: studio
+        run: cargo test --workspace
+      - name: Third-party notices
+        shell: bash
+        run: bash studio/scripts/notices.sh x86_64-pc-windows-msvc studio/target/THIRD-PARTY-NOTICES.txt
+      - name: Build jai.exe
+        working-directory: studio
+        env:
+          JAI_THIRD_PARTY_NOTICES: ${{ github.workspace }}\studio\target\THIRD-PARTY-NOTICES.txt
+        run: cargo build --release -p jai
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jai-windows-x64
+          path: |
+            studio/target/release/jai.exe
+            studio/target/THIRD-PARTY-NOTICES.txt
+
+  linux:
+    runs-on: ubuntu-24.04
+    env:
+      JAI_SPEC_DIR: ${{ github.workspace }}/spec
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: gnistai/jai
+          path: spec
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: GUI build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: studio
+      # Licence notices for what the executables are built from (studio/scripts/notices.sh).
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --features cli --version 0.9.2
+      - run: npm ci
+      - run: npm run build
+      - name: Lint
+        working-directory: studio
+        run: cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        working-directory: studio
+        run: cargo test --workspace
+      # The GUI build's dependencies include the headless build's, so one file covers both.
+      - name: Third-party notices
+        run: bash studio/scripts/notices.sh x86_64-unknown-linux-gnu studio/THIRD-PARTY-NOTICES.txt
+      - name: Build jai (GUI) and jai-headless
+        working-directory: studio
+        env:
+          JAI_THIRD_PARTY_NOTICES: ${{ github.workspace }}/studio/THIRD-PARTY-NOTICES.txt
+        run: |
+          cargo build --release -p jai
+          cp target/release/jai jai-gui
+          cargo build --release -p jai --no-default-features
+          cp target/release/jai jai-headless
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jai-linux-x64
+          path: |
+            studio/jai-gui
+            studio/jai-headless
+            studio/THIRD-PARTY-NOTICES.txt

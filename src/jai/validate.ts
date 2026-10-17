@@ -1,5 +1,5 @@
 // Advisory validator (spec §Diagnostics, validator codes).
-import { MEDIA_TYPE, QUALIFIABLE, SINGLE_VALUED, STANDARD_KEYS, WS_CLASS, asciiLower, diag, trim, type Diagnostic, type JaiDocument } from './chars.ts';
+import { MEDIA_TYPE, QUALIFIABLE, SINGLE_VALUED, STANDARD_KEYS, WS_CLASS, asciiLower, diag, isAsciiSpace, trim, trimBy, type Diagnostic, type JaiDocument } from './chars.ts';
 import { srcIsSelected, srcsetCandidates, type Carrier } from './html.ts';
 import { canonicalJSON } from './json.ts';
 import type { DecodeResult } from './decode.ts';
@@ -24,7 +24,8 @@ export function validate(doc: JaiDocument, info?: ParseInfo | null): Diagnostic[
       if (/[​-‍⁠]|.﻿/s.test(v)) d.push(diag('invisible-char', k));
       if (/[‪-‮⁦-⁩]/.test(v)) d.push(diag('bidi-control', k));
       if (utf8(v) > 8192) d.push(diag('large-payload', k));
-      if (/\n[\t\n\f\r ]*[A-Za-z0-9][A-Za-z0-9_.-]*(?:\/[A-Za-z0-9][A-Za-z0-9_-]*)?[\t\n\f\r ]*=/.test(v)) d.push(diag('newline-assignment', k));
+      // No \n after the first one: the same matches, in linear time (a run of newlines made this quadratic).
+      if (/\n[\t\f\r ]*[A-Za-z0-9][A-Za-z0-9_.-]*(?:\/[A-Za-z0-9][A-Za-z0-9_-]*)?[\t\n\f\r ]*=/.test(v)) d.push(diag('newline-assignment', k));
       if (k === 'prompt' && /^jai:/i.test(v)) d.push(diag('prefix-in-prompt', k));
       if (k === 'prompt' && KNOWN_FOREIGN.test(v)) d.push(diag('foreign-syntax', k));
       if (CONFUSABLE_DELIM.test(v)) d.push(diag('confusable-delimiter', k));
@@ -76,7 +77,7 @@ export function validate(doc: JaiDocument, info?: ParseInfo | null): Diagnostic[
 /** Checks on a data:image/jai URL written in a carrier (validator codes). */
 function dataURLAdvisories(url: string): Diagnostic[] {
   const d: Diagnostic[] = [];
-  const s = String(url).replace(/^[\u0000- ]+|[\u0000- ]+$/g, '');
+  const s = trimBy(String(url), c => c <= 0x20); // C0 controls and space
   if (!/^data:image\/jai(?=[;,]|$)/i.test(s)) return d;
   const comma = s.indexOf(',');
   if (comma < 0) { d.push(diag('data-url-missing-comma')); return d; }
@@ -112,8 +113,8 @@ export function validateDelivery({ decoded, carrier, element, viaDataURL = false
         if (ch === element) { after = true; continue; }
         if (ch.localName !== 'source') continue;
         const type = ch.getAttribute('type'), ss = ch.getAttribute('srcset') ?? '';
-        const isJai = asciiLower(((type ?? '').split(';')[0] ?? '').replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '')) === MEDIA_TYPE;
-        const first = (ss.replace(/^[\t\n\f\r ,]+/, '').split(/[\t\n\f\r ]/)[0] ?? '').replace(/,+$/, '');
+        const isJai = asciiLower(trimBy((type ?? '').split(';')[0] ?? '', isAsciiSpace)) === MEDIA_TYPE;
+        const first = trimBy(ss.replace(/^[\t\n\f\r ,]+/, '').split(/[\t\n\f\r ]/)[0] ?? '', c => c === 0x2c, false);
         const looksJai = /^data:image\/jai(?=[;,]|$)/i.test(first) || /\.jai(?:[?#]|$)/i.test(first);
         if (after) { if (isJai || looksJai) d.push(diag('source-after-img')); continue; }
         if (isJai && srcsetCandidates(ss).length === 0) d.push(diag('srcset-unparseable'));

@@ -1,6 +1,7 @@
 // Instructions for the analyst. They condense the JAI authoring guidance
 // (spec: Writing JAI by hand; skills/jai/SKILL.md) and the encoder's task.
-import type { Draft, Observation, ProposeContext } from './types.ts';
+import { subjectKey } from './metrics.ts';
+import type { Box, Draft, Observation, ProposeContext } from './types.ts';
 
 export const SYSTEM = `You write JAI image descriptions. A JAI description is plain natural-language text that text-to-image models render. Your job is compression: given a target image, write text from which the named image models reproduce the target as closely as possible.
 
@@ -29,35 +30,69 @@ Write ${n} different candidate descriptions, each at most ${maxWords} words (a m
 Answer: {"notes": string (one sentence on what is hardest to reproduce), "drafts": [${draftShapeD}, ...${n} items]}`;
 }
 
-export const INSPECT_SYSTEM = `You measure images for layout comparison. You report what is visible, with bounding boxes as box_2d [ymin, xmin, ymax, xmax] in integers from 0 to 1000 (0,0 is the top left). Be precise: boxes tight around each subject. Answer with one JSON object only, no Markdown fences.`;
+/**
+ * Box coordinate order. 'yx' is box_2d [ymin, xmin, ymax, xmax] (Gemini's and
+ * GPT's convention); 'xy' is bbox_2d [x1, y1, x2, y2] (Qwen-VL's native one).
+ * Asked for 'yx', Qwen3.8 answered some boxes in its own order within the same
+ * answer, so the local analyst asks in its order.
+ */
+export type BoxOrder = 'yx' | 'xy';
+const BOXES = {
+  yx: { field: 'box_2d', shape: '[ymin, xmin, ymax, xmax]', origin: '(0,0 is the top left)' },
+  xy: { field: 'bbox_2d', shape: '[x1, y1, x2, y2]', origin: '(x from the left edge, y from the top edge)' },
+} as const;
+
+export function inspectSystem(order: BoxOrder = 'yx'): string {
+  const b = BOXES[order];
+  return `You measure images for layout comparison. You report what is visible, with bounding boxes as ${b.field} ${b.shape} in integers from 0 to 1000 ${b.origin}. Be precise: boxes tight around each subject${order === 'xy' ? ', even very small ones' : ''}. Answer with one JSON object only, no Markdown fences.`;
+}
+export const INSPECT_SYSTEM = inspectSystem('yx');
 
 const OBS_SHAPE = '"horizon_y": integer 0-1000 or null (where the horizon or the line between ground and sky is, 0 = top, measured at the middle of the frame), "horizon_shape": "flat", "curved" or null, "camera": short phrase (angle and distance), "lighting": short phrase, "medium": short phrase (photograph, oil painting, 3D render, ...)';
 
-export function inspectTargetPrompt(): string {
+export function inspectTargetPrompt(order: BoxOrder = 'yx'): string {
+  const b = BOXES[order];
   return `List the 1 to 5 most important visible subjects or regions, most important first (people, animals, objects, buildings, a planet, the ground or sea when it defines the composition). Name each with a short generic noun phrase that would let someone find it again in a similar picture ("red bicycle", "lunar surface").
-Answer: {"subjects": [{"name": string, "box_2d": [ymin, xmin, ymax, xmax]}], ${OBS_SHAPE}}`;
+Answer: {"subjects": [{"name": string, "${b.field}": ${b.shape}}], ${OBS_SHAPE}}`;
 }
 
-export function inspectRenderPrompt(subjects: string[]): string {
-  return `Find each of these in the image: ${subjects.map((x, i) => `${i + 1}. ${x}`).join('; ')}. For each, give its box, or null when it is not visible. Use the names exactly as given, in the same order.
-Answer: {"subjects": [{"name": string, "box_2d": [ymin, xmin, ymax, xmax] or null}], ${OBS_SHAPE}}`;
+export function inspectRenderPrompt(subjects: string[], order: BoxOrder = 'yx'): string {
+  const b = BOXES[order];
+  return `Find each of these in the image: ${subjects.map((x, i) => `${i + 1}. ${x}`).join('; ')}. For each, give its box, or null when it is not visible.${order === 'xy' ? ' Look carefully: a subject may be very small.' : ''} Use the names exactly as given, in the same order.
+Answer: {"subjects": [{"name": string, "${b.field}": ${b.shape} or null}], ${OBS_SHAPE}}`;
 }
 
 const clamp01 = (x: unknown): number | null => (typeof x === 'number' && Number.isFinite(x) ? Math.min(1, Math.max(0, x / 1000)) : null);
 
+/**
+ * The answered subjects in the order and naming of `expected`. Exact names pair
+ * first (a name listed twice pairs by occurrence); a name the analyst changed
+ * then takes the first answer no name claimed. No answer is used twice.
+ */
+function followNames(parsed: Array<{ name: string; box: Box | null }>, expected: string[]): Observation['subjects'] {
+  const used = new Set<number>();
+  const take = (i: number): number => { if (i >= 0) used.add(i); return i; };
+  const exact = expected.map(name => take(parsed.findIndex((p, i) => !used.has(i) && subjectKey(p.name) === subjectKey(name))));
+  return expected.map((name, k) => {
+    const i = exact[k]! >= 0 ? exact[k]! : take(parsed.findIndex((_, j) => !used.has(j)));
+    return { name, box: i >= 0 ? parsed[i]!.box : null };
+  });
+}
+
 /** Validate an inspection answer into an Observation; subjects follow `expected` when given. */
-export function toObservation(a: Record<string, unknown>, expected: string[] | null): Observation {
+export function toObservation(a: Record<string, unknown>, expected: string[] | null, order: BoxOrder = 'yx'): Observation {
   const raw = Array.isArray(a.subjects) ? a.subjects : [];
   const parsed = raw.map(s => {
     const o = (s ?? {}) as Record<string, unknown>;
     const name = typeof o.name === 'string' ? cleanText(o.name, 60) : '';
-    const b = Array.isArray(o.box_2d) && o.box_2d.length === 4 ? o.box_2d.map(clamp01) : null;
+    const v = o[BOXES[order].field];
+    const n = Array.isArray(v) && v.length === 4 ? v.map(clamp01) : null;
+    // As [ymin, xmin, ymax, xmax] whichever order was asked for.
+    const b = n && (order === 'xy' ? [n[1], n[0], n[3], n[2]] : n);
     const box = b && b.every(x => x !== null) && b[2]! > b[0]! && b[3]! > b[1]! ? { ymin: b[0]!, xmin: b[1]!, ymax: b[2]!, xmax: b[3]! } : null;
     return { name, box };
   }).filter(s => s.name);
-  const subjects = expected
-    ? expected.map((name, i) => ({ name, box: (parsed.find(p => p.name.toLowerCase() === name.toLowerCase()) ?? parsed[i])?.box ?? null }))
-    : parsed.slice(0, 5);
+  const subjects = expected ? followNames(parsed, expected) : parsed.slice(0, 5);
   const text = (v: unknown): string => (typeof v === 'string' ? cleanText(v, 80) : '');
   const shape = typeof a.horizon_shape === 'string' && /^(flat|curved)$/i.test(a.horizon_shape.trim()) ? a.horizon_shape.trim().toLowerCase() : '';
   return { subjects, horizon: clamp01(a.horizon_y), horizonShape: shape, camera: text(a.camera), lighting: text(a.lighting), medium: text(a.medium) };

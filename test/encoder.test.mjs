@@ -45,7 +45,7 @@ function mockAnalyst(calls = [], { start = { w: 0.4, cx: 0.3, cy: 0.25, hz: 0.5 
       return { value: { subjects: [{ name: 'Earth', box: { xmin: p.cx - w / 2, xmax: p.cx + w / 2, ymin: p.cy - h / 2, ymax: p.cy + h / 2 } }], horizon: p.hz, horizonShape: 'flat', camera: 'wide', lighting: 'sun', medium: 'photograph' }, notes: '', cost: 0.001 };
     },
     async propose(t, ctx) {
-      calls.push(['propose', ctx.scope.kind, ctx.history.length, ctx.history.map(h => h.fitness)]);
+      calls.push(['propose', ctx.scope.kind, ctx.history.length, ctx.history.map(h => h.fitness), ctx.n]);
       if (ctx.scope.kind === 'refine') return { value: ['A small beta-fix detail.', 'Something irrelevant.'].slice(0, ctx.n), notes: 'beta draws it wide', cost: 0.002 };
       const bestP = params(ctx.history[0].draft.prompt);
       const next = stuck ? bestP : Object.fromEntries(Object.entries(bestP).map(([k, v]) => [k, v + (TRUE[k] - v) * step]));
@@ -75,6 +75,42 @@ test('measure: numbers in, fitness and words out', () => {
   assert.match(describeObservation(TARGET_OBS), /Earth: x 49%–64%, y 46%–57%/);
 });
 
+test('measure: subjects pair by exact name, never by shared words; names listed twice pair in order', () => {
+  const box = (xmin, xmax, ymin, ymax) => ({ xmin, xmax, ymin, ymax });
+  const obs = subjects => ({ ...TARGET_OBS, horizon: null, horizonShape: '', subjects });
+  for (const [a, b] of [['tree', 'large tree'], ['street', 'street lamp'], ['boat', 'small boat'], ['person', "person's shadow"]]) {
+    for (const t of [obs([{ name: a, box: box(0.1, 0.3, 0.4, 0.8) }, { name: b, box: box(0.6, 0.9, 0.1, 0.9) }]), obs([{ name: b, box: box(0.6, 0.9, 0.1, 0.9) }, { name: a, box: box(0.1, 0.3, 0.4, 0.8) }])]) {
+      const m = measure(t, t);
+      assert.ok(m.fitness > 0.99, `${a} / ${b}: ${m.fitness}`);
+      assert.equal(m.feedback, 'matches the measured layout');
+    }
+  }
+  // The render inspection names each target subject; the shorter name missing leaves the longer one present.
+  const t = obs([{ name: 'tree', box: box(0.1, 0.3, 0.4, 0.8) }, { name: 'large tree', box: box(0.6, 0.9, 0.1, 0.9) }]);
+  const m = measure(t, obs([{ name: 'Tree', box: null }, { name: 'large  tree', box: box(0.6, 0.9, 0.1, 0.9) }]));
+  assert.deepEqual(m.subjects.map(s => [s.name, s.present]), [['tree', false], ['large tree', true]]);
+  assert.match(m.feedback, /^Largest first: tree: missing$/);
+  // Two subjects with one name: the first box pairs with the first, the second with the second.
+  const twins = obs([{ name: 'tree', box: box(0.1, 0.2, 0.5, 0.9) }, { name: 'tree', box: box(0.7, 0.8, 0.5, 0.9) }]);
+  assert.ok(measure(twins, twins).fitness > 0.99);
+  assert.deepEqual(measure(twins, obs([{ name: 'tree', box: box(0.1, 0.2, 0.5, 0.9) }, { name: 'tree', box: null }])).subjects.map(s => s.present), [true, false]);
+  // Medium and light still compare by words.
+  const looks = measure(TARGET_OBS, { ...TARGET_OBS, medium: 'digital photograph', lighting: 'sun light' });
+  assert.doesNotMatch(looks.feedback, /looks like|light:/);
+  assert.match(measure(TARGET_OBS, { ...TARGET_OBS, medium: 'oil painting' }).feedback, /looks like: oil painting \(target: photograph\)/);
+});
+
+test('toObservation: exact names first, then a changed name takes an answer no name claimed; none is used twice', () => {
+  const ans = subjects => ({ subjects: subjects.map(([name, x]) => ({ name, box_2d: [100, x, 200, x + 100] })) });
+  const xs = o => o.subjects.map(s => [s.name, s.box ? Math.round(s.box.xmin * 1000) : null]);
+  // The analyst renamed one subject and answered it first.
+  assert.deepEqual(xs(toObservation(ans([['bike', 100], ['wall', 500]]), ['wall', 'red bicycle'])), [['wall', 500], ['red bicycle', 100]]);
+  // A name listed twice pairs by occurrence.
+  assert.deepEqual(xs(toObservation(ans([['tree', 100], ['tree', 700]]), ['tree', 'tree'])), [['tree', 100], ['tree', 700]]);
+  // Fewer answers than names: the rest have no box.
+  assert.deepEqual(xs(toObservation(ans([['tree', 100]]), ['tree', 'large tree'])), [['tree', 100], ['large tree', null]]);
+});
+
 test('encoder: measured feedback drives the loop to the goal', async () => {
   const calls = [];
   const events = [];
@@ -102,10 +138,143 @@ test('encoder: the optimiser sees at most historySize entries', async () => {
   assert.ok(sizes.length >= 3 && sizes.every(n => n <= 5), JSON.stringify(sizes));
 });
 
-test('encoder: stops on plateau when the optimiser makes no progress', async () => {
-  const r = await encode({ target, models: ['acme/alpha'], renderer: mockRenderer(), analyst: mockAnalyst([], { stuck: true }), budgetUSD: 2, population: 2, maxGenerations: 10, plateau: 2 });
+test('encoder: stops on plateau when the optimiser makes no progress, measuring no draft twice', async () => {
+  const log = [];
+  const r = await encode({ target, models: ['acme/alpha'], renderer: mockRenderer(log), analyst: mockAnalyst([], { stuck: true }), budgetUSD: 2, population: 2, maxGenerations: 10, plateau: 2 });
   assert.equal(r.stopReason, 'plateau');
-  assert.equal(r.generations.length, 3);
+  assert.ok(r.generations.length <= 3, String(r.generations.length));
+  const prompts = r.candidates.map(c => c.draft.prompt);
+  assert.equal(new Set(prompts).size, prompts.length, 'each draft is measured once');
+  assert.equal(log.length, prompts.length * 2, 'two seeds per unique draft');
+});
+
+test('encoder: repeated drafts are skipped and the optimiser is asked once for the rest', async () => {
+  const calls = [];
+  const base = mockAnalyst(calls, { step: 0.5 });
+  let first = true;
+  const analyst = { ...base, async propose(t, ctx) {
+    const r = await base.propose(t, ctx);
+    if (first && ctx.scope.kind === 'core') { first = false; return { ...r, value: [ctx.history[0].draft, r.value[0], r.value[0], r.value[1]] }; }
+    // The top-up sees the note about repeats and writes new variations.
+    if (/repeated/.test(ctx.notes)) return { ...r, value: r.value.map(d => ({ ...d, prompt: `${d.prompt} (variation)` })) };
+    return r;
+  } };
+  const r = await encode({ target, models: ['acme/alpha'], renderer: mockRenderer(), analyst, budgetUSD: 2, population: 4, maxGenerations: 2, goal: 2 });
+  const proposals = calls.filter(c => c[0] === 'propose');
+  assert.equal(proposals.length, 2, 'one proposal plus one top-up for the repeats');
+  assert.equal(proposals[1][4], 2, 'the top-up asks for the two missing drafts');
+  const gen1 = r.candidates.filter(c => c.generation === 1);
+  assert.equal(gen1.length, 4);
+  const prompts = r.candidates.map(c => c.draft.prompt);
+  assert.equal(new Set(prompts).size, prompts.length);
+});
+
+test('encoder: no top-up when the optimiser wrote fewer drafts without repeats', async () => {
+  const calls = [];
+  const base = mockAnalyst(calls, { step: 0.5 });
+  const analyst = { ...base, async propose(t, ctx) { const r = await base.propose(t, ctx); return { ...r, value: r.value.slice(0, ctx.n - 1) }; } };
+  const r = await encode({ target, models: ['acme/alpha'], renderer: mockRenderer(), analyst, budgetUSD: 2, population: 4, maxGenerations: 3, goal: 2 });
+  const proposals = calls.filter(c => c[0] === 'propose');
+  assert.equal(proposals.length, 2, 'one proposal per generation after the first');
+  assert.ok(proposals.every(c => c[4] === 4));
+  assert.ok(!r.spend.some(l => l.label.includes('(more)')), 'no extra call is paid for');
+  assert.deepEqual(r.generations.map(g => g.candidates.length), [4, 3, 3]);
+});
+
+test('encoder: the top-up asks only for the repeats, and only when the drafts in hand stay affordable', async () => {
+  const calls = [];
+  const base = mockAnalyst(calls, { step: 0.5 });
+  // Three of four: one new draft, one repeat of a measured draft, one repeat within the answer.
+  const analyst = { ...base, async propose(t, ctx) {
+    const r = await base.propose(t, ctx);
+    return /repeated/.test(ctx.notes) ? { ...r, value: r.value.map(d => ({ ...d, prompt: `${d.prompt} (variation)` })) } : { ...r, value: [r.value[0], ctx.history[0].draft, r.value[0]] };
+  } };
+  await encode({ target, models: ['acme/alpha'], renderer: mockRenderer(), analyst, budgetUSD: 2, population: 4, maxGenerations: 2, goal: 2 });
+  assert.deepEqual(calls.filter(c => c[0] === 'propose').map(c => c[4]), [4, 2], 'two repeats, two asked for');
+  // Spent before the proposal: the target 0.001, describe 0.002, two candidates 2 × 0.022; the proposal 0.002.
+  // What is left then pays for a top-up (0.002) and one candidate (0.024), not for the draft in hand as well: no top-up.
+  const tight = [];
+  const budgetUSD = 0.001 + 0.002 + 2 * 0.022 + 0.002 + (0.002 + 0.024) + 0.001;
+  const r = await encode({ target, models: ['acme/alpha'], renderer: mockRenderer(), analyst: { ...analyst, async propose(t, ctx) { tight.push(ctx.n); return analyst.propose(t, ctx); } }, budgetUSD, population: 2, maxGenerations: 2, goal: 2 });
+  assert.deepEqual(tight, [2], String(r.spent));
+  assert.equal(r.generations.at(-1).candidates.length, 1, 'the draft in hand is measured');
+});
+
+test('encoder: a failed top-up leaves the drafts in hand; the run goes on', async () => {
+  const base = mockAnalyst([], { step: 0.2 });
+  const events = [];
+  const analyst = { ...base, async propose(t, ctx) {
+    if (/repeated/.test(ctx.notes)) throw new Error("The analyst's answer was cut off");
+    const r = await base.propose(t, ctx);
+    return { ...r, value: [ctx.history[0].draft, ...r.value.slice(1)] };
+  } };
+  const r = await encode({ target, models: ['acme/alpha'], renderer: mockRenderer(), analyst, budgetUSD: 5, population: 4, maxGenerations: 5, plateau: 9, goal: 2, onEvent: e => events.push(e) });
+  assert.equal(r.stopReason, 'generations');
+  assert.equal(r.error, null);
+  assert.equal(r.generations.length, 5);
+  assert.ok(r.generations.slice(1).every(g => g.candidates.length === 3), 'the three fresh drafts are measured');
+  assert.ok(events.some(e => e.type === 'log' && /asking for more descriptions failed \(The analyst's answer was cut off\); going on with 3/.test(e.message)));
+});
+
+test('encoder: an error ends the run with the best so far, its message in the result and the log', async () => {
+  const base = mockAnalyst([], { step: 0.2 });
+  let n = 0;
+  const analyst = { ...base, async propose(t, ctx) { if (++n === 2) throw new Error('Chat completion failed (HTTP 500): engine crashed'); return base.propose(t, ctx); } };
+  const events = [];
+  const r = await encode({ target, models: ['acme/alpha'], renderer: mockRenderer(), analyst, budgetUSD: 2, population: 2, maxGenerations: 9, goal: 2, onEvent: e => events.push(e) });
+  assert.equal(r.stopReason, 'error');
+  assert.equal(r.error, 'Chat completion failed (HTTP 500): engine crashed');
+  assert.equal(r.generations.length, 2);
+  assert.deepEqual(events.filter(e => e.type === 'log').map(e => e.message), ['Stopped: Chat completion failed (HTTP 500): engine crashed']);
+});
+
+test('encoder: a cancel during an analyst call stops as canceled, not as an error', async () => {
+  for (const at of ['describe', 'propose', 'top-up']) {
+    const ac = new AbortController();
+    const base = mockAnalyst([], { step: 0.2 });
+    const pending = signal => new Promise((_, reject) => { signal.addEventListener('abort', () => reject(new Error('Canceled'))); queueMicrotask(() => ac.abort()); });
+    const analyst = { ...base,
+      async describe(t, n, ctx) { return at === 'describe' ? pending(ctx.signal) : base.describe(t, n, ctx); },
+      async propose(t, ctx) {
+        if (at === 'propose' || /repeated/.test(ctx.notes)) return pending(ctx.signal);
+        const r = await base.propose(t, ctx);
+        return at === 'top-up' ? { ...r, value: [ctx.history[0].draft, ...r.value.slice(1)] } : r;
+      } };
+    const run = encode({ target, models: ['acme/alpha'], renderer: mockRenderer(), analyst, budgetUSD: 2, population: 2, maxGenerations: 9, goal: 2, signal: ac.signal });
+    if (at === 'describe') { await assert.rejects(run, e => e.stopReason === 'canceled', at); continue; }
+    const r = await run;
+    assert.equal(r.stopReason, 'canceled', at);
+    assert.equal(r.error, null, at);
+  }
+});
+
+test('encoder: renders and inspections have their own slots, so waiting inspections never hold up renders', async () => {
+  // Like a local server: an inspection is answered only once the image engine has no renders left.
+  // With one shared pool, the inspections would hold every slot and the renders they wait for never start.
+  let rendering = 0, renders = 0, inspecting = 0, maxRendering = 0, maxInspecting = 0, stalled = 0;
+  const base = mockRenderer();
+  const renderer = { ...base, async render(req) {
+    maxRendering = Math.max(maxRendering, ++rendering);
+    await new Promise(r => setTimeout(r, 2));
+    rendering--; renders++;
+    return base.render(req);
+  } };
+  const a = mockAnalyst([], { step: 0.5 });
+  const analyst = { ...a, async inspect(image, subjects, ctx) {
+    if (!subjects) return a.inspect(image, subjects, ctx);
+    maxInspecting = Math.max(maxInspecting, ++inspecting);
+    const until = Date.now() + 1000;
+    while (renders % 6 && Date.now() < until) await new Promise(r => setTimeout(r, 1));
+    if (renders % 6) stalled++;
+    await new Promise(r => setTimeout(r, 1));
+    inspecting--;
+    return a.inspect(image, subjects, ctx);
+  } };
+  const r = await encode({ target, models: ['acme/alpha'], renderer, analyst, budgetUSD: 2, population: 3, seeds: [1, 2], maxGenerations: 2, goal: 2, concurrency: 2 });
+  assert.equal(r.candidates.length, 6);
+  assert.equal(stalled, 0, 'no inspection waited for renders that could not start');
+  assert.equal(maxRendering, 2, 'at most two renders at once');
+  assert.equal(maxInspecting, 2, 'at most two inspections at once');
 });
 
 test('encoder: never exceeds the budget; refuses to start when it cannot cover one round', async () => {
@@ -186,6 +355,10 @@ test('encoder helpers', () => {
   const o = toObservation({ subjects: [{ name: 'earth', box_2d: [461, 492, 573, 645] }, { name: 'bad', box_2d: [5, 5, 1, 1] }], horizon_y: 805, camera: 'wide' }, ['Earth', 'ground']);
   assert.deepEqual(o.subjects.map(s => s.name), ['Earth', 'ground']);
   assert.ok(Math.abs(o.subjects[0].box.xmin - 0.492) < 1e-9 && o.subjects[1].box === null && Math.abs(o.horizon - 0.805) < 1e-9);
+  // Qwen's order: bbox_2d [x1, y1, x2, y2] gives the same box.
+  const q = toObservation({ subjects: [{ name: 'earth', bbox_2d: [492, 461, 645, 573] }, { name: 'ground', box_2d: [0, 735, 1000, 1000] }] }, ['Earth', 'ground'], 'xy');
+  assert.deepEqual(q.subjects[0].box, o.subjects[0].box);
+  assert.equal(q.subjects[1].box, null, 'the other field name is not read');
   const flux = (id, aliases) => ({ id, family: 'flux', aliases });
   assert.deepEqual(refinementTargets([flux('bfl/flux-schnell', ['flux-schnell']), { id: 'sai/sdxl', family: 'sdxl', aliases: [] }]), { 'bfl/flux-schnell': 'flux', 'sai/sdxl': 'sdxl' });
   const doc = buildDocument({ prompt: 'x', style: [], avoid: [] }, { 'bfl/flux-schnell': ['y'] }, { 'bfl/flux-schnell': 'flux' }, ['bfl/flux-schnell'], '3:2');

@@ -16,7 +16,6 @@ export interface Diagnostic {
 /** The 25 code points with the Unicode White_Space property, as a regex class body. */
 export const WS_CLASS = '\\t\\n\\v\\f\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000';
 export const WS_ONLY_RE = new RegExp(`^[${WS_CLASS}]*$`);
-const TRIM_RE = new RegExp(`^[${WS_CLASS}]+|[${WS_CLASS}]+$`, 'g');
 export const LEADING_WS_RE = new RegExp(`^[${WS_CLASS}]*`);
 
 export const KEY_SRC = '[a-z0-9][a-z0-9_-]*(?:\\.[a-z0-9][a-z0-9_-]*)*(?:/[a-z0-9][a-z0-9_-]*)?';
@@ -29,8 +28,26 @@ export const STANDARD_KEYS: readonly string[] = ['prompt', 'style', 'avoid', 'mo
 export const SINGLE_VALUED: ReadonlySet<string> = new Set(['aspect', 'mode', 'strength', 'seed', 'source', 'preview', 'animate']);
 export const RASTER_TYPES: ReadonlySet<string> = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/avif']);
 
+/** One of the WS_CLASS code points (all in the BMP, so one UTF-16 code unit each). */
+export function isJaiSpace(c: number): boolean {
+  return (c >= 0x09 && c <= 0x0d) || c === 0x20 || c === 0x85 || c === 0xa0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) ||
+    c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000;
+}
+/** ASCII whitespace as HTML and the URL standard define it: tab, LF, FF, CR, space. */
+export const isAsciiSpace = (c: number): boolean => c === 0x09 || c === 0x0a || c === 0x0c || c === 0x0d || c === 0x20;
+/**
+ * s without the leading (unless `start` is false) and trailing UTF-16 code
+ * units that `strip` accepts. A loop, not `/^[…]+|[…]+$/g`: a regex retries
+ * `[…]+$` from every position of an inner run, in time quadratic in its length.
+ */
+export function trimBy(s: string, strip: (c: number) => boolean, start = true): string {
+  let i = 0, j = s.length;
+  if (start) while (i < j && strip(s.charCodeAt(i))) i++;
+  while (j > i && strip(s.charCodeAt(j - 1))) j--;
+  return i === 0 && j === s.length ? s : s.slice(i, j);
+}
 /** Trim exactly the JAI whitespace code points. */
-export function trim(s: string): string { return s.replace(TRIM_RE, ''); }
+export function trim(s: string): string { return trimBy(s, isJaiSpace); }
 /** ASCII lowercase only (never locale-sensitive). */
 export function asciiLower(s: string): string { return s.replace(/[A-Z]/g, c => String.fromCharCode(c.charCodeAt(0) + 32)); }
 export function isKey(s: string): boolean { return KEY_RE.test(s); }

@@ -73,7 +73,35 @@ function iou(a: Box, b: Box): number {
 }
 const pct = (x: number): string => `${Math.round(Math.abs(x) * 100)}%`;
 const times = (lnRatio: number): string => `${Math.exp(Math.abs(lnRatio)).toFixed(1)}×`;
-const same = (a: string, b: string): boolean => a.trim().toLowerCase() === b.trim().toLowerCase();
+/**
+ * Same phrase, or one phrase's words all within the other's ("photograph" and
+ * "digital photograph"). For the medium and the light only: subjects pair by
+ * exact name (subjectPairs), since "tree" and "large tree" are two subjects.
+ */
+const same = (a: string, b: string): boolean => {
+  const words = (x: string): string[] => x.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  const wa = words(a), wb = words(b);
+  if (!wa.length || !wb.length) return wa.length === wb.length;
+  const [short, long] = wa.length <= wb.length ? [wa, new Set(wb)] : [wb, new Set(wa)];
+  return short.every(w => long.has(w));
+};
+
+/** A subject name as inspections compare it: case and spacing do not count. */
+export const subjectKey = (name: string): string => name.trim().replace(/\s+/g, ' ').toLowerCase();
+
+/**
+ * The render's box for each target subject that has one, in target order. A
+ * render's subjects carry the target's names (toObservation keeps them), so they
+ * pair by exact name; a name the target lists twice pairs by occurrence.
+ */
+function subjectPairs(target: Observation, render: Observation): Array<{ name: string; target: Box; render: Box | null }> {
+  const boxes = new Map<string, Array<Box | null>>();
+  for (const s of render.subjects) {
+    const k = subjectKey(s.name);
+    boxes.set(k, [...(boxes.get(k) ?? []), s.box]);
+  }
+  return target.subjects.flatMap(t => (t.box ? [{ name: t.name, target: t.box, render: boxes.get(subjectKey(t.name))?.shift() ?? null }] : []));
+}
 
 /**
  * Compare a render's observation with the target's (and, when given, their
@@ -85,30 +113,28 @@ export function measure(target: Observation, render: Observation, thumbs?: { tar
   // Each difference contributes weight × error; the feedback lists them largest first.
   const items: Array<{ w: number; error: number; text: string | null }> = [];
   const subjects: SubjectMeasure[] = [];
-  for (const t of target.subjects) {
-    if (!t.box) continue;
-    const w = area(t.box) > 0.4 ? 0.5 : 1;
-    const r = render.subjects.find(s => same(s.name, t.name))?.box ?? null;
+  for (const { name, target: tb, render: r } of subjectPairs(target, render)) {
+    const w = area(tb) > 0.4 ? 0.5 : 1;
     if (!r || area(r) <= 0) {
-      subjects.push({ name: t.name, present: false, dx: 0, dy: 0, sw: 0, sh: 0, iou: 0, error: 1 });
-      items.push({ w, error: 1, text: `${t.name}: missing` });
+      subjects.push({ name, present: false, dx: 0, dy: 0, sw: 0, sh: 0, iou: 0, error: 1 });
+      items.push({ w, error: 1, text: `${name}: missing` });
       continue;
     }
-    const tw = Math.max(1e-3, t.box.xmax - t.box.xmin), th = Math.max(1e-3, t.box.ymax - t.box.ymin);
+    const tw = Math.max(1e-3, tb.xmax - tb.xmin), th = Math.max(1e-3, tb.ymax - tb.ymin);
     const rw = Math.max(1e-3, r.xmax - r.xmin), rh = Math.max(1e-3, r.ymax - r.ymin);
-    const dx = (r.xmin + r.xmax) / 2 - (t.box.xmin + t.box.xmax) / 2;
-    const dy = (r.ymin + r.ymax) / 2 - (t.box.ymin + t.box.ymax) / 2;
+    const dx = (r.xmin + r.xmax) / 2 - (tb.xmin + tb.xmax) / 2;
+    const dy = (r.ymin + r.ymax) / 2 - (tb.ymin + tb.ymax) / 2;
     const sw = Math.log(rw / tw), sh = Math.log(rh / th);
-    const o = iou(t.box, r);
+    const o = iou(tb, r);
     // Gentle enough to separate near misses: position in frame fractions, size as log ratios, overlap a little.
     const error = Math.min(1, 1.2 * (Math.abs(dx) + Math.abs(dy)) + 0.35 * (Math.abs(sw) + Math.abs(sh)) + 0.15 * (1 - o));
-    subjects.push({ name: t.name, present: true, dx, dy, sw, sh, iou: o, error });
+    subjects.push({ name, present: true, dx, dy, sw, sh, iou: o, error });
     const says: string[] = [];
     if (Math.abs(sw) > 0.15) says.push(`${times(sw)} too ${sw > 0 ? 'wide' : 'narrow'}`);
     if (Math.abs(sh) > 0.15) says.push(`${times(sh)} too ${sh > 0 ? 'tall' : 'short'}`);
     if (Math.abs(dx) > 0.04) says.push(`${pct(dx)} of the frame too far ${dx > 0 ? 'right' : 'left'}`);
     if (Math.abs(dy) > 0.04) says.push(`${pct(dy)} of the frame too ${dy > 0 ? 'low' : 'high'}`);
-    items.push({ w, error, text: says.length ? `${t.name}: ${says.join(', ')}` : null });
+    items.push({ w, error, text: says.length ? `${name}: ${says.join(', ')}` : null });
   }
   let horizon: number | null = null;
   if (target.horizon !== null) {

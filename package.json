@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test test/*.test.mjs && npm run conformance",
     "conformance": "node scripts/conformance.mjs",
-    "package": "npm run build && node scripts/package.mjs"
+    "package": "npm run build && node scripts/package.mjs",
+    "studio:windows": "bash studio/scripts/build-windows.sh"
   },
   "engines": {
     "node": ">=20.9"

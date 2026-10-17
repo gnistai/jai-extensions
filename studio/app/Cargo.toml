@@ -1,0 +1,80 @@
+[package]
+name = "jai"
+description = "JAI Studio: the JAI command-line tool, desktop app, tray service and local model server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+default-run = "jai"
+
+[[bin]]
+name = "jai"
+path = "src/main.rs"
+
+[features]
+default = ["gui", "custom-protocol"]
+# The desktop app (window, tray, single instance). Without it: a headless CLI and server.
+gui = [
+    "dep:tauri",
+    "dep:tauri-build",
+    "dep:tauri-plugin-single-instance",
+    "dep:tauri-plugin-dialog",
+    "dep:tauri-plugin-notification",
+]
+# Embed the frontend (dist/studio/ui) in the exe instead of loading a dev URL.
+custom-protocol = ["tauri?/custom-protocol"]
+
+[dependencies]
+jai-core.workspace = true
+jai-engines.workspace = true
+jai-js.workspace = true
+# QuickJS assertions stay on in jai-js's own tests (they catch leaks); in the exe a failed
+# assertion would abort the whole app, server and engines included.
+rquickjs = { workspace = true, features = ["disable-assertions"] }
+jai-server.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+futures.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tauri = { workspace = true, optional = true }
+tauri-plugin-dialog = { workspace = true, optional = true }
+tauri-plugin-notification = { workspace = true, optional = true }
+tauri-plugin-single-instance = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# On top of the workspace features: ShellExecuteW and MessageBoxW
+# (WindowsAndMessaging), GetSystemDirectoryW and GetLocalTime
+# (SystemInformation), the clipboard (DataExchange, Memory), and
+# WinVerifyTrust with the signer's certificate name for the VC++ installer
+# (WinTrust, Cryptography with Catalog and Sip).
+windows-sys = { workspace = true, features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_SystemInformation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_Security_WinTrust",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+] }
+# A private folder with a random name for the downloaded VC++ installer.
+tempfile.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[build-dependencies]
+tauri-build = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true

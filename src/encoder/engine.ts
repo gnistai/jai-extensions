@@ -81,6 +81,12 @@ const SHORT_WINDOW_WORDS = 55;
 /** A finite number, else the default (options may come from untrusted forms or flags). */
 const fin = (v: number | undefined, d: number): number => (typeof v === 'number' && Number.isFinite(v) ? v : d);
 
+/** An error's message; providers may throw errors from another realm, or non-errors. */
+const messageOf = (e: unknown): string => {
+  const m = (e as { message?: unknown } | null)?.message;
+  return typeof m === 'string' ? m : String(e);
+};
+
 class Stop extends Error { constructor(readonly reason: StopReason, message: string = reason) { super(message); } }
 
 export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
@@ -98,7 +104,11 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
   const refine = opts.refine ?? opts.models.length > 1;
   const refineShare = refine ? Math.min(0.9, Math.max(0, fin(opts.refineShare, 0.2))) : 0;
   const refineTries = Math.max(1, Math.floor(fin(opts.refineTries, 3)));
-  const limit = pool(Math.max(1, Math.floor(fin(opts.concurrency, 4))));
+  // Renders and inspections each get their own slots: a render that finished
+  // never waits for an inspection slot to free a render slot, so both kinds keep
+  // flowing, and a local server never holds more than a few requests of a kind.
+  const slots = Math.max(1, Math.floor(fin(opts.concurrency, 4)));
+  const renderSlot = pool(slots), inspectSlot = pool(slots);
   const budget = new Budget(opts.budgetUSD);
   const ceilingA = opts.budgetUSD * (1 - refineShare);
   const analyst = opts.analyst;
@@ -144,6 +154,8 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
       return r;
     } catch (e) {
       hold.charge(kind, label, who.costHint);
+      // A cancel makes the provider call fail: report it as the cancel it is.
+      if (opts.signal?.aborted) throw new Stop('canceled');
       throw e;
     } finally { hold.release(); spend(); }
   }
@@ -154,42 +166,56 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
     const doc = buildDocument(c.draft, c.refinements, targets, opts.models, aspect);
     const names = targetObs!.subjects.filter(x => x.box).map(x => x.name);
     let broken = false;
-    try {
-      const tasks = models.flatMap(model => seeds.map(seed => limit(async (): Promise<ScoredRender> => {
-        if (opts.signal?.aborted) throw new Stop('canceled');
-        if (broken) throw new Stop('error', 'An earlier render in this batch failed unexpectedly.');
+    /** Before each request: stop on a cancel, or when another task of this batch failed unexpectedly. */
+    const proceed = (): void => {
+      if (opts.signal?.aborted) throw new Stop('canceled');
+      if (broken) throw new Stop('error', 'An earlier render in this batch failed unexpectedly.');
+    };
+    /** One render and its inspection, each in its own slot. */
+    const task = async (model: string, seed: number): Promise<ScoredRender> => {
+      const m = all.find(x => x.id === model)!;
+      const rendered = await renderSlot(async (): Promise<{ result: RenderResult } | { error: string }> => {
+        proceed();
         const it = interpret(doc, { catalog, selected: model }).interpreted;
-        const m = all.find(x => x.id === model)!;
-        let result: RenderResult | null = null;
         try {
-          result = await opts.renderer.render({
+          const result = await opts.renderer.render({
             intent: { description: it.modelDescription, style: it.modelStyle, avoid: it.modelAvoid, aspect: it.aspect ? { width: it.aspect.width, height: it.aspect.height } : null, mode: 'generate', strength: null, seed: String(seed), animate: false },
             modelId: model, inputImage: null, governingRatio: null, target: null, signal: opts.signal,
           });
+          hold.charge('render', `${c.id} ${model}`, m.costHint);
+          return { result };
         } catch (e) {
           // The job may have run even if it failed or was canceled: charge it either way.
           hold.charge('render', `${c.id} ${model} (${opts.signal?.aborted ? 'canceled' : 'failed'})`, m.costHint);
           if (opts.signal?.aborted) throw new Stop('canceled');
-          return { model, seed, result: null, error: (e as Error).message, observation: null, measure: null, score: 0 };
+          return { error: messageOf(e) };
         }
-        hold.charge('render', `${c.id} ${model}`, m.costHint);
-        let observation: Observation;
+      });
+      if ('error' in rendered) return { model, seed, result: null, error: rendered.error, observation: null, measure: null, score: 0 };
+      const { result } = rendered;
+      const inspected = await inspectSlot(async (): Promise<{ observation: Observation } | { error: string }> => {
+        proceed();
         try {
           const r = await analyst.inspect(imageOf(result), names, { ...ctx });
           hold.charge('inspect', `${c.id} ${model}`, r.cost);
-          observation = r.value;
+          return { observation: r.value };
         } catch (e) {
           hold.charge('inspect', `${c.id} ${model} (failed)`, analyst.costHint);
           if (opts.signal?.aborted) throw new Stop('canceled');
-          return { model, seed, result, error: `Inspection failed: ${(e as Error).message}`, observation: null, measure: null, score: 0 };
+          return { error: `Inspection failed: ${messageOf(e)}` };
         }
-        let thumbs: { target: Thumbnail; render: Thumbnail } | null = null;
-        if (opts.thumbnail && opts.targetThumbnail) {
-          try { thumbs = { target: opts.targetThumbnail, render: await opts.thumbnail(result) }; } catch { thumbs = null; }
-        }
-        const ms = measure(targetObs!, observation, thumbs);
-        return { model, seed, result, error: null, observation, measure: ms, score: ms.fitness };
-      }).catch(e => { broken = true; throw e; })));
+      });
+      if ('error' in inspected) return { model, seed, result, error: inspected.error, observation: null, measure: null, score: 0 };
+      const { observation } = inspected;
+      let thumbs: { target: Thumbnail; render: Thumbnail } | null = null;
+      if (opts.thumbnail && opts.targetThumbnail) {
+        try { thumbs = { target: opts.targetThumbnail, render: await opts.thumbnail(result) }; } catch { thumbs = null; }
+      }
+      const ms = measure(targetObs!, observation, thumbs);
+      return { model, seed, result, error: null, observation, measure: ms, score: ms.fitness };
+    };
+    try {
+      const tasks = models.flatMap(model => seeds.map(seed => task(model, seed).catch(e => { broken = true; throw e; })));
       // Wait for every task, so that nothing keeps running or goes uncharged after a failure.
       const settled = await Promise.allSettled(tasks);
       const failed = settled.find((r): r is PromiseRejectedResult => r.status === 'rejected');
@@ -224,6 +250,14 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
     return [labels[model] ?? model, cut + (r?.measure ? r.measure.feedback : `render failed${r?.error ? ` (${r.error})` : ''}`)];
   }));
   const top = (h: HistoryEntry[]): HistoryEntry[] => [...h].sort((a, b) => b.fitness - a.fitness).slice(0, historySize);
+  /** An identical draft renders identically with the fixed seeds, so it is measured once per lineage. */
+  const draftKey = (d: Draft): string => [d.prompt, d.style.join(','), d.avoid.join(',')].map(x => x.toLowerCase().replace(/\s+/g, ' ').trim()).join('\u0000');
+  /** The drafts not measured yet (keys not in `seen`), without repeats. */
+  const fresh = (drafts: Draft[], seen: Set<string>): Draft[] => {
+    const keys = new Set(seen);
+    return drafts.filter(d => { const k = draftKey(d); if (keys.has(k)) return false; keys.add(k); return true; });
+  };
+  const usable = (v: Draft[] | string[]): Draft[] => (v as Draft[]).filter(d => d && typeof d.prompt === 'string');
 
   try {
     // Measure the target once (careful), the yardstick for every render in every lineage.
@@ -242,15 +276,16 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
       if (!first.value.length) throw new Stop('error', 'The analyst wrote no usable description.');
       emit({ type: 'phase', phase: 'evolve', lineage });
       const history: HistoryEntry[] = [];
+      const seen = new Set<string>();
       let notes = first.notes;
       let lineBest: Candidate | null = null;
       let stale = 0;
-      let drafts: Draft[] = first.value;
+      let drafts: Draft[] = fresh(first.value, seen);
       let reason: StopReason = 'generations';
       for (let gen = 0; gen < maxGenerations; gen++) {
         let next: Candidate[];
         try { next = await evaluateAll(drafts, lineage, gen, ceiling); } catch (e) { if (e instanceof Stop && e.reason === 'budget') { reason = 'budget'; break; } throw e; }
-        for (const c of next) history.push({ draft: c.draft, fitness: c.fitness, feedback: feedbackOf(c) });
+        for (const c of next) { history.push({ draft: c.draft, fitness: c.fitness, feedback: feedbackOf(c) }); seen.add(draftKey(c.draft)); }
         const genTop = next.reduce((a, b) => (b.fitness > a.fitness ? b : a));
         const gain = lineBest ? genTop.fitness - lineBest.fitness : Infinity;
         if (!lineBest || genTop.fitness > lineBest.fitness) lineBest = genTop;
@@ -264,8 +299,23 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
         if (!budget.canAfford(optimiser.costHint + evalCost(opts.models), ceiling)) { reason = 'budget'; break; }
         const reply = await call(optimiser, () => optimiser.propose(opts.target, { ...ctx, targetObservation: targetObs!, history: top(history), notes, n: population, scope: { kind: 'core' } }), 'analyst', `propose l${lineage}g${gen + 1}`, ceiling);
         if (reply.notes) notes = reply.notes;
-        drafts = (reply.value as Draft[]).filter(d => d && typeof d.prompt === 'string');
-        if (!drafts.length) { emit({ type: 'log', message: `Lineage ${lineage}: the optimiser wrote no usable description.` }); reason = 'error'; break; }
+        const proposed = usable(reply.value);
+        if (!proposed.length) { emit({ type: 'log', message: `Lineage ${lineage}: the optimiser wrote no usable description.` }); reason = 'error'; break; }
+        drafts = fresh(proposed, seen);
+        // Repeats of descriptions already measured were dropped: ask once more for
+        // as many, when the budget still covers the drafts in hand and one more.
+        const repeats = Math.min(population - drafts.length, proposed.length - drafts.length);
+        if (repeats > 0 && budget.canAfford(optimiser.costHint + evalCost(opts.models) * (drafts.length + 1), ceiling)) {
+          try {
+            const more = await call(optimiser, () => optimiser.propose(opts.target, { ...ctx, targetObservation: targetObs!, history: top(history), notes: `${notes}\nSome of your last descriptions repeated ones already measured; write different ones.`.trim(), n: repeats, scope: { kind: 'core' } }), 'analyst', `propose l${lineage}g${gen + 1} (more)`, ceiling);
+            drafts = [...drafts, ...fresh(usable(more.value), new Set([...seen, ...drafts.map(draftKey)]))].slice(0, population);
+          } catch (e) {
+            // The top-up is optional: a cancel, the time limit or the budget still stop the run; any other failure only leaves the drafts in hand.
+            if (e instanceof Stop || e instanceof BudgetExceeded) throw e;
+            emit({ type: 'log', message: `Lineage ${lineage}: asking for more descriptions failed (${messageOf(e)}); going on with ${drafts.length}.` });
+          }
+        }
+        if (!drafts.length) { emit({ type: 'log', message: `Lineage ${lineage}: the optimiser only repeated descriptions already measured.` }); reason = 'plateau'; break; }
       }
       stopReason = reason;
     }
@@ -307,14 +357,18 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
       }
     }
   } catch (e) {
-    if (e instanceof Stop) { stopReason = e.reason; if (e.reason === 'error' || e.message !== e.reason) error = e.message; }
+    // Whatever failed once the run was canceled failed because of the cancel.
+    if (opts.signal?.aborted) stopReason = 'canceled';
+    else if (e instanceof Stop) { stopReason = e.reason; if (e.reason === 'error' || e.message !== e.reason) error = e.message; }
     else if (e instanceof BudgetExceeded) stopReason = 'budget';
-    else { stopReason = 'error'; error = (e as Error).message; }
+    else { stopReason = 'error'; error = messageOf(e); }
     if (!best) {
       const err = new Error(error ?? `Stopped before any candidate was scored (${stopReason})`) as Error & { stopReason?: StopReason; spent?: number };
       err.stopReason = stopReason; err.spent = budget.spent;
       throw err;
     }
+    // The run ends with its best so far; say why in the log too, which every app shows as it happens.
+    if (error) emit({ type: 'log', message: `Stopped: ${error}` });
   }
 
   emit({ type: 'phase', phase: 'done' });

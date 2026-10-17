@@ -1,0 +1,25 @@
+# cargo-about configuration for JAI Studio's third-party notices
+# (studio/scripts/notices.sh). Order is preference: for a crate offered under
+# several licences, the first one listed here is used.
+accepted = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "BSL-1.0",
+    "0BSD",
+    "CC0-1.0",
+    "Unlicense",
+    "MPL-2.0",
+    "OpenSSL",
+    "CDLA-Permissive-2.0",
+]
+# Build and test tools never reach the executable.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true

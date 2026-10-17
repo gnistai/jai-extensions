@@ -191,7 +191,12 @@ export interface EncodeOptions {
   /** Additions tried per lagging model and round (default 3). */
   refineTries?: number;
   timeLimitMs?: number;
-  /** Renders and inspections run at once (default 4). */
+  /**
+   * Renders run at most this many at once, and so do inspections, each kind in
+   * its own slots (default 4). Against a local server that queues each kind for
+   * its own engine, a few of each keep both engines busy while every request
+   * waits only for those ahead of it, not for a whole generation.
+   */
   concurrency?: number;
   signal?: AbortSignal;
   onEvent?: (e: EncodeEvent) => void;

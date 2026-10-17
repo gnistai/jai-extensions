@@ -34,3 +34,26 @@ test('matchModel only ever returns catalog models', () => {
   assert.equal(J.matchModel(['stable-diffusion-xl-base-1.0'], { catalog, families: fam }).model.id, 'stability-ai/sdxl');
   assert.equal(J.matchModel(['some-user/exfiltrator'], { catalog, families: fam }).diagnostics.at(-1).code, 'no-matching-model');
 });
+
+test('trim removes exactly the 25 White_Space code points from both ends', () => {
+  const ws = new RegExp(`^[${J.WS_CLASS}]$`);
+  for (let c = 0; c < 0x10000; c++) {
+    const ch = String.fromCharCode(c);
+    assert.equal(J.trim(`${ch}${ch}a${ch}b${ch}`), ws.test(ch) ? `a${ch}b` : `${ch}${ch}a${ch}b${ch}`, c.toString(16));
+  }
+});
+
+test('validate: newline-assignment is found, and long runs of whitespace cannot make validation slow', () => {
+  const codes = prompt => J.validate(J.fromObject({ prompt })).map(d => d.code);
+  assert.ok(codes('a castle\n  style = ink').includes('newline-assignment'));
+  assert.ok(codes('a castle\n\n \n\tstyle/en=ink').includes('newline-assignment'));
+  assert.ok(!codes('a castle\n\n\n').includes('newline-assignment'));
+  assert.ok(!codes('a castle\n\n= ink').includes('newline-assignment'));
+  // Regexes that retried a run of whitespace from each of its positions (the
+  // newline-assignment check, trimming) took seconds here, minutes in QuickJS.
+  const started = performance.now();
+  assert.ok(!codes(`a${'\n'.repeat(200000)}b`).includes('newline-assignment'));
+  J.validate(J.readJSON(JSON.stringify({ prompt: `a${' '.repeat(200000)}b` })).document);
+  assert.ok(J.decodeDataURL(`data:image/jai${' '.repeat(100000)}x;base64,${btoa('jai: a castle')}`) !== undefined);
+  assert.ok(performance.now() - started < 1000, `${Math.round(performance.now() - started)} ms`);
+});

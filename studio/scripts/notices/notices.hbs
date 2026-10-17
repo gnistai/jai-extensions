@@ -1,0 +1,26 @@
+Third-party software in JAI Studio
+==================================
+
+JAI Studio contains the open-source packages listed below. For each licence
+it names the packages under it, then gives the licence text with their
+copyright notices. The models and engines that JAI Studio downloads are not
+part of it; they keep their own licences, which the Models tab and
+`jai models status` show.
+
+Licences:
+{{#each overview}}
+  {{{name}}} ({{count}})
+{{/each}}
+
+{{#each licenses}}
+--------------------------------------------------------------------------------
+{{{name}}}
+
+Used by:
+{{#each used_by}}
+  {{{crate.name}}} {{{crate.version}}}{{#if crate.repository}}  {{{crate.repository}}}{{/if}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

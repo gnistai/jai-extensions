@@ -1,12 +1,18 @@
 #!/usr/bin/env node
 // jai: command-line app for JAI (Just AI Images).
-//   jai encode <image>      image -> .jai by analysis by synthesis (Replicate)
-//   jai render <doc>        .jai, JAI text or JSON -> image (Replicate)
+//   jai encode <image>      image -> .jai by analysis by synthesis (Replicate, or JAI Studio with --local)
+//   jai render <doc>        .jai, JAI text or JSON -> image (Replicate, or JAI Studio with --local)
 //   jai validate <doc>      parse, validate and normalise
-// The token comes from REPLICATE_API_TOKEN (or --env <file>); it is never
-// printed or written to reports. Run `npm run build` first.
+// The Replicate token comes from REPLICATE_API_TOKEN (or --env <file>). With
+// --local, the address and token of JAI Studio's local server come from its
+// data folder (studio/DESIGN.md section 2). Tokens are never printed or
+// written to reports. Run `npm run build` first.
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
-import { basename, dirname, extname, join, resolve } from 'node:path';
+import { request } from 'node:http';
+import { isIP } from 'node:net';
+import { homedir } from 'node:os';
+import { basename, dirname, extname, isAbsolute, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
 const HELP = `jai encode <image> [options]
@@ -25,9 +31,18 @@ const HELP = `jai encode <image> [options]
   --out <file.jai>      output file (default <image>.jai)
   --report <dir>        report directory (default <out>.report)
   --force               overwrite an existing output file
-jai render <file.jai | text> [--model <id>] [--out <image>]
+  --local               encode with JAI Studio's local models (FLUX.1 schnell, Qwen3.8 27B) at no
+                        cost; --budget, --analyst and --optimiser do not apply
+  --think <mode>        with --local: when Qwen thinks: off (default), propose or all
+  --scale <f>           with --local: render size factor from 0.25 to 1.25, 1 is about a
+                        megapixel (default 1)
+jai render <file.jai | text> [--model <id>] [--out <image>] [--local]
 jai validate <file.jai | text>
-Common: --env <file>  read REPLICATE_API_TOKEN from a dotenv file`;
+Common: --env <file>  read REPLICATE_API_TOKEN from a dotenv file
+        --local       use the JAI Studio server running on this computer instead of Replicate;
+                      no token needed. It is found through server.json and token in Studio's
+                      data folder: JAI_HOME, else %LOCALAPPDATA%\\JAI on Windows, else
+                      $XDG_DATA_HOME/jai or ~/.local/share/jai`;
 
 const { values: o, positionals } = parseArgs({
   allowPositionals: true,
@@ -35,7 +50,8 @@ const { values: o, positionals } = parseArgs({
     models: { type: 'string' }, model: { type: 'string' }, budget: { type: 'string' }, population: { type: 'string' },
     generations: { type: 'string' }, optimiser: { type: 'string' }, restarts: { type: 'string' }, goal: { type: 'string' }, seeds: { type: 'string' }, analyst: { type: 'string' }, 'no-pixel': { type: 'boolean' },
     'no-refine': { type: 'boolean' }, scores: { type: 'boolean' }, out: { type: 'string' }, report: { type: 'string' },
-    env: { type: 'string' }, force: { type: 'boolean' }, help: { type: 'boolean', short: 'h' },
+    env: { type: 'string' }, force: { type: 'boolean' }, local: { type: 'boolean' }, think: { type: 'string' }, scale: { type: 'string' },
+    help: { type: 'boolean', short: 'h' },
   },
 });
 const [cmd, input] = positionals;
@@ -55,11 +71,84 @@ function token() {
   return t;
 }
 
-function findModel(name) {
+function findModel(name, models = E.REPLICATE_MODELS) {
   const n = name.trim().toLowerCase();
-  const m = E.REPLICATE_MODELS.find(x => x.id === n || x.aliases.includes(n)) ?? E.REPLICATE_MODELS.find(x => x.family === n);
-  if (!m) { console.error(`Unknown model "${name}". Known: ${E.REPLICATE_MODELS.map(x => x.aliases[0] ?? x.id).join(', ')}`); process.exit(2); }
+  const m = models.find(x => x.id === n || x.aliases.includes(n)) ?? models.find(x => x.family === n);
+  if (!m) { console.error(`Unknown model "${name}". Known: ${models.map(x => x.aliases[0] ?? x.id).join(', ')}`); process.exit(2); }
   return m;
+}
+
+/** JAI Studio's data folder: JAI_HOME, else the platform default (studio/DESIGN.md section 2). */
+function studioRoot() {
+  if (process.env.JAI_HOME) return process.env.JAI_HOME;
+  if (process.platform === 'win32') return join(process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local'), 'JAI');
+  const xdg = process.env.XDG_DATA_HOME;
+  return join(xdg && isAbsolute(xdg) ? xdg : join(homedir(), '.local', 'share'), 'jai');
+}
+
+/**
+ * The running JAI Studio server: <root>/server.json and <root>/token. Before
+ * the token goes anywhere, the server there must prove that it holds it:
+ * GET /health?nonce=<random> answers with base64url(HMAC-SHA256(token,
+ * "jai-health:<port>:<nonce>")) (studio/DESIGN.md section 7). server.json
+ * outlives a server that crashed, and another program or user may then listen
+ * on its port; only the nonce is sent to it.
+ */
+async function localServer() {
+  const root = studioRoot();
+  const notRunning = `JAI Studio's server is not running (no server.json in ${root}). Start JAI Studio or run \`jai serve\`.`;
+  let info, key;
+  try { info = JSON.parse(readFileSync(join(root, 'server.json'), 'utf8')); } catch { console.error(notRunning); process.exit(1); }
+  try { key = readFileSync(join(root, 'token'), 'utf8').trim(); } catch { key = ''; }
+  if (!key) { console.error(`Cannot read JAI Studio's token in ${root}.`); process.exit(1); }
+  const port = Number(info?.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) { console.error(notRunning); process.exit(1); }
+  // A wildcard bind is reached through loopback. Only an IP address, never a host name.
+  const host = typeof info.host !== 'string' || !info.host || info.host === '0.0.0.0' ? '127.0.0.1' : info.host === '::' ? '::1' : info.host;
+  if (!isIP(host)) { console.error(notRunning); process.exit(1); }
+  const url = `http://${host.includes(':') ? `[${host}]` : host}:${port}`;
+  const nonce = randomBytes(32).toString('base64url');
+  const health = await fetch(`${url}/health?nonce=${nonce}`, { redirect: 'error', signal: AbortSignal.timeout(5000) })
+    .then(r => (r.ok ? r.json() : null)).catch(() => null);
+  if (health?.name !== 'jai') { console.error(`No JAI Studio server answers at ${url}. Start JAI Studio or run \`jai serve\`.`); process.exit(1); }
+  const expected = Buffer.from(createHmac('sha256', key).update(`jai-health:${port}:${nonce}`).digest('base64url'));
+  const shown = Buffer.from(typeof health.proof === 'string' ? health.proof : '');
+  if (shown.length !== expected.length || !timingSafeEqual(shown, expected)) {
+    console.error(`The server at ${url} did not prove that it holds your JAI Studio token, so the token was not sent. Restart JAI Studio or \`jai serve\`.`);
+    process.exit(1);
+  }
+  return { url, token: key };
+}
+
+/**
+ * fetch for JAI Studio's local server over node:http, without the time limits
+ * of Node's own fetch (undici gives up after 300 s without reply headers).
+ * Studio replies only once the request's engine is free and the job is done;
+ * the providers keep their own limits (DESIGN.md section 9).
+ */
+function localFetch(url, init = {}) {
+  return new Promise((resolve, reject) => {
+    const { signal } = init;
+    const aborted = () => new DOMException('This operation was aborted', 'AbortError');
+    if (signal?.aborted) { reject(aborted()); return; }
+    const fail = e => { signal?.removeEventListener('abort', onAbort); reject(signal?.aborted ? aborted() : new TypeError('fetch failed', { cause: e })); };
+    const req = request(url, { method: init.method ?? 'GET', headers: init.headers }, res => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('error', fail);
+      res.on('end', () => {
+        signal?.removeEventListener('abort', onAbort);
+        if (!res.complete) { fail(Object.assign(new Error('the connection closed before the reply was complete'), { code: 'ECONNRESET' })); return; }
+        const status = res.statusCode ?? 0;
+        const headers = Object.entries(res.headers).flatMap(([k, v]) => (v === undefined ? [] : (Array.isArray(v) ? v : [v]).map(x => [k, x])));
+        resolve(new Response([101, 204, 205, 304].includes(status) ? null : Buffer.concat(chunks), { status, statusText: res.statusMessage, headers }));
+      });
+    });
+    const onAbort = () => req.destroy(aborted());
+    signal?.addEventListener('abort', onAbort, { once: true });
+    req.on('error', fail);
+    req.end(init.body);
+  });
 }
 
 function readDocument(arg) {
@@ -97,16 +186,19 @@ if (cmd === 'validate') {
 
 if (cmd === 'render') {
   const r = readDocument(input);
-  const catalog = E.REPLICATE_MODELS.map(m => ({ id: m.id, aliases: m.aliases, family: m.family, imageInput: m.imageInput, default: m.id === 'black-forest-labs/flux-schnell' }));
-  const selected = o.model ? findModel(o.model).id : null;
+  const local = o.local ? await localServer() : null;
+  const models = local ? [E.LOCAL_FLUX] : E.REPLICATE_MODELS;
+  const catalog = models.map(m => ({ id: m.id, aliases: m.aliases, family: m.family, imageInput: m.imageInput, default: m.id === 'black-forest-labs/flux-schnell' }));
+  const selected = o.model ? findModel(o.model, models).id : null;
   const { interpreted: it, diagnostics } = J.interpret(r.document, { catalog, families: E.FAMILIES, selected });
   if (it.mode !== 'generate') { console.error(`mode=${it.mode} needs an input image; the CLI renders generate only.`); process.exit(2); }
-  const model = E.REPLICATE_MODELS.find(m => m.id === it.matched);
-  const renderer = new E.ReplicateRenderer(token(), { foldAvoid: true });
-  const res = await renderer.render({ intent: { description: it.modelDescription, style: it.modelStyle, avoid: it.modelAvoid, aspect: it.aspect ? { width: it.aspect.width, height: it.aspect.height } : null, mode: 'generate', strength: null, seed: it.seed, animate: false }, modelId: model.id, inputImage: null, governingRatio: null, target: null });
+  const model = models.find(m => m.id === it.matched);
+  const renderer = local ? new E.LocalRenderer(local.url, local.token, { fetch: localFetch, outputFormat: /\.jpe?g$/i.test(o.out ?? '') ? 'jpeg' : 'png' }) : new E.ReplicateRenderer(token(), { foldAvoid: true });
+  const res = await renderer.render({ intent: { description: it.modelDescription, style: it.modelStyle, avoid: it.modelAvoid, aspect: it.aspect ? { width: it.aspect.width, height: it.aspect.height } : null, mode: 'generate', strength: null, seed: it.seed, animate: false }, modelId: model.id, inputImage: null, governingRatio: null, target: null })
+    .catch(e => { console.error(`Render failed: ${e.message}`); process.exit(1); });
   const out = o.out ?? `render-${Date.now()}.${res.mime.split('/')[1]}`;
   writeFileSync(out, res.bytes);
-  console.log(`${model.label} -> ${out} (about ${usd(model.costHint)})`);
+  console.log(local ? `${model.label} on JAI Studio -> ${out} (seed ${res.sentInput.seed}, ${res.sentInput.width}x${res.sentInput.height})` : `${model.label} -> ${out} (about ${usd(model.costHint)})`);
   console.log(`sent: ${res.sentPrompt}`);
   for (const d of [...diagnostics, ...res.diagnostics]) console.log(`  ${d.code}${d.key ? ` (${d.key})` : ''}`);
   process.exit(0);
@@ -128,8 +220,11 @@ const target = { url: `data:image/jpeg;base64,${upload.toString('base64')}`, wid
 const THUMB = 16;
 const thumb = async buf => { const { data, info } = await sharp(buf).rotate().removeAlpha().resize(THUMB, THUMB, { fit: 'cover' }).ensureAlpha().raw().toBuffer({ resolveWithObject: true }); return { width: info.width, height: info.height, data }; };
 
-const models = (o.models ?? 'flux-schnell').split(',').filter(Boolean).map(findModel);
-const budgetUSD = numberOption('budget', 0.5, 0.01, 50);
+const local = o.local ? await localServer() : null;
+if (local) for (const k of ['budget', 'analyst', 'optimiser']) if (o[k] !== undefined) { console.error(`--${k} does not apply with --local`); process.exit(2); }
+if (!local) for (const k of ['think', 'scale']) if (o[k] !== undefined) { console.error(`--${k} needs --local`); process.exit(2); }
+const models = [...new Map((o.models ?? 'flux-schnell').split(',').filter(Boolean).map(name => findModel(name, local ? [E.LOCAL_FLUX] : E.REPLICATE_MODELS)).map(m => [m.id, m])).values()];
+const budgetUSD = local ? 0 : numberOption('budget', 0.5, 0.01, 50);
 const population = numberOption('population', 4, 1, 9, true);
 const generations = numberOption('generations', 5, 1, 30, true);
 const restarts = numberOption('restarts', 1, 1, 5, true);
@@ -139,30 +234,46 @@ const seeds = (o.seeds ?? '1,2').split(',').map(x => {
   if (!Number.isSafeInteger(n) || n < 0 || n > 2 ** 32 - 1) { console.error('--seeds must be integers from 0 to 4294967295'); process.exit(2); }
   return n;
 });
-const client = new E.HttpReplicateClient(token());
-const makeAnalyst = name => {
-  if (name === 'gemini') return new E.GeminiAnalyst(client);
-  if (name === 'sonnet') return new E.ClaudeAnalyst(client);
-  if (name === undefined || name === 'luna') return new E.OpenAIAnalyst(client);
-  console.error(`Unknown model "${name}": use luna, gemini or sonnet`); process.exit(2);
-};
-const analyst = makeAnalyst(o.analyst);
-if (o.analyst === 'sonnet') { console.error('--analyst sonnet takes one image per call; use it as --optimiser'); process.exit(2); }
-const optimiser = o.optimiser ? makeAnalyst(o.optimiser) : analyst;
+const thinking = o.think ?? 'off';
+if (!['off', 'propose', 'all'].includes(thinking)) { console.error('--think must be off, propose or all'); process.exit(2); }
+// As JAI Studio's own encoder allows: up to 1.25, every FLUX size fits the server's limits.
+const scale = numberOption('scale', 1, 0.25, 1.25);
+let analyst, optimiser, renderer;
+if (local) {
+  analyst = optimiser = new E.LocalAnalyst(new E.OpenAIChatClient(local.url, local.token, { fetch: localFetch }), { thinking });
+  renderer = new E.LocalRenderer(local.url, local.token, { fetch: localFetch, outputFormat: 'jpeg', scale });
+} else {
+  const client = new E.HttpReplicateClient(token());
+  const makeAnalyst = name => {
+    if (name === 'gemini') return new E.GeminiAnalyst(client);
+    if (name === 'sonnet') return new E.ClaudeAnalyst(client);
+    if (name === undefined || name === 'luna') return new E.OpenAIAnalyst(client);
+    console.error(`Unknown model "${name}": use luna, gemini or sonnet`); process.exit(2);
+  };
+  analyst = makeAnalyst(o.analyst);
+  if (o.analyst === 'sonnet') { console.error('--analyst sonnet takes one image per call; use it as --optimiser'); process.exit(2); }
+  optimiser = o.optimiser ? makeAnalyst(o.optimiser) : analyst;
+  renderer = new E.ReplicateRenderer(client, { foldAvoid: true });
+}
 const out = resolve(o.out ?? join(dirname(src), `${basename(src, extname(src))}.jai`));
 if (existsSync(out) && !o.force) { console.error(`${out} exists; pass --force to overwrite it.`); process.exit(2); }
 const reportDir = o.report ?? `${out}.report`;
 mkdirSync(join(reportDir, 'renders'), { recursive: true });
 writeFileSync(join(reportDir, 'target.jpg'), upload);
 
-console.log(`Encoding ${basename(src)} (${target.width}x${target.height}) for ${models.map(m => m.label).join(', ')}; budget ${usd(budgetUSD)}; analyst ${analyst.id}${optimiser !== analyst ? `, optimiser ${optimiser.id}` : ''}`);
+console.log(local
+  ? `Encoding ${basename(src)} (${target.width}x${target.height}) for ${models.map(m => m.label).join(', ')} with JAI Studio at ${local.url}; analyst ${analyst.id}${thinking !== 'off' ? `, thinking: ${thinking}` : ''}`
+  : `Encoding ${basename(src)} (${target.width}x${target.height}) for ${models.map(m => m.label).join(', ')}; budget ${usd(budgetUSD)}; analyst ${analyst.id}${optimiser !== analyst ? `, optimiser ${optimiser.id}` : ''}`);
 const files = new Map();
 let n = 0;
 const result = await E.encode({
-  target, models: models.map(m => m.id), renderer: new E.ReplicateRenderer(client, { foldAvoid: true }), analyst, optimiser,
+  target, models: models.map(m => m.id), renderer, analyst, optimiser,
   ...(o['no-pixel'] ? {} : { thumbnail: r => thumb(Buffer.from(r.bytes)), targetThumbnail: await thumb(upload) }),
   budgetUSD, population, maxGenerations: generations, restarts, goal,
   seeds, refine: o['no-refine'] ? false : undefined,
+  // The engine's default concurrency (four renders and four inspections at once) also suits
+  // JAI Studio: its scheduler still batches each engine's work, and no request waits behind
+  // a whole generation.
   onEvent: e => {
     if (e.type === 'phase') console.log(`\n== ${e.phase}${e.lineage ? ` (lineage ${e.lineage})` : ''}`);
     if (e.type === 'target') console.log(`  target: ${E.describeObservation(e.observation).replace(/\n/g, '\n          ')}`);
@@ -177,7 +288,7 @@ const result = await E.encode({
       const fb = e.candidate.renders.find(r => r.measure)?.measure?.feedback;
       if (fb) console.log(`     ${fb.slice(0, 240)}`);
     }
-    if (e.type === 'generation') console.log(`  -> l${e.generation.lineage} gen ${e.generation.index} best ${e.generation.best} ${e.generation.bestFitness.toFixed(3)}, spent ${usd(e.generation.spent)}${e.generation.notes ? `\n     ${e.generation.notes.slice(0, 300)}` : ''}`);
+    if (e.type === 'generation') console.log(`  -> l${e.generation.lineage} gen ${e.generation.index} best ${e.generation.best} ${e.generation.bestFitness.toFixed(3)}${local ? '' : `, spent ${usd(e.generation.spent)}`}${e.generation.notes ? `\n     ${e.generation.notes.slice(0, 300)}` : ''}`);
     if (e.type === 'log') console.log(`  ${e.message}`);
   },
 }).catch(e => { console.error(`\nEncoding failed: ${e.message}${e.spent !== undefined ? ` (spent about ${usd(e.spent)})` : ''}`); process.exit(1); });
@@ -201,12 +312,12 @@ const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta n
 <div class="row"><figure style="max-width:360px"><img src="target.jpg" alt="Target image"><figcaption>Target, ${target.width}×${target.height}</figcaption></figure><pre style="flex:1;min-width:260px">${esc(E.describeObservation(result.target))}</pre></div>
 <h2>Result</h2><pre>${esc(text)}</pre>
 <table><tr><th>Model</th><th>Score</th></tr>${result.ranking.map(r => `<tr><td>${esc(r.model)}</td><td>${r.score.toFixed(3)}</td></tr>`).join('')}</table>
-<p>Stopped: ${esc(result.stopReason)}${result.error ? ` (${esc(result.error)})` : ''}. Estimated spend ${usd(result.spent)} of ${usd(budgetUSD)} in ${result.seconds.toFixed(0)} s. Analyst ${esc(analyst.id)}${optimiser !== analyst ? `, optimiser ${esc(optimiser.id)}` : ''}; fitness is measured against the target's boxes, horizon and colours.</p>
+<p>Stopped: ${esc(result.stopReason)}${result.error ? ` (${esc(result.error)})` : ''}. ${local ? `Rendered and measured with JAI Studio's local models in ${result.seconds.toFixed(0)} s` : `Estimated spend ${usd(result.spent)} of ${usd(budgetUSD)} in ${result.seconds.toFixed(0)} s`}. Analyst ${esc(analyst.id)}${optimiser !== analyst ? `, optimiser ${esc(optimiser.id)}` : ''}; fitness is measured against the target's boxes, horizon and colours.</p>
 ${result.generations.map(g => `<section class="gen"><h3>${g.phase === 'refine' ? 'Refinement' : `Lineage ${g.lineage}, generation`} ${g.index}: best ${g.bestFitness.toFixed(3)}</h3>${g.notes ? `<p>${esc(g.notes)}</p>` : ''}<div class="row">${g.candidates.map(id => byId.get(id)).filter(Boolean).map(card).join('')}</div></section>`).join('\n')}
 </body></html>`;
 writeFileSync(join(reportDir, 'index.html'), html);
 
 console.log(`\n${text}\n`);
 for (const r of result.ranking) console.log(`  ${r.model.padEnd(36)} ${r.score.toFixed(3)}`);
-console.log(`\nStopped: ${result.stopReason}${result.error ? ` (${result.error})` : ''}. Estimated spend ${usd(result.spent)} of ${usd(budgetUSD)}, ${result.seconds.toFixed(0)} s.`);
+console.log(`\nStopped: ${result.stopReason}${result.error ? ` (${result.error})` : ''}. ${local ? `JAI Studio, ${result.seconds.toFixed(0)} s.` : `Estimated spend ${usd(result.spent)} of ${usd(budgetUSD)}, ${result.seconds.toFixed(0)} s.`}`);
 console.log(`Wrote ${out} and ${join(reportDir, 'index.html')}`);

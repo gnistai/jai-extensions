@@ -1,0 +1,564 @@
+//! jai-js's public API against `dist/studio/host.mjs`: validate on a real
+//! `.jai` file, and render and encode against an axum mock of the Studio API
+//! (`/v1/images/generations` returns a small image; `/v1/chat/completions`
+//! answers in the shape its response_format schema asks for).
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use axum::{Json, Router};
+use base64::Engine as _;
+use jai_js::{
+    imageops, DocInput, EncodeOptions, EncodeSink, EncodeTarget, RenderOptions, ServerRef,
+};
+use serde_json::{json, Value};
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
+
+const TOKEN: &str = "jai_test-token";
+
+/// `examples/encoding/earthrise.jai` from the spec repository: `$JAI_SPEC_DIR`,
+/// else `../jai` next to jai-tools.
+fn earthrise() -> Vec<u8> {
+    let spec = std::env::var_os("JAI_SPEC_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../../jai"));
+    let path = spec.join("examples").join("encoding").join("earthrise.jai");
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// A 64×64 image whose colour depends on `seed`, as PNG or JPEG.
+fn test_image(seed: u64, format: &str) -> Vec<u8> {
+    let shade = (seed * 53 % 200) as u8;
+    let img = image::RgbImage::from_fn(64, 64, |x, y| {
+        image::Rgb([shade, (x * 4) as u8, (y * 4) as u8])
+    });
+    let mut out = std::io::Cursor::new(Vec::new());
+    let fmt = if format == "jpeg" {
+        image::ImageFormat::Jpeg
+    } else {
+        image::ImageFormat::Png
+    };
+    img.write_to(&mut out, fmt).unwrap();
+    out.into_inner()
+}
+
+/// What the mock saw and how it behaves.
+#[derive(Clone, Default)]
+struct Studio {
+    image_delay: Duration,
+    requests: Arc<Mutex<Vec<(String, Value)>>>,
+}
+
+impl Studio {
+    fn seen(&self, kind: &str) -> Vec<Value> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k == kind)
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+}
+
+fn unauthorized(headers: &HeaderMap) -> Option<Response> {
+    let ok = headers.get("authorization").and_then(|v| v.to_str().ok())
+        == Some(&format!("Bearer {TOKEN}"));
+    (!ok).then(|| {
+        let body = json!({ "error": { "message": "Missing or invalid token", "type": "auth_error", "code": "unauthorized" } });
+        (StatusCode::UNAUTHORIZED, Json(body)).into_response()
+    })
+}
+
+async fn images(
+    State(studio): State<Studio>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Some(denied) = unauthorized(&headers) {
+        return denied;
+    }
+    studio
+        .requests
+        .lock()
+        .unwrap()
+        .push(("image".into(), body.clone()));
+    tokio::time::sleep(studio.image_delay).await;
+    let seed = body["seed"].as_u64().unwrap_or(777);
+    let format = body["output_format"].as_str().unwrap_or("png").to_owned();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(test_image(seed, &format));
+    Json(json!({
+        "created": 0, "model": "flux-schnell", "width": body["width"], "height": body["height"], "steps": 4,
+        "output_format": format, "data": [{ "b64_json": b64, "seed": seed }], "timings": { "queueMs": 0, "generateMs": 5 },
+    }))
+    .into_response()
+}
+
+/// Answers each analyst call in the shape of its response_format schema.
+async fn chat(
+    State(studio): State<Studio>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Some(denied) = unauthorized(&headers) {
+        return denied;
+    }
+    let format = &body["response_format"]["json_schema"];
+    let name = format["name"].as_str().unwrap_or_default().to_owned();
+    studio
+        .requests
+        .lock()
+        .unwrap()
+        .push((name.clone(), body.clone()));
+    // Each call's drafts differ, as a model's would: the engine measures a repeated draft only once.
+    let call_no = studio.requests.lock().unwrap().len();
+    let props = &format["schema"]["properties"];
+    let scene = json!({ "horizon_y": 800, "horizon_shape": "curved", "camera": "telephoto", "lighting": "hard sunlight", "medium": "photograph" });
+    let mut answer = match name.as_str() {
+        "jai_drafts" => {
+            let n = props["drafts"]["minItems"].as_u64().unwrap_or(1);
+            let drafts: Vec<Value> = (0..n)
+                .map(|i| json!({ "prompt": format!("A small blue planet above a grey lunar horizon, variant {call_no}-{i}"), "style": ["space photograph"], "avoid": ["text"] }))
+                .collect();
+            json!({ "notes": "mock notes", "drafts": drafts })
+        }
+        "jai_additions" => {
+            let n = props["additions"]["minItems"].as_u64().unwrap_or(1);
+            json!({ "notes": "", "additions": (0..n).map(|i| format!("addition {i}")).collect::<Vec<_>>() })
+        }
+        "jai_target_inspection" => {
+            json!({ "subjects": [{ "name": "planet", "bbox_2d": [450, 400, 600, 550] }] })
+        }
+        "jai_render_inspection" => {
+            let names: Vec<Value> = props["subjects"]["items"]["properties"]["name"]["enum"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            json!({ "subjects": names.into_iter().map(|n| json!({ "name": n, "bbox_2d": [440, 380, 610, 560] })).collect::<Vec<_>>() })
+        }
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unexpected response_format {other}"),
+            )
+                .into_response()
+        }
+    };
+    if name.contains("inspection") {
+        if let (Some(a), Some(s)) = (answer.as_object_mut(), scene.as_object()) {
+            a.extend(s.clone());
+        }
+    }
+    Json(json!({
+        "id": "chatcmpl-mock", "object": "chat.completion", "model": "qwen3.8-27b",
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": answer.to_string() }, "finish_reason": "stop" }],
+        "usage": { "prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30 },
+    }))
+    .into_response()
+}
+
+async fn mock_studio(studio: Studio) -> String {
+    let app = Router::new()
+        .route("/v1/images/generations", post(images))
+        .route("/v1/chat/completions", post(chat))
+        .with_state(studio);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app).await {
+            eprintln!("mock studio stopped: {e}");
+        }
+    });
+    format!("http://{addr}")
+}
+
+fn server(url: &str) -> ServerRef {
+    ServerRef {
+        url: url.into(),
+        token: TOKEN.into(),
+    }
+}
+
+#[test]
+fn validate_reads_a_real_jai_file() {
+    let r = jai_js::validate(DocInput::Bytes(earthrise())).unwrap();
+    assert!(r.ok && !r.fatal, "{r:?}");
+    assert_eq!(r.form.as_deref(), Some("gzip"));
+    let text = r.text.unwrap();
+    assert!(
+        text.starts_with("jai:Photograph of a distant Earthrise over the Moon"),
+        "{text}"
+    );
+    assert!(
+        text.contains(";model=black-forest-labs/flux-schnell;"),
+        "{text}"
+    );
+    assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+}
+
+#[test]
+fn validate_reports_text_json_and_fatal_inputs() {
+    let text =
+        jai_js::validate(DocInput::Text("prompt=a red fox\nstyle=watercolor".into())).unwrap();
+    assert_eq!((text.ok, text.form.as_deref()), (true, Some("text")));
+    let json = jai_js::validate(DocInput::Text("{\"prompt\":[\"a red fox\"]}".into())).unwrap();
+    assert_eq!(
+        (json.ok, json.form.as_deref(), json.text.as_deref()),
+        (true, Some("json"), Some("jai:a red fox"))
+    );
+    let broken = jai_js::validate(DocInput::Bytes(vec![
+        0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255, 1, 2, 3,
+    ]))
+    .unwrap();
+    assert!(
+        !broken.ok && broken.fatal && broken.text.is_none(),
+        "{broken:?}"
+    );
+    assert!(
+        broken
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "malformed-container"),
+        "{broken:?}"
+    );
+    let undecodable = jai_js::validate(DocInput::Bytes(vec![0x70, 0xff, 0xfe])).unwrap();
+    assert!(
+        undecodable.fatal
+            && undecodable
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "undecodable"),
+        "{undecodable:?}"
+    );
+}
+
+#[tokio::test]
+async fn render_against_a_mock_server() {
+    let studio = Studio::default();
+    let url = mock_studio(studio.clone()).await;
+    let opts = RenderOptions {
+        server: server(&url),
+        seed: Some("42".into()),
+        model: None,
+        output_format: None,
+        scale: None,
+    };
+    let out = jai_js::render(DocInput::Bytes(earthrise()), opts)
+        .await
+        .unwrap();
+
+    let sent = studio.seen("image");
+    assert_eq!(sent.len(), 1);
+    let request = &sent[0];
+    assert_eq!(out.bytes, test_image(42, "png"));
+    assert_eq!(out.mime, "image/png");
+    assert_eq!(out.model, "black-forest-labs/flux-schnell");
+    assert_eq!(out.model_label, "FLUX.1 schnell");
+    assert_eq!(out.seed, 42);
+    assert_eq!(
+        (out.width, out.height),
+        (1024, 1024),
+        "aspect=1:1 renders at 1024x1024"
+    );
+    assert_eq!(request["seed"], 42);
+    assert_eq!(request["output_format"], "png");
+    assert_eq!(out.sent_prompt, request["prompt"].as_str().unwrap());
+    assert!(
+        out.sent_prompt
+            .starts_with("Photograph of a distant Earthrise"),
+        "{}",
+        out.sent_prompt
+    );
+    assert!(
+        out.sent_prompt.contains("Apollo space photography"),
+        "{}",
+        out.sent_prompt
+    );
+    assert!(out
+        .description
+        .starts_with("Photograph of a distant Earthrise"));
+    assert!(out.document_text.starts_with("jai:Photograph"));
+}
+
+#[tokio::test]
+async fn render_errors_name_the_cause() {
+    let url = mock_studio(Studio::default()).await;
+    let wrong = RenderOptions {
+        server: ServerRef {
+            url: url.clone(),
+            token: "wrong".into(),
+        },
+        seed: None,
+        model: None,
+        output_format: None,
+        scale: None,
+    };
+    let e = jai_js::render(DocInput::Bytes(earthrise()), wrong)
+        .await
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("HTTP 401"), "{e:#}");
+    let opts = RenderOptions {
+        server: server(&url),
+        seed: None,
+        model: None,
+        output_format: None,
+        scale: None,
+    };
+    let e = jai_js::render(DocInput::Bytes(vec![0x1f, 0x8b, 1, 2]), opts)
+        .await
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("malformed-container"), "{e:#}");
+}
+
+#[tokio::test]
+async fn dropping_a_render_closes_its_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buf = [0u8; 4096];
+        // Read the request and anything after it; the read ends when the client hangs up.
+        while let Ok(n) = socket.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+        }
+        let _ = closed_tx.send(());
+    });
+    let opts = RenderOptions {
+        server: server(&url),
+        seed: None,
+        model: None,
+        output_format: None,
+        scale: None,
+    };
+    let render = jai_js::render(DocInput::Bytes(earthrise()), opts);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), render)
+            .await
+            .is_err(),
+        "the render should still be waiting"
+    );
+    tokio::time::timeout(Duration::from_secs(5), closed_rx)
+        .await
+        .expect("the connection stayed open after the render was dropped")
+        .expect("the server task ended without a request");
+}
+
+/// The encode target: a dark square with a blue disc, as PNG.
+fn target_png() -> Vec<u8> {
+    let img = image::RgbImage::from_fn(320, 240, |x, y| {
+        let (dx, dy) = (x as i32 - 180, y as i32 - 100);
+        if dx * dx + dy * dy < 900 {
+            image::Rgb([40, 90, 220])
+        } else if y > 200 {
+            image::Rgb([90, 90, 90])
+        } else {
+            image::Rgb([0, 0, 0])
+        }
+    });
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+    out.into_inner()
+}
+
+fn encode_options(url: &str, generations: u32) -> EncodeOptions {
+    let target = imageops::prepare_target(&target_png()).unwrap();
+    EncodeOptions {
+        server: server(url),
+        target: EncodeTarget {
+            url: target.data_url,
+            width: target.width,
+            height: target.height,
+        },
+        target_thumbnail: target.thumb,
+        generations,
+        population: 2,
+        seeds: vec![1],
+        restarts: 1,
+        goal: 0.999,
+        time_limit_ms: None,
+        render_scale: Some(0.25),
+        thinking: None,
+        source_name: Some("disc.png".into()),
+    }
+}
+
+fn collecting_sink(dir: &std::path::Path) -> (EncodeSink, Arc<Mutex<Vec<Value>>>) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let seen = events.clone();
+    let sink = EncodeSink {
+        on_event: Arc::new(move |e| seen.lock().unwrap().push(e)),
+        render_dir: dir.to_path_buf(),
+    };
+    (sink, events)
+}
+
+#[tokio::test]
+async fn encode_against_a_mock_server() {
+    let studio = Studio::default();
+    let url = mock_studio(studio.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let renders = dir.path().join("renders");
+    let (sink, events) = collecting_sink(&renders);
+    let out = jai_js::encode(encode_options(&url, 2), sink, CancellationToken::new())
+        .await
+        .unwrap();
+
+    // The result document, as text and as a .jai file.
+    assert!(out.text.starts_with("jai:"), "{}", out.text);
+    assert!(
+        out.text.contains("model=black-forest-labs/flux-schnell"),
+        "{}",
+        out.text
+    );
+    assert_eq!(out.jai[..2], [0x1f, 0x8b]);
+    let check = jai_js::validate(DocInput::Bytes(out.jai.clone())).unwrap();
+    assert!(
+        check.ok && check.form.as_deref() == Some("gzip"),
+        "{check:?}"
+    );
+    assert_eq!(check.text.as_deref(), Some(out.text.as_str()));
+    assert!(
+        ["generations", "goal", "plateau"].contains(&out.stop_reason.as_str()),
+        "{}",
+        out.stop_reason
+    );
+    assert!(out.best.fitness.is_finite() && out.seconds >= 0.0);
+    assert_eq!(out.error, None, "a run that ends normally names no error");
+
+    // Every call went to the mock with the right shapes.
+    let images = studio.seen("image");
+    assert_eq!(images.len(), 4, "2 generations x 2 candidates x 1 seed");
+    assert!(images.iter().all(|r| r["output_format"] == "jpeg"
+        && r["seed"] == 1
+        && r["width"].as_u64().unwrap() % 64 == 0));
+    assert_eq!(studio.seen("jai_target_inspection").len(), 1);
+    assert_eq!(studio.seen("jai_render_inspection").len(), 4);
+    assert_eq!(
+        studio.seen("jai_drafts").len(),
+        2,
+        "describe, then one proposal"
+    );
+    for call in studio
+        .seen("jai_drafts")
+        .iter()
+        .chain(studio.seen("jai_target_inspection").iter())
+    {
+        let url = call["messages"][1]["content"][1]["image_url"]["url"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            url.starts_with("data:image/jpeg;base64,"),
+            "the task text, then one image per call, as a data URL"
+        );
+    }
+
+    // Renders were saved and events point at them.
+    let mut files: Vec<String> = std::fs::read_dir(&renders)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    files.sort();
+    assert_eq!(files.len(), 4, "{files:?}");
+    assert!(files.iter().all(|f| f.ends_with(".jpg")), "{files:?}");
+    let events = events.lock().unwrap().clone();
+    let candidates: Vec<&Value> = events.iter().filter(|e| e["type"] == "candidate").collect();
+    assert_eq!(candidates.len(), 4, "{events:?}");
+    for c in &candidates {
+        for r in c["candidate"]["renders"].as_array().unwrap() {
+            let file = r["file"].as_str().expect("a render file");
+            assert!(files.iter().any(|f| f == file), "{file} not in {files:?}");
+            assert!(
+                r.get("result").is_none(),
+                "render bytes must not reach events"
+            );
+        }
+    }
+    assert_eq!(out.report["candidates"].as_array().map(Vec::len), Some(4));
+    assert_eq!(out.report["source"], "disc.png");
+}
+
+#[tokio::test]
+async fn cancelling_an_encode_stops_it_promptly() {
+    let studio = Studio {
+        image_delay: Duration::from_secs(60),
+        ..Studio::default()
+    };
+    let url = mock_studio(studio.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (sink, _) = collecting_sink(dir.path());
+    let cancel = CancellationToken::new();
+    let trigger = cancel.clone();
+    let watched = studio.clone();
+    tokio::spawn(async move {
+        // Cancel once the renders are waiting on the slow image endpoint.
+        while watched.seen("image").is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        trigger.cancel();
+    });
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        jai_js::encode(encode_options(&url, 2), sink, cancel),
+    )
+    .await
+    .expect("the encode did not stop");
+    let elapsed = started.elapsed();
+    match result {
+        Ok(out) => assert_eq!(out.stop_reason, "canceled"),
+        Err(e) => assert!(format!("{e:#}").contains("canceled"), "{e:#}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "took {elapsed:?}: __jaiAbort did not stop the encode"
+    );
+}
+
+#[tokio::test]
+async fn a_cancelled_token_stops_before_any_request() {
+    let studio = Studio::default();
+    let url = mock_studio(studio.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (sink, _) = collecting_sink(dir.path());
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let e = jai_js::encode(encode_options(&url, 1), sink, cancel)
+        .await
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("canceled"), "{e:#}");
+    assert!(studio.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn the_async_api_can_run_on_any_executor_thread() {
+    fn send<T: Send + 'static>(_: T) {}
+    let opts = RenderOptions {
+        server: server("http://127.0.0.1:1"),
+        seed: None,
+        model: None,
+        output_format: None,
+        scale: None,
+    };
+    send(jai_js::render(DocInput::Text(String::new()), opts));
+    let sink = EncodeSink {
+        on_event: Arc::new(|_| {}),
+        render_dir: PathBuf::new(),
+    };
+    send(jai_js::encode(
+        encode_options("http://127.0.0.1:1", 1),
+        sink,
+        CancellationToken::new(),
+    ));
+}

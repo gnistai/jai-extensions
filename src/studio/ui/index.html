@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>JAI Studio</title>
+<link rel="icon" href="icon.png">
+<link rel="stylesheet" href="style.css">
+<script type="module" src="main.js"></script>
+</head>
+<body>
+<header class="app-header">
+  <div class="brand">
+    <img src="icon.png" alt="" width="24" height="24">
+    <h1>JAI Studio</h1>
+    <span class="mock-tag" id="mock-tag" title="Running in a browser with mock data" hidden>mock</span>
+  </div>
+  <div class="tabs" id="tabs" role="tablist" aria-label="Sections">
+    <button type="button" class="tab" role="tab" id="tab-view" aria-controls="panel-view" aria-selected="true">View</button>
+    <button type="button" class="tab" role="tab" id="tab-encode" aria-controls="panel-encode" aria-selected="false" tabindex="-1">Encode</button>
+    <button type="button" class="tab" role="tab" id="tab-models" aria-controls="panel-models" aria-selected="false" tabindex="-1">Models</button>
+    <button type="button" class="tab" role="tab" id="tab-server" aria-controls="panel-server" aria-selected="false" tabindex="-1">Server</button>
+  </div>
+  <button type="button" class="pill" id="status-pill" title="Engine status">
+    <span class="pill-seg" id="pill-llm" data-state="off"><i class="dot"></i>LLM <b id="pill-llm-state">off</b></span>
+    <span class="pill-seg" id="pill-image" data-state="off"><i class="dot"></i>Image <b id="pill-image-state">off</b></span>
+    <span class="pill-seg" id="pill-missing" data-state="missing" hidden><i class="dot"></i>Models not installed</span>
+  </button>
+</header>
+
+<main id="main">
+  <!-- View -->
+  <section class="panel" id="panel-view" role="tabpanel" aria-labelledby="tab-view">
+    <h2 class="sr-only">View a .jai file</h2>
+    <div class="view-grid">
+      <div class="card stage" id="view-stage">
+        <div class="drop" id="view-drop">
+          <p class="drop-title">Drop a .jai file here</p>
+          <p class="muted">JAI Studio renders it on this PC, with no account and nothing sent anywhere.</p>
+          <button type="button" id="view-open">Open a .jai file…</button>
+          <p class="muted small">or press Ctrl+O</p>
+        </div>
+        <figure class="render empty" id="view-figure" hidden>
+          <img id="view-img" alt="" hidden>
+          <div class="render-wait" id="view-wait" hidden><span class="spinner" aria-hidden="true"></span><span id="view-wait-text">Rendering…</span></div>
+        </figure>
+      </div>
+      <aside class="card side" aria-labelledby="view-title">
+        <h2 id="view-title">No document open</h2>
+        <p class="muted" id="view-meta">Open or drop a .jai file to see it here.</p>
+        <p id="view-status" class="status" role="status"></p>
+        <button type="button" class="secondary small" id="view-models" hidden>Open Models</button>
+        <div class="actions" id="view-actions" hidden>
+          <button type="button" id="view-again">Render again</button>
+          <button type="button" class="secondary" id="view-save">Save image…</button>
+          <button type="button" class="secondary" id="view-copy">Copy HTML</button>
+        </div>
+        <div id="view-details" hidden>
+          <h3>Description</h3>
+          <p id="view-desc" class="desc"></p>
+          <dl class="kv">
+            <dt>Seed</dt><dd><span id="view-seed" class="mono"></span> <span class="badge" id="view-cached" hidden>from cache</span></dd>
+            <dt>Size</dt><dd id="view-size"></dd>
+          </dl>
+          <details class="more">
+            <summary>Sent prompt</summary>
+            <pre id="view-prompt"></pre>
+          </details>
+          <details class="more">
+            <summary>Document text</summary>
+            <pre id="view-doc"></pre>
+          </details>
+        </div>
+        <div id="view-diag-box" hidden>
+          <h3>Diagnostics</h3>
+          <p class="muted" id="view-diags-none">None: the document rendered as written.</p>
+          <ul class="diags" id="view-diags"></ul>
+        </div>
+        <div class="actions bottom" id="view-more" hidden>
+          <button type="button" class="secondary small" id="view-open-2">Open another file…</button>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <!-- Encode -->
+  <section class="panel" id="panel-encode" role="tabpanel" aria-labelledby="tab-encode" hidden>
+    <h2 class="sr-only">Encode an image</h2>
+    <div class="card result" id="enc-result" hidden>
+      <h2 id="enc-result-title" tabindex="-1">Result</h2>
+      <p id="enc-result-note"></p>
+      <pre id="enc-result-text" class="doc"></pre>
+      <div class="actions">
+        <button type="button" id="enc-save">Save .jai…</button>
+        <button type="button" class="secondary" id="enc-view">Open in viewer</button>
+        <button type="button" class="secondary" id="enc-reveal">Reveal report folder</button>
+        <button type="button" class="secondary" id="enc-copy">Copy text</button>
+      </div>
+    </div>
+    <div class="enc-grid">
+      <div class="col">
+        <div class="card stage-card" id="enc-stage">
+          <div class="card-head">
+            <h2>Image</h2>
+            <button type="button" class="secondary small" id="enc-open">Open image…</button>
+          </div>
+          <div class="drop" id="enc-drop">
+            <p class="drop-title">Drop an image here</p>
+            <p class="muted">PNG, JPEG, WebP or GIF. JAI Studio writes a description that renders back into a picture like it.</p>
+            <p class="muted small">or use Open image… (Ctrl+O)</p>
+          </div>
+          <figure class="target" id="enc-figure" hidden>
+            <div id="enc-target"></div>
+            <figcaption class="muted" id="enc-caption"></figcaption>
+          </figure>
+          <ol class="subjects" id="enc-subjects" aria-label="Measured in the image" hidden></ol>
+        </div>
+        <div class="card" id="enc-best-card" hidden>
+          <div class="card-head">
+            <h2>Best so far <span class="muted mono" id="enc-best-id"></span></h2>
+            <span class="big-number" id="enc-best-fit"></span>
+          </div>
+          <div class="shots" id="enc-best-shots"></div>
+          <div id="enc-best-feedback"></div>
+          <details class="more" open>
+            <summary>Description</summary>
+            <div id="enc-best-draft"></div>
+          </details>
+        </div>
+      </div>
+      <div class="col">
+        <form class="card" id="enc-form" novalidate>
+          <h2>Settings</h2>
+          <fieldset id="enc-fields">
+            <legend class="sr-only">Encoder settings</legend>
+            <div class="fields">
+              <label>Generations <input type="number" id="enc-generations" min="1" max="30" step="1" value="8" required></label>
+              <label>Candidates per generation <input type="number" id="enc-population" min="1" max="9" step="1" value="4" required></label>
+              <label>Seeds <input type="text" id="enc-seeds" value="1, 2" inputmode="numeric" autocomplete="off" spellcheck="false" aria-describedby="enc-seeds-hint" required></label>
+              <label>Attempts <input type="number" id="enc-restarts" min="1" max="3" step="1" value="1" aria-describedby="enc-restarts-hint" required></label>
+              <label>Goal <input type="number" id="enc-goal" min="0.05" max="1" step="0.01" value="0.90" aria-describedby="enc-goal-hint" required></label>
+            </div>
+            <p class="hint muted small"><span id="enc-seeds-hint">Each candidate renders once per seed.</span> <span id="enc-restarts-hint">Attempts start over; the best wins.</span> <span id="enc-goal-hint">The run stops at this fitness (0 to 1).</span></p>
+            <details class="more">
+              <summary>More settings</summary>
+              <div class="fields">
+                <label>Render scale <input type="number" id="enc-scale" min="0.25" max="1.25" step="0.05" value="1" aria-describedby="enc-scale-hint" required></label>
+                <label>Thinking
+                  <select id="enc-thinking">
+                    <option value="off">Off (fastest)</option>
+                    <option value="propose">When proposing</option>
+                    <option value="all">When describing and proposing</option>
+                  </select>
+                </label>
+              </div>
+              <p class="hint muted small" id="enc-scale-hint">Render scale 1 renders about a megapixel; 0.25 to 1.25.</p>
+            </details>
+          </fieldset>
+          <p class="summary" id="enc-summary" hidden></p>
+          <div class="actions">
+            <button type="submit" id="enc-start">Start encoding</button>
+            <button type="button" class="secondary" id="enc-cancel" hidden>Cancel</button>
+            <button type="button" class="secondary" id="enc-edit" hidden>Change settings</button>
+          </div>
+          <p id="enc-msg" class="status" role="status"></p>
+          <button type="button" class="secondary small" id="enc-models" hidden>Open Models</button>
+        </form>
+        <div class="card" id="enc-progress-card" hidden>
+          <div class="card-head">
+            <h2>Progress</h2>
+            <span class="muted mono" id="enc-clock">0:00</span>
+          </div>
+          <p id="enc-phase" class="phase" role="status"></p>
+          <div id="enc-chart" class="chart"></div>
+          <ol class="log" id="enc-log" aria-label="Encoder messages" tabindex="0"></ol>
+        </div>
+        <div class="card" id="enc-cands-card" hidden>
+          <div class="card-head">
+            <h2>Candidates</h2>
+            <span class="muted" id="enc-count"></span>
+          </div>
+          <div class="cands" id="enc-cands" role="region" aria-label="Candidates" tabindex="0"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Models -->
+  <section class="panel" id="panel-models" role="tabpanel" aria-labelledby="tab-models" hidden>
+    <div class="card models-head">
+      <h2 id="models-total">Models</h2>
+      <p class="muted" id="models-disk"></p>
+      <p class="notice warn" id="models-space" hidden></p>
+      <div class="notice warn" id="vc-warning" hidden>
+        <p><b>The Microsoft Visual C++ runtime is missing or out of date.</b> The engines need version 14.40 or newer. The installer comes from Microsoft and Windows asks before it changes anything.</p>
+        <button type="button" class="secondary" id="vc-install">Install the runtime…</button>
+        <p id="vc-msg" class="status" role="status"></p>
+      </div>
+      <div class="reuse" id="models-reuse-row" hidden>
+        <label class="check"><input type="checkbox" id="models-reuse" checked> Reuse files found on this PC</label>
+        <p class="muted small" id="models-reuse-note"></p>
+      </div>
+      <div class="dl">
+        <button type="button" class="big" id="models-download">Download models</button>
+        <div class="dl-overall" id="dl-overall" hidden>
+          <progress id="dl-overall-bar" max="1" value="0" aria-labelledby="dl-overall-label"></progress>
+          <div class="dl-row">
+            <span id="dl-overall-label" class="sr-only">Download progress</span>
+            <span id="dl-overall-text" class="mono-nums"></span>
+            <button type="button" class="secondary" id="models-cancel">Cancel</button>
+          </div>
+        </div>
+      </div>
+      <p id="models-msg" class="status" role="status"></p>
+    </div>
+    <div class="card">
+      <h2>What gets installed</h2>
+      <ul class="comps" id="models-list"></ul>
+    </div>
+  </section>
+
+  <!-- Server -->
+  <section class="panel" id="panel-server" role="tabpanel" aria-labelledby="tab-server" hidden>
+    <div class="server-grid">
+      <div class="col">
+        <div class="card">
+          <h2>Local server</h2>
+          <p id="srv-state" class="status"></p>
+          <p id="srv-note" class="notice" hidden></p>
+          <p class="notice warn" id="srv-lan" hidden>The server accepts connections from your network at <b id="srv-lan-host"></b>. The token is still required; share it only with apps you trust.</p>
+          <label for="srv-url">URL</label>
+          <div class="field-row">
+            <input type="text" id="srv-url" readonly>
+            <button type="button" class="secondary" id="srv-url-copy">Copy</button>
+          </div>
+          <label for="srv-token">Token</label>
+          <div class="field-row">
+            <input type="password" id="srv-token" readonly autocomplete="off">
+            <button type="button" class="secondary" id="srv-token-show" aria-pressed="false" aria-controls="srv-token">Show</button>
+            <button type="button" class="secondary" id="srv-token-copy">Copy</button>
+          </div>
+          <div class="actions">
+            <button type="button" class="secondary small" id="srv-token-regen">Make a new token…</button>
+          </div>
+          <div class="notice warn" id="srv-regen-confirm" hidden>
+            <p>Apps that use the current token stop working until you give them the new one.</p>
+            <div class="actions">
+              <button type="button" id="srv-regen-yes">Make a new token</button>
+              <button type="button" class="secondary" id="srv-regen-no">Keep the current one</button>
+            </div>
+          </div>
+          <p class="muted small note">Give this URL and token to OpenAI-compatible apps on this PC. Endpoints: <code>POST /v1/chat/completions</code> (qwen3.8-27b) and <code>POST /v1/images/generations</code> (flux-schnell), with <code>Authorization: Bearer &lt;token&gt;</code>. The JAI browser extension renders with Replicate and cannot use JAI Studio yet.</p>
+          <p class="muted small" id="srv-version"></p>
+        </div>
+        <form class="card" id="settings-form" novalidate>
+          <h2>Settings</h2>
+          <p class="notice warn" id="set-config-problem" hidden></p>
+          <div class="fields">
+            <label>Unload after idle (minutes) <input type="number" id="set-idle" min="0" max="1440" step="1" aria-describedby="set-idle-hint"></label>
+            <label>Server port <input type="number" id="set-port" min="1024" max="65535" step="1"></label>
+            <label class="wide">Backend
+              <select id="set-backend" aria-describedby="set-backend-hint">
+                <option value="auto">Automatic</option>
+                <option value="cuda">CUDA (NVIDIA)</option>
+                <option value="vulkan">Vulkan</option>
+                <option value="cpu">CPU (slow)</option>
+              </select>
+            </label>
+          </div>
+          <p class="hint muted small"><span id="set-idle-hint">0 keeps the models loaded.</span> <span id="set-backend-hint">Automatic picks CUDA on NVIDIA GPUs, otherwise Vulkan; another backend may need its own engine download.</span></p>
+          <label class="check"><input type="checkbox" id="set-tray"> Keep running in the tray when the window is closed</label>
+          <label class="check" id="set-login-row"><input type="checkbox" id="set-login"> Start in the tray when I sign in</label>
+          <label class="check" id="set-assoc-row"><input type="checkbox" id="set-assoc"> Open .jai files with JAI Studio</label>
+          <p class="muted small" id="set-windows-only" hidden>Signing-in start and opening .jai files are Windows only for now.</p>
+          <div class="actions">
+            <button type="submit">Save settings</button>
+          </div>
+          <p id="set-msg" class="status" role="status"></p>
+        </form>
+      </div>
+      <div class="col">
+        <div class="card">
+          <h2>Engines</h2>
+          <dl class="kv engines">
+            <dt>LLM</dt><dd id="srv-llm" data-state="off"><i class="dot"></i>Qwen3.8 27B: <b id="srv-llm-state">off</b></dd>
+            <dt>Image</dt><dd id="srv-image" data-state="off"><i class="dot"></i>FLUX.1 schnell: <b id="srv-image-state">off</b></dd>
+            <dt>Swaps</dt><dd id="srv-swaps" class="mono-nums">0</dd>
+            <dt>MTP</dt><dd id="srv-mtp"></dd>
+            <dt>Requests</dt><dd id="srv-requests"></dd>
+            <dt>GPU</dt><dd id="srv-gpu"></dd>
+            <dt>Backend</dt><dd id="srv-backend"></dd>
+          </dl>
+          <p class="notice warn" id="srv-cuda-note" hidden></p>
+          <p class="err" id="srv-error" hidden></p>
+          <p class="muted small note">One engine is loaded at a time; requests for the other one wait for a swap.</p>
+          <div class="actions">
+            <button type="button" class="secondary" id="srv-unload">Unload models</button>
+          </div>
+        </div>
+        <details class="card logs-card" id="srv-logs-box">
+          <summary><h2>Engine logs</h2></summary>
+          <div class="logs-bar">
+            <fieldset class="seg">
+              <legend class="sr-only">Engine</legend>
+              <label><input type="radio" name="srv-log-kind" value="llm" checked> LLM</label>
+              <label><input type="radio" name="srv-log-kind" value="image"> Image</label>
+            </fieldset>
+            <button type="button" class="secondary small" id="srv-logs-refresh">Refresh</button>
+          </div>
+          <pre class="logs" id="srv-logs" tabindex="0" aria-label="Engine log"></pre>
+        </details>
+        <details class="card logs-card" id="srv-licenses-box">
+          <summary><h2>Open-source licences</h2></summary>
+          <p class="muted small">JAI Studio is MIT-licensed and built on open-source software. The models and engines it downloads keep their own licences, listed in the Models tab.</p>
+          <pre class="logs" id="srv-licenses" tabindex="0" aria-label="Open-source licences"></pre>
+        </details>
+      </div>
+    </div>
+  </section>
+</main>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

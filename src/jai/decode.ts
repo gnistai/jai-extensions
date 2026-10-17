@@ -1,5 +1,5 @@
 // The decoding algorithm and URL carriers (data: URLs, query forms).
-import { MEDIA_TYPE, asciiLower, diag, type Diagnostic, type JaiDocument } from './chars.ts';
+import { MEDIA_TYPE, asciiLower, diag, isAsciiSpace, trimBy, type Diagnostic, type JaiDocument } from './chars.ts';
 import { createDocument } from './document.ts';
 import { gunzipOne } from './gzip.ts';
 import { readJSON } from './json.ts';
@@ -78,7 +78,7 @@ export interface DataURL { mime: string; essence: string; bytes: Uint8Array }
 
 /** Essence of a MIME type as the Fetch Standard's MIME type parser computes it; text/plain on failure. */
 function fetchMimeEssence(mimeType: string): string {
-  const t = mimeType.replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, '');
+  const t = trimBy(mimeType, c => c === 0x09 || c === 0x0a || c === 0x0d || c === 0x20); // HTTP whitespace
   const m = /^([!#$%&'*+.^_`|~0-9A-Za-z-]+)\/([!#$%&'*+.^_`|~0-9A-Za-z-]+)[\t\n\r ]*(?:;|$)/.exec(t);
   return m ? asciiLower((m[1] ?? '') + '/' + (m[2] ?? '')) : 'text/plain';
 }
@@ -91,7 +91,7 @@ export function parseDataURL(url: string): DataURL | null {
   let s = href.slice(5);
   const hash = s.indexOf('#'); if (hash >= 0) s = s.slice(0, hash);
   const comma = s.indexOf(','); if (comma < 0) return null;
-  let mimeType = s.slice(0, comma).replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '');
+  let mimeType = trimBy(s.slice(0, comma), isAsciiSpace);
   let bytes = percentDecode(s.slice(comma + 1));
   const m = /;[ ]*base64$/i.exec(mimeType);
   if (m) {

@@ -1,0 +1,38 @@
+[package]
+name = "jai-server"
+description = "JAI Studio server: the OpenAI-style HTTP API on 127.0.0.1, auth, discovery, the shared Core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+jai-core.workspace = true
+jai-engines.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+bytes.workspace = true
+fs4.workspace = true
+futures.workspace = true
+# The server loop: HTTP/1 with a header-read timeout (axum::serve sets none).
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+# Chat images are decoded and encoded again before llama-server sees them.
+image = { workspace = true, features = ["bmp"] }
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tower.workspace = true

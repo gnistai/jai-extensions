@@ -1,0 +1,94 @@
+# JAI Studio: the `jai` executable and its library crates. See DESIGN.md.
+# Run `npm run build` in jai-tools first: jai-js embeds dist/studio/host.mjs and
+# the app embeds dist/studio/ui.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/jai-core",
+    "crates/jai-engines",
+    "crates/jai-server",
+    "crates/jai-js",
+    "app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/gnistai/jai-tools"
+publish = false
+
+[workspace.dependencies]
+# Workspace crates
+jai-core = { path = "crates/jai-core" }
+jai-engines = { path = "crates/jai-engines" }
+jai-server = { path = "crates/jai-server" }
+jai-js = { path = "crates/jai-js" }
+
+# Runtime and plumbing
+tokio = { version = "1.53", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+bytes = "1"
+async-trait = "0.1"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP
+axum = "0.8"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }
+url = "2.5"
+
+# Files, archives, hashing
+sha2 = "0.11"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+flate2 = "1.1"
+tar = "0.4"
+fs4 = { version = "1.1", features = ["sync"] }
+dirs = "7"
+
+# Images, encoding, randomness
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+base64 = "0.23"
+rand = "0.9"
+
+# JavaScript engine
+rquickjs = { version = "0.14", features = ["futures", "loader", "macro"] }
+
+# CLI
+clap = { version = "4.6", features = ["derive"] }
+
+# Platform
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_Storage_FileSystem",
+] }
+libc = "0.2"
+
+# GUI
+tauri = { version = "2.12", features = ["tray-icon"] }
+tauri-build = "2.7"
+tauri-plugin-single-instance = "2.5"
+tauri-plugin-dialog = "2.8"
+tauri-plugin-notification = "2.7"
+
+# Tests only
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
+panic = "unwind"

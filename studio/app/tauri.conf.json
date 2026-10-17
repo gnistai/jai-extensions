@@ -1,0 +1,35 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "JAI Studio",
+  "identifier": "ai.gnist.jai",
+  "build": {
+    "frontendDist": "../../dist/studio/ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": {
+      "csp": {
+        "default-src": "'self'",
+        "script-src": "'self'",
+        "style-src": "'self'",
+        "img-src": "'self' data: blob:",
+        "font-src": "'self'",
+        "connect-src": "ipc: http://ipc.localhost",
+        "object-src": "'none'",
+        "base-uri": "'none'",
+        "form-action": "'none'"
+      }
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": [
+      "icons/128x128@2x.png",
+      "icons/128x128.png",
+      "icons/32x32.png",
+      "icons/icon.png",
+      "icons/icon.ico"
+    ]
+  }
+}

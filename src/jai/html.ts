@@ -1,6 +1,6 @@
 // HTML discovery (spec §Discovery). Works on a minimal element interface so it
 // runs on real DOM elements and on hand-made trees alike.
-import { LEADING_WS_RE, MEDIA_TYPE, asciiLower, normalizeValue, type Diagnostic, type JaiDocument } from './chars.ts';
+import { LEADING_WS_RE, MEDIA_TYPE, asciiLower, isAsciiSpace, normalizeValue, trimBy, type Diagnostic, type JaiDocument } from './chars.ts';
 import { decodeDataURL } from './decode.ts';
 import { parse, type ParseInfo } from './text.ts';
 
@@ -29,7 +29,7 @@ export interface Discovery {
 
 function mimeEssence(type: string | null): string {
   if (!type) return '';
-  return asciiLower((type.split(';')[0] ?? '').replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, ''));
+  return asciiLower(trimBy(type.split(';')[0] ?? '', isAsciiSpace));
 }
 
 export interface SrcsetCandidate { url: string; width: number | null; density: number | null; height: number | null }
@@ -47,7 +47,7 @@ export function srcsetCandidates(input: string | null | undefined): SrcsetCandid
     while (pos < s.length && !isWS(s.charAt(pos))) pos++;
     let url = s.slice(start, pos);
     const descriptors: string[] = [];
-    if (url.endsWith(',')) url = url.replace(/,+$/, '');
+    if (url.endsWith(',')) url = trimBy(url, c => c === 0x2c, false);
     else {
       while (pos < s.length && isWS(s.charAt(pos))) pos++;
       let current = '';

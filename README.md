@@ -8,7 +8,7 @@ holds four layers, each depending only on the ones above it:
 |---|---|---|
 | Library | `src/jai/` | Format logic only: no network, no rendering |
 | Engines | `src/providers/`, `src/renderers/`, `src/encoder/` | UI-free and environment-neutral: Replicate client, renderer, encoder loop |
-| Apps | `src/extension/`, `bin/jai.mjs` | The Chrome extension (viewer and encode page) and the command line |
+| Apps | `src/extension/`, `bin/jai.mjs`, `studio/` | The Chrome extension (viewer and encode page), the command line, and JAI Studio |
 | Tests | `test/` | Unit tests with mocked providers, the spec's conformance suite, end to end in Chrome |
 
 In detail:
@@ -26,7 +26,14 @@ In detail:
   web pages and renders them with your own Replicate account, when you ask, and
   an **encode page** that turns an image into JAI.
 - **`bin/jai.mjs`** — a command-line app: `jai encode`, `jai render`,
-  `jai validate`.
+  `jai validate`. With `--local` it uses JAI Studio's models instead of Replicate.
+- **`studio/`** — **JAI Studio**, one `jai` executable (Windows and Linux) that is a
+  command line, a desktop viewer and encoder, a Windows tray service, and a local model
+  server: Qwen3.8 27B (llama.cpp) and FLUX.1 schnell (stable-diffusion.cpp) on your own GPU,
+  behind OpenAI-style `/v1/chat/completions` and `/v1/images/generations` on 127.0.0.1. It
+  runs the same TypeScript library and encoder inside an embedded JavaScript engine. See
+  [`studio/README.md`](studio/README.md); the design and contracts are in
+  [`studio/DESIGN.md`](studio/DESIGN.md).
 
 The [specification and its conformance fixtures](https://github.com/gnistai/jai)
 are authoritative; this extension demonstrates them and must not be read as
@@ -179,8 +186,8 @@ about $0.03. See [`test/e2e/README.md`](test/e2e/README.md).
 
 Implement the `Renderer` interface in `src/renderers/types.ts`: list the models
 you support, map a `RenderIntent` to your provider's input, return image bytes,
-the exact prompt sent and renderer diagnostics. A local ComfyUI or diffusers
-renderer would fit the same interface without any change to the format.
+the exact prompt sent and renderer diagnostics. `src/renderers/local.ts` (JAI Studio's
+local FLUX.1 schnell) is an example of a second renderer behind the same interface.
 
 ## Licence
 
