@@ -2,6 +2,7 @@
 export * from './types.ts';
 export * from './budget.ts';
 export * from './metrics.ts';
+export { TRAITS } from './people.ts';
 export * from './engine.ts';
 export * from './prompts.ts';
 export * from './replicate-providers.ts';

@@ -96,7 +96,7 @@ test('engine: an inspection failure is one failed render, not a crash; nothing r
   let started = 0, returned = false, after = 0;
   const renderer = { id: 'm', label: 'm', models: () => models, async render(req) { started++; if (returned) after++; await new Promise(r => setTimeout(r, 5)); return { bytes: new Uint8Array([1]), mime: 'image/png', model: req.modelId, sentPrompt: '', sentNegative: null, sentInput: {}, jobId: null, diagnostics: [], outputURL: 'mock:' + started }; } };
   let n = 0;
-  const obs = { subjects: [{ name: 'thing', box: { ymin: 0.4, xmin: 0.4, ymax: 0.6, xmax: 0.6 } }], horizon: null, horizonShape: '', camera: '', lighting: '', medium: '' };
+  const obs = { subjects: [{ name: 'thing', box: { ymin: 0.4, xmin: 0.4, ymax: 0.6, xmax: 0.6 } }], people: [], crowd: null, horizon: null, horizonShape: '', camera: '', lighting: '', medium: '' };
   const analyst = { id: 'a', costHint: 0.005,
     async describe(t, k) { return { value: Array.from({ length: k }, (_, i) => ({ prompt: 'p' + i, style: [], avoid: [] })), notes: '', cost: 0.005 }; },
     async inspect(img, subjects) { if (subjects && ++n === 2) throw new Error('bad JSON'); return { value: obs, notes: '', cost: 0.001 }; },

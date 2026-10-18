@@ -1,6 +1,7 @@
 // Analysis-by-synthesis image encoder (spec: Encoding images, informative).
 // Measure, feed back numbers, optimise from history: the target is inspected
-// once; every candidate is rendered with every target model and several seeds;
+// once (subjects, people and their visible traits, horizon); every candidate is
+// rendered with every target model and several seeds, unless it names a group;
 // each render is inspected the same way and its fitness is computed from the
 // measured differences; an optimiser sees the best past candidates with their
 // measured errors and writes the next ones (OPRO-style). Lagging models then get
@@ -12,6 +13,7 @@ import { fromObject, interpret, serialize, type CatalogModel, type JaiDocument }
 import type { ModelInfo, RenderIntent, RenderResult } from '../renderers/types.ts';
 import { Budget, BudgetExceeded } from './budget.ts';
 import { measure, reduceAspect } from './metrics.ts';
+import { refusal } from './prompts.ts';
 import type { Analyst, AnalystReply, Candidate, Draft, EncodeOptions, EncodeResult, Generation, HistoryEntry, Observation, ScoredRender, SpendLine, StopReason, Thumbnail } from './types.ts';
 
 const SEGMENT = /^[a-z0-9][a-z0-9_-]*$/;
@@ -265,7 +267,7 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
     if (!budget.canAfford(analyst.costHint * 2 + evalCost(opts.models), ceilingA)) throw new Stop('budget', 'The budget does not cover measuring the target and one round of renders.');
     targetObs = (await call(analyst, () => analyst.inspect(opts.target, null, { ...ctx, careful: true }), 'inspect', 'inspect target', ceilingA)).value;
     emit({ type: 'target', observation: targetObs });
-    if (!targetObs.subjects.some(x => x.box)) emit({ type: 'log', message: 'The target inspection found no subjects with boxes; fitness uses the horizon and colours only.' });
+    if (!targetObs.subjects.some(x => x.box) && !targetObs.people.length) emit({ type: 'log', message: 'The target inspection found no subjects with boxes and no people; fitness uses the horizon and colours only.' });
 
     let reachedGoal = false;
     for (let lineage = 1; lineage <= restarts && !reachedGoal; lineage++) {
@@ -280,7 +282,21 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
       let notes = first.notes;
       let lineBest: Candidate | null = null;
       let stale = 0;
-      let drafts: Draft[] = fresh(first.value, seen);
+      /** The drafts that may be rendered; the others join the history unrendered, with the reason, for the optimiser to learn from. */
+      const screen = (ds: Draft[]): Draft[] => ds.filter(d => {
+        const why = refusal([d.prompt, ...d.style, ...d.avoid].join('; '));
+        if (!why) return true;
+        history.push({ draft: d, fitness: 0, feedback: Object.fromEntries(opts.models.map(m => [labels[m] ?? m, `not rendered: ${why}`])) });
+        seen.add(draftKey(d));
+        emit({ type: 'log', message: `Lineage ${lineage}: a description was not rendered: ${why}.` });
+        return false;
+      });
+      let drafts: Draft[] = screen(fresh(first.value, seen));
+      if (!drafts.length) {
+        const again = await call(optimiser, () => optimiser.propose(opts.target, { ...ctx, targetObservation: targetObs!, history: top(history), notes, n: population, scope: { kind: 'core' } }), 'analyst', `propose l${lineage}g0`, ceiling);
+        drafts = screen(fresh(usable(again.value), seen));
+        if (!drafts.length) throw new Stop('error', 'The analyst wrote no description that could be rendered.');
+      }
       let reason: StopReason = 'generations';
       for (let gen = 0; gen < maxGenerations; gen++) {
         let next: Candidate[];
@@ -301,21 +317,22 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
         if (reply.notes) notes = reply.notes;
         const proposed = usable(reply.value);
         if (!proposed.length) { emit({ type: 'log', message: `Lineage ${lineage}: the optimiser wrote no usable description.` }); reason = 'error'; break; }
-        drafts = fresh(proposed, seen);
-        // Repeats of descriptions already measured were dropped: ask once more for
-        // as many, when the budget still covers the drafts in hand and one more.
+        drafts = screen(fresh(proposed, seen));
+        // Repeats of descriptions already measured, and descriptions that may not be
+        // rendered, were dropped: ask once more for as many, when the budget still
+        // covers the drafts in hand and one more.
         const repeats = Math.min(population - drafts.length, proposed.length - drafts.length);
         if (repeats > 0 && budget.canAfford(optimiser.costHint + evalCost(opts.models) * (drafts.length + 1), ceiling)) {
           try {
-            const more = await call(optimiser, () => optimiser.propose(opts.target, { ...ctx, targetObservation: targetObs!, history: top(history), notes: `${notes}\nSome of your last descriptions repeated ones already measured; write different ones.`.trim(), n: repeats, scope: { kind: 'core' } }), 'analyst', `propose l${lineage}g${gen + 1} (more)`, ceiling);
-            drafts = [...drafts, ...fresh(usable(more.value), new Set([...seen, ...drafts.map(draftKey)]))].slice(0, population);
+            const more = await call(optimiser, () => optimiser.propose(opts.target, { ...ctx, targetObservation: targetObs!, history: top(history), notes: `${notes}\nSome of your last descriptions repeated ones already measured or were not rendered (see the history); write different ones.`.trim(), n: repeats, scope: { kind: 'core' } }), 'analyst', `propose l${lineage}g${gen + 1} (more)`, ceiling);
+            drafts = [...drafts, ...screen(fresh(usable(more.value), new Set([...seen, ...drafts.map(draftKey)])))].slice(0, population);
           } catch (e) {
             // The top-up is optional: a cancel, the time limit or the budget still stop the run; any other failure only leaves the drafts in hand.
             if (e instanceof Stop || e instanceof BudgetExceeded) throw e;
             emit({ type: 'log', message: `Lineage ${lineage}: asking for more descriptions failed (${messageOf(e)}); going on with ${drafts.length}.` });
           }
         }
-        if (!drafts.length) { emit({ type: 'log', message: `Lineage ${lineage}: the optimiser only repeated descriptions already measured.` }); reason = 'plateau'; break; }
+        if (!drafts.length) { emit({ type: 'log', message: `Lineage ${lineage}: the optimiser wrote nothing new that could be rendered.` }); reason = 'plateau'; break; }
       }
       stopReason = reason;
     }
@@ -339,6 +356,12 @@ export async function encode(opts: EncodeOptions): Promise<EncodeResult> {
           if (reply.notes) notes = reply.notes;
           const tried: Candidate[] = [];
           for (const [k, addition] of (reply.value as string[]).entries()) {
+            const why = refusal(addition);
+            if (why) {
+              tries.push({ draft: best.draft, addition, fitness: 0, feedback: { [labels[model]!]: `not rendered: ${why}` } });
+              emit({ type: 'log', message: `Refining ${labels[model]}: an addition was not rendered: ${why}.` });
+              continue;
+            }
             if (!budget.canAfford(evalCost([model]))) break;
             const c = await evaluate({ id: `r${round + 1}-${targets[model]}-${k + 1}`, lineage: best.lineage, generation: round, phase: 'refine', draft: best.draft, refinements: { ...best.refinements, [model]: [addition] } }, [model], opts.budgetUSD);
             tried.push(c);

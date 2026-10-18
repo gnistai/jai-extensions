@@ -66,13 +66,21 @@ reproduce as closely as possible. It follows the specification's informative
 section [Encoding images](https://jai.gnist.ai/spec/#image-encoding):
 
 1. A vision model (GPT-5.6 luna by default, Gemini 2.5 Flash as an option)
-   measures the original: its main subjects with bounding boxes, the horizon's
-   height and shape, the camera, the light and the medium. Palette and
-   lightness come from the pixels.
+   measures the original: its main subjects with bounding boxes, the prominent
+   people with their boxes and visible traits (apparent age and gender, skin
+   tone, hair, eyes, the shape of the face, clothing, pose), the horizon's height and shape, the
+   camera, the light and the medium. Palette and lightness come from the
+   pixels.
 2. It writes several first descriptions. Every candidate is rendered with every
    target model and two fixed seeds.
 3. Each render is measured the same way, and its fitness is computed from the
-   differences: positions, sizes, horizon, palette and lightness. Nothing is
+   differences: positions, sizes, people, horizon, palette and lightness.
+   People weigh by how tall they appear in the frame; each visible trait that
+   differs adds to a person's error (a gender swap or a large change of skin
+   tone alone counts three quarters), and someone of another kind costs as
+   much as someone missing: the aim is the same kind of person, not the same
+   face. A candidate that names a group or likens someone to a named person is
+   never rendered. Nothing is
    judged by feel, so scores are stable and comparable across runs. A
    candidate's fitness blends its mean and its worst per-model score.
 4. An optimiser (by default the same model; `--optimiser sonnet` uses Claude

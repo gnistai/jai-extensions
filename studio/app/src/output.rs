@@ -138,67 +138,12 @@ pub fn tray_tooltip(status: &SchedulerStatus) -> String {
     format!("JAI Studio: {}", engines_summary(status))
 }
 
-/// `Math.round(|x| * 100)%`, as the encoder's `pct`.
-fn pct(x: f64) -> String {
-    format!("{}%", (x.abs() * 100.0).round() as i64)
-}
-
 fn num(v: &Value, key: &str) -> Option<f64> {
     v.get(key).and_then(Value::as_f64)
 }
 
 fn text<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or("")
-}
-
-/// An encoder `Observation` in words, as `describeObservation` in
-/// `src/encoder/metrics.ts`.
-pub fn describe_observation(o: &Value) -> String {
-    let mut lines = Vec::new();
-    for s in o
-        .get("subjects")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let Some(b) = s.get("box").filter(|b| b.is_object()) else {
-            continue;
-        };
-        let (Some(ymin), Some(xmin), Some(ymax), Some(xmax)) = (
-            num(b, "ymin"),
-            num(b, "xmin"),
-            num(b, "ymax"),
-            num(b, "xmax"),
-        ) else {
-            continue;
-        };
-        lines.push(format!(
-            "- {}: x {}–{}, y {}–{} of the frame (width {}, height {})",
-            text(s, "name"),
-            pct(xmin),
-            pct(xmax),
-            pct(ymin),
-            pct(ymax),
-            pct(xmax - xmin),
-            pct(ymax - ymin)
-        ));
-    }
-    if let Some(h) = num(o, "horizon") {
-        let shape = text(o, "horizonShape");
-        let shape = if shape.is_empty() {
-            String::new()
-        } else {
-            format!(", {shape}")
-        };
-        lines.push(format!("- horizon: {} from the top{shape}", pct(h)));
-    }
-    lines.push(format!(
-        "- camera: {}; light: {}; medium: {}",
-        text(o, "camera"),
-        text(o, "lighting"),
-        text(o, "medium")
-    ));
-    lines.join("\n")
 }
 
 /// An error from the JavaScript host as a person reads it: without the
@@ -257,10 +202,7 @@ pub fn event_lines(e: &Value) -> Vec<String> {
             out.push(format!("== {}{lineage}", text(e, "phase")));
         }
         "target" => {
-            let d = e
-                .get("observation")
-                .map(describe_observation)
-                .unwrap_or_default();
+            let d = text(e, "described");
             out.push(format!("  target: {}", d.replace('\n', "\n          ")));
         }
         "candidate" => {
@@ -503,26 +445,6 @@ mod tests {
     }
 
     #[test]
-    fn observation_in_words() {
-        let o = json!({
-            "subjects": [
-                {"name": "castle", "box": {"ymin": 0.2, "xmin": 0.1, "ymax": 0.7, "xmax": 0.55}},
-                {"name": "moon", "box": null}
-            ],
-            "horizon": 0.62, "horizonShape": "flat",
-            "camera": "wide, eye level", "lighting": "dusk", "medium": "photo"
-        });
-        assert_eq!(
-            describe_observation(&o),
-            "- castle: x 10%–55%, y 20%–70% of the frame (width 45%, height 50%)\n\
-             - horizon: 62% from the top, flat\n\
-             - camera: wide, eye level; light: dusk; medium: photo"
-        );
-        let o = json!({"subjects": [], "horizon": null, "horizonShape": "", "camera": "c", "lighting": "l", "medium": "m"});
-        assert_eq!(describe_observation(&o), "- camera: c; light: l; medium: m");
-    }
-
-    #[test]
     fn encode_events() {
         assert_eq!(
             event_lines(&json!({"type": "phase", "phase": "describe", "lineage": 1})),
@@ -549,7 +471,7 @@ mod tests {
         );
         let g = json!({"type": "generation", "generation": {"lineage": 1, "index": 2, "best": "l1-g2-c1", "bestFitness": 0.7, "notes": "", "spent": 0}});
         assert_eq!(event_lines(&g), ["  -> l1 gen 2 best l1-g2-c1 0.700"]);
-        let t = json!({"type": "target", "observation": {"subjects": [], "horizon": 0.5, "horizonShape": "", "camera": "c", "lighting": "l", "medium": "m"}});
+        let t = json!({"type": "target", "observation": {}, "described": "- horizon: 50% from the top\n- camera: c; light: l; medium: m"});
         assert_eq!(
             event_lines(&t),
             ["  target: - horizon: 50% from the top\n          - camera: c; light: l; medium: m"]

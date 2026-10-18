@@ -4,6 +4,7 @@
 // APIs and globalThis.__jai (see globals.d.ts). See studio/DESIGN.md section 8.
 import { LocalAnalyst } from '../encoder/local-providers.ts';
 import { encode as runEncoder } from '../encoder/engine.ts';
+import { describeObservation } from '../encoder/metrics.ts';
 import type { Candidate, EncodeEvent, ScoredRender, Thumbnail } from '../encoder/types.ts';
 import * as J from '../jai/index.ts';
 import { OpenAIChatClient, errorText } from '../providers/openai-chat.ts';
@@ -221,6 +222,8 @@ export async function encode(opts: EncodeHostOptions): Promise<EncodeOutput> {
     }
   };
   const onEvent = (e: EncodeEvent): void => {
+    // The measured target also in words, as the optimiser reads it, for the CLI to print.
+    if (e.type === 'target') return send({ ...e, described: describeObservation(e.observation) });
     if (e.type !== 'candidate') return send(e);
     save(e.candidate);
     send({ type: 'candidate', candidate: { ...e.candidate, renders: e.candidate.renders.map(r => ({ model: r.model, seed: r.seed, file: files.get(r) ?? null, error: r.error, measure: r.measure, score: r.score })) } });
@@ -254,7 +257,7 @@ export async function encode(opts: EncodeHostOptions): Promise<EncodeOutput> {
     const report: unknown = JSON.parse(JSON.stringify({
       source: opts.sourceName ?? null, size: [target.width, target.height], models: [LOCAL_FLUX.id], analyst: analyst.id, optimiser: analyst.id,
       settings: { population, generations, seeds, restarts, goal, thinking, renderScale, timeLimitMs: timeLimitMs ?? null },
-      target: result.target, budgetUSD: 0, text: result.text, ranking: result.ranking, stopReason: result.stopReason, error: result.error,
+      target: result.target, targetDescribed: describeObservation(result.target), budgetUSD: 0, text: result.text, ranking: result.ranking, stopReason: result.stopReason, error: result.error,
       spentEstimateUSD: result.spent, seconds: result.seconds, generations: result.generations, best: strip(result.best),
       candidates: result.candidates.map(strip), spend: result.spend,
     }));

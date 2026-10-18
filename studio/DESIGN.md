@@ -795,6 +795,9 @@ What each function does:
   - Each render goes through `__jai.saveRender(name, bytes)` as it completes.
   - Each engine event goes through `__jai.emit`. Renders in events are replaced by
     `{model, seed, file, error, measure, score}`.
+  - The `target` event also carries `described`, the measured target in words as the optimiser
+    reads it (`describeObservation`); the report carries the same text as `targetDescribed`.
+    The CLI prints the one and the contact sheet shows the other; Rust formats neither.
 
 ## 9. TypeScript providers
 
@@ -827,25 +830,31 @@ export class LocalAnalyst implements Analyst {
 }
 ```
 
-- It uses the existing prompts (SYSTEM, describePrompt, INSPECT_SYSTEM, inspectTargetPrompt,
+- It uses the existing prompts (SYSTEM, describePrompt, inspectSystem('xy'), inspectTargetPrompt,
   inspectRenderPrompt, proposePrompt) and parsing (parseAnswer, toDrafts, toObservation,
   toAdditions).
 - Every call sends a JSON schema `response_format`:
   - describe and propose (core): `drafts` is an array of exactly n items `{prompt (≤1200 chars),
     style (≤3 strings ≤80), avoid (≤2 strings ≤80)}`, plus `notes` (≤600).
   - propose (refine): `additions`, exactly n strings ≤300, plus `notes`.
-  - inspect (target): `subjects` has 1 to 5 items `{name ≤60, bbox_2d: 4 integers 0–1000}`, plus
-    `horizon_y` (integer 0–1000 or null), `horizon_shape` (`flat`, `curved` or null), and
-    `camera`, `lighting` and `medium` (strings ≤120). `bbox_2d` is `[x1, y1, x2, y2]`, Qwen-VL's
-    own field and order (the prompts' `xy` convention); the Replicate analysts use `box_2d`
-    `[ymin, xmin, ymax, xmax]`.
+  - inspect (target): `subjects` has up to 5 items `{name ≤60, bbox_2d: 4 integers 0–1000}`
+    (people are not subjects; a plain portrait may have none), `people` up to 5 items
+    `{bbox_2d, face, stands_out ≤80, <trait>…}` where `face` is an enum of `FACES` and every
+    trait an enum of its words in `TRAITS` (`src/encoder/people.ts`), each or null;
+    `stands_out` makes the model look at the face before judging it and is never read back; `crowd` (`none`, `few`, `some`, `many` or null), `horizon_y` (integer 0–1000 or
+    null), `horizon_shape` (`flat`, `curved` or null), and `camera`, `lighting` and `medium`
+    (strings ≤120). `bbox_2d` is `[x1, y1, x2, y2]`, Qwen-VL's own field and order (the
+    prompts' `xy` convention); the Replicate analysts use `box_2d` `[ymin, xmin, ymax, xmax]`.
   - inspect (render): `subjects` has exactly the given length; each `name` is an enum of that
-    subject's name; `bbox_2d` is 4 integers or null.
+    subject's name; `bbox_2d` is 4 integers or null. `people` up to 6 items (a render lists
+    people down to a twentieth of the frame, so a shrunken person is still paired).
 - Thinking defaults to off for every call (`chat_template_kwargs: {enable_thinking: false}`).
   - `thinking: 'propose'` enables it for propose.
   - `thinking: 'all'` enables it for describe and propose. Inspection stays off.
 - Sampling:
-  - inspection: temperature 0, max_tokens 800;
+  - inspection: temperature 0, max_tokens 4096 (the longest answer the schema allows, five
+    subjects, six people with every trait and the scene, is about 1,200 tokens as compact JSON
+    and about 2,050 indented);
   - describe and propose: temperature 0.7, top_p 0.8, top_k 20, presence_penalty 0.5. max_tokens
     leaves room for the longest answer the schema allows, counted at 3 characters a token plus
     60 tokens per field (n drafts or additions, plus the notes), so no valid answer is cut off.
@@ -1165,7 +1174,8 @@ LLM and Image state.
   CLI.
 - Start and Cancel.
 - While it runs:
-  - the target image with the measured subject boxes and the horizon drawn as an SVG overlay;
+  - the target image with the measured subject and people boxes and the horizon drawn as an SVG
+    overlay, and each person's traits listed below it;
   - a small fitness-per-generation chart (inline SVG);
   - the current best candidate's render thumbnails with its measured feedback;
   - a scrolling list of candidates.

@@ -3,14 +3,14 @@
 // boxes, so the tests check that the loop really converges on the target.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { encode, measure, fitnessOf, describeObservation, Budget, BudgetExceeded, reduceAspect, thumbnailSimilarity, parseAnswer, toDrafts, toObservation, refinementTargets, buildDocument } from '../dist/encoder.mjs';
+import { encode, measure, fitnessOf, describeObservation, Budget, BudgetExceeded, reduceAspect, thumbnailSimilarity, parseAnswer, toDrafts, toObservation, refinementTargets, buildDocument, TRAITS, refusal } from '../dist/encoder.mjs';
 import { parse, interpret } from '../dist/jai.mjs';
 
 const MODELS = [
   { id: 'acme/alpha', label: 'Alpha', family: 'alpha', aliases: [], imageInput: false, negativePrompt: false, shortWindow: false, costHint: 0.01, description: '' },
   { id: 'acme/beta', label: 'Beta', family: 'beta', aliases: [], imageInput: false, negativePrompt: false, shortWindow: false, costHint: 0.02, description: '' },
 ];
-const TARGET_OBS = { subjects: [{ name: 'Earth', box: { ymin: 0.46, xmin: 0.49, ymax: 0.57, xmax: 0.64 } }], horizon: 0.8, horizonShape: 'flat', camera: 'wide', lighting: 'sun', medium: 'photograph' };
+const TARGET_OBS = { subjects: [{ name: 'Earth', box: { ymin: 0.46, xmin: 0.49, ymax: 0.57, xmax: 0.64 } }], people: [], crowd: 'none', horizon: 0.8, horizonShape: 'flat', camera: 'wide', lighting: 'sun', medium: 'photograph' };
 const target = { url: 'data:image/png;base64,AAAA', width: 960, height: 960 };
 
 // A draft encodes its layout as "w=0.30 cx=0.40 cy=0.30 hz=0.50".
@@ -42,7 +42,7 @@ function mockAnalyst(calls = [], { start = { w: 0.4, cx: 0.3, cy: 0.25, hz: 0.5 
       const noise = Number(seed) * 0.002;
       const w = p.w * (model === 'acme/beta' && !text.includes('beta-fix') ? 1.5 : 1) + noise;
       const h = w * (11 / 15);
-      return { value: { subjects: [{ name: 'Earth', box: { xmin: p.cx - w / 2, xmax: p.cx + w / 2, ymin: p.cy - h / 2, ymax: p.cy + h / 2 } }], horizon: p.hz, horizonShape: 'flat', camera: 'wide', lighting: 'sun', medium: 'photograph' }, notes: '', cost: 0.001 };
+      return { value: { subjects: [{ name: 'Earth', box: { xmin: p.cx - w / 2, xmax: p.cx + w / 2, ymin: p.cy - h / 2, ymax: p.cy + h / 2 } }], people: [], crowd: 'none', horizon: p.hz, horizonShape: 'flat', camera: 'wide', lighting: 'sun', medium: 'photograph' }, notes: '', cost: 0.001 };
     },
     async propose(t, ctx) {
       calls.push(['propose', ctx.scope.kind, ctx.history.length, ctx.history.map(h => h.fitness), ctx.n]);
@@ -109,6 +109,155 @@ test('toObservation: exact names first, then a changed name takes an answer no n
   assert.deepEqual(xs(toObservation(ans([['tree', 100], ['tree', 700]]), ['tree', 'tree'])), [['tree', 100], ['tree', 700]]);
   // Fewer answers than names: the rest have no box.
   assert.deepEqual(xs(toObservation(ans([['tree', 100]]), ['tree', 'large tree'])), [['tree', 100], ['large tree', null]]);
+});
+
+// People: a fair, blonde, blue-eyed young woman filling most of a portrait, a small man at the left.
+const box = (xmin, xmax, ymin, ymax) => ({ xmin, xmax, ymin, ymax });
+const WOMAN = { box: box(0.3, 0.7, 0.15, 0.95), face: 'clear', traits: { ...Object.fromEntries(TRAITS.map(t => [t.key, null])), gender: 'female', age: 'young adult', skin_tone: 'very light', undertone: 'pinkish', hair_colour: 'platinum blonde', hair_length: 'long', eye_colour: 'blue', lips: 'thin' } };
+const MAN = { box: box(0.02, 0.12, 0.6, 0.78), face: 'small', traits: { ...Object.fromEntries(TRAITS.map(t => [t.key, null])), gender: 'male', age: 'middle-aged', skin_tone: 'dark', hair_colour: 'black' } };
+const PORTRAIT = { subjects: [{ name: 'fjord', box: box(0, 1, 0.3, 0.7) }], people: [WOMAN, MAN], crowd: 'none', horizon: null, horizonShape: '', camera: 'close-up', lighting: 'overcast', medium: 'photograph' };
+const look = (p, traits, b = p.box) => ({ ...p, box: b, traits: { ...p.traits, ...traits } });
+
+test('measure: people are found by kind and place, and a changed look costs more than a small shift', () => {
+  const same = measure(PORTRAIT, PORTRAIT);
+  assert.ok(same.fitness > 0.99, String(same.fitness));
+  assert.deepEqual(same.people.map(p => [p.n, p.label, p.error]), [[1, 'young woman at centre', 0], [2, 'middle-aged man at left', 0]]);
+  // The change the owner does not want: brown eyes, dark brown hair and light-medium, olive skin in place of blue eyes, platinum blonde hair and very light, pinkish skin.
+  const changed = measure(PORTRAIT, { ...PORTRAIT, people: [look(WOMAN, { eye_colour: 'brown', hair_colour: 'dark brown', skin_tone: 'light-medium', undertone: 'olive' }), MAN] });
+  assert.match(changed.feedback, /^Largest first: person 1 \(young woman at centre\): skin tone light-medium \(target very light\), hair dark brown \(target platinum blonde\), eyes brown \(target blue\), skin undertone olive \(target pinkish\)$/);
+  assert.ok(changed.people[0].traitError >= 0.9, String(changed.people[0].traitError));
+  const moved = measure(PORTRAIT, { ...PORTRAIT, people: [look(WOMAN, {}, box(0.34, 0.74, 0.15, 0.95)), MAN] });
+  assert.ok(moved.fitness > changed.fitness + 0.15, `${moved.fitness} vs ${changed.fitness}`);
+  // One wrong eye colour alone is visible in the fitness, beyond seed noise.
+  const eyes = measure(PORTRAIT, { ...PORTRAIT, people: [look(WOMAN, { eye_colour: 'brown' }), MAN] });
+  assert.ok(same.fitness - eyes.fitness > 0.04, String(same.fitness - eyes.fitness));
+  assert.ok(measure(PORTRAIT, { ...PORTRAIT, people: [look(WOMAN, { eye_colour: 'grey' }), MAN] }).fitness > eyes.fitness, 'a neighbouring colour costs a quarter');
+  // Pairing follows the kind of person: listed in another order, swapped places, each still pairs with themselves.
+  const swapped = measure(PORTRAIT, { ...PORTRAIT, people: [look(MAN, {}, box(0.7, 0.8, 0.6, 0.78)), look(WOMAN, {}, box(0.0, 0.4, 0.15, 0.95))] });
+  assert.deepEqual(swapped.people.map(p => p.differs.length), [0, 0]);
+  assert.match(swapped.feedback, /person 1 \(young woman at centre\): 30% of the frame too far left/);
+  assert.match(swapped.feedback, /person 2 \(middle-aged man at left\): 68% of the frame too far right/);
+});
+
+test('measure: a missing person, an extra one, the crowd, a hidden face, and the cap on people', () => {
+  const missing = measure(PORTRAIT, { ...PORTRAIT, people: [MAN] });
+  assert.equal(missing.people[0].box, null);
+  assert.match(missing.feedback, /^Largest first: person 1 \(young woman at centre\): missing/);
+  const extra = measure(PORTRAIT, { ...PORTRAIT, people: [WOMAN, MAN, look(MAN, {}, box(0.8, 0.95, 0.5, 0.9))] });
+  assert.equal(extra.extraPeople, 1);
+  assert.match(extra.feedback, /an extra person, not in the target: middle-aged man at right \(40% of the frame tall\)/);
+  // A small extra figure is the crowd's business, not an extra person.
+  assert.equal(measure(PORTRAIT, { ...PORTRAIT, people: [WOMAN, MAN, look(MAN, {}, box(0.8, 0.85, 0.5, 0.56))] }).extraPeople, 0);
+  assert.match(measure(PORTRAIT, { ...PORTRAIT, crowd: 'many' }).feedback, /other people, too small or too many to list: many \(target none\)/);
+  // Turned away, the face cannot show the eyes: that costs, but the unread eyes are not compared.
+  const away = measure(PORTRAIT, { ...PORTRAIT, people: [look({ ...WOMAN, face: 'hidden' }, { eye_colour: null }), MAN] });
+  assert.match(away.feedback, /person 1 \(young woman at centre\): face hidden \(target clear\)/);
+  assert.doesNotMatch(away.feedback, /eyes/);
+  // Without people on either side nothing changes (Earthrise keeps its numbers).
+  assert.equal(measure(TARGET_OBS, TARGET_OBS).fitness, measure({ ...TARGET_OBS, crowd: null }, { ...TARGET_OBS, crowd: null }).fitness);
+  // A crowd of five missing people weighs no more than everything else together.
+  const crowd = { ...PORTRAIT, people: [0, 1, 2, 3, 4].map(i => look(MAN, {}, box(i * 0.2, i * 0.2 + 0.15, 0.2, 0.9))) };
+  const empty = measure(crowd, { ...crowd, people: [] });
+  assert.ok(empty.fitness >= 0.5 - 1e-9 && empty.fitness < 0.55, String(empty.fitness));
+});
+
+test('measure: a hidden feature never comes free, a turned-away face costs most, and what only the render has can only lower the fitness', () => {
+  const traitError = render => measure(PORTRAIT, { ...PORTRAIT, people: [render, MAN] }).people[0].traitError;
+  const unread = { eye_colour: null, lips: null, undertone: null };
+  const small = traitError(look({ ...WOMAN, face: 'small' }, unread));
+  const away = traitError(look({ ...WOMAN, face: 'hidden' }, { ...unread, facing: 'away' }));
+  assert.ok(small > 0 && away > small, `small ${small}, turned away ${away}`);
+  assert.equal(traitError(look({ ...WOMAN, face: null }, unread)), small, 'a face the inspector did not classify counts as small');
+  // A face that is small because the whole person is: the layout charges it, not the traits.
+  assert.equal(traitError(look({ ...WOMAN, face: 'small' }, unread, box(0.4, 0.6, 0.5, 0.95))), measure(PORTRAIT, PORTRAIT).people[0].traitError + 0.5 / 6);
+  // A turned-away face costs at most three quarters of a different person, whatever it hides.
+  const all = Object.fromEntries(TRAITS.filter(t => t.level === 'detail').map(t => [t.key, t.values[0]]));
+  const detailed = { ...PORTRAIT, people: [look(WOMAN, all), MAN] };
+  const turned = measure(detailed, { ...detailed, people: [look({ ...WOMAN, face: 'hidden' }, Object.fromEntries(Object.keys(all).map(k => [k, null]))), MAN] });
+  assert.equal(turned.people[0].traitError, 0.75);
+  // An unread trait costs half a wrong one; a detail left unread on a clear face costs nothing, since a clear face hides none.
+  assert.equal(traitError(look(WOMAN, { hair_colour: null })), traitError(look(WOMAN, { hair_colour: 'black' })) / 2);
+  assert.equal(traitError(look(WOMAN, unread)), traitError(WOMAN));
+  assert.doesNotMatch(measure(PORTRAIT, { ...PORTRAIT, people: [look(WOMAN, unread), MAN] }).feedback, /not seen/);
+  assert.match(measure(PORTRAIT, { ...PORTRAIT, people: [look(WOMAN, { hair_colour: null }), MAN] }).feedback, /hair not seen \(target platinum blonde\)/);
+  // A poor render read with background people or a horizon the target lacks scores no higher for it.
+  const empty = { subjects: [], people: [], crowd: 'none', horizon: null, horizonShape: '', camera: '', lighting: '', medium: '' };
+  const target = { ...empty, subjects: [{ name: 'boat', box: box(0.1, 0.3, 0.4, 0.6) }] };
+  const poor = { ...empty, subjects: [{ name: 'boat', box: null }] };
+  for (const extra of [{ crowd: 'few' }, { horizon: 0.5 }, { people: [MAN] }]) assert.ok(measure(target, { ...poor, ...extra }).fitness <= measure(target, poor).fitness, JSON.stringify(extra));
+});
+
+test('measure: people pair at the lowest cost to the fitness; a full target list counts no one as extra', () => {
+  const W = traits => ({ box: box(0, 0, 0, 0), face: 'small', traits: { gender: 'female', age: 'middle-aged', ...traits } });
+  const front = { ...W({}), box: box(0.22, 0.43, 0.22, 0.83) }, back = { ...W({}), box: box(0.37, 0.45, 0.13, 0.36) };
+  const target = { ...PORTRAIT, subjects: [], people: [front, back] };
+  const render = { ...target, people: [{ ...W({}), box: box(0.27, 0.42, 0.04, 0.46) }] };
+  const m = measure(target, render);
+  assert.ok(m.people[0].box && !m.people[1].box, 'the heavier foreground woman takes the one render person');
+  // Five people fill the target list: a sixth in the render may be someone the list left out.
+  const five = { ...PORTRAIT, people: [0, 1, 2, 3, 4].map(i => look(MAN, {}, box(i * 0.16, i * 0.16 + 0.12, 0.2, 0.8))) };
+  const six = { ...five, people: [...five.people, look(MAN, {}, box(0.84, 0.96, 0.2, 0.8))] };
+  assert.equal(measure(five, six).extraPeople, 0);
+  assert.equal(measure(five, six).fitness, measure(five, five).fitness);
+});
+
+test('people vocabulary: the kind of person weighs most; light eyes are near one another; skin keeps counting past three steps', () => {
+  const traitError = traits => measure(PORTRAIT, { ...PORTRAIT, people: [look(WOMAN, traits), MAN] }).people[0].traitError;
+  assert.equal(traitError({ gender: 'male' }), 0.75, 'a gender swap is three quarters of a different person');
+  assert.ok(traitError({ eye_colour: 'green' }) < traitError({ eye_colour: 'hazel' }), 'green is near blue, hazel is not');
+  assert.ok(traitError({ skin_tone: 'very dark' }) > traitError({ skin_tone: 'medium' }));
+  const neutral = { box: box(0.3, 0.7, 0.2, 0.9), face: 'small', traits: { gender: 'androgynous', age: 'middle-aged' } };
+  assert.equal(measure({ ...PORTRAIT, people: [neutral] }, { ...PORTRAIT, people: [neutral] }).people[0].label, 'middle-aged adult at centre');
+  // The right person in the wrong place still beats no one.
+  const far = measure(PORTRAIT, { ...PORTRAIT, people: [look(WOMAN, {}, box(0, 0.12, 0, 0.2)), MAN] });
+  assert.ok(far.people[0].box && far.people[0].error < 1, String(far.people[0].error));
+});
+
+test('refusal: descriptions that name a group or liken someone to a named person; features and ordinary words pass', () => {
+  for (const t of ['Photograph of a Scandinavian woman with blue eyes', 'a woman with Nordic features', 'a French woman at a café', 'Photograph of a Swedish young woman', 'Portrait. An Italian man with stubble', 'a white woman smiling', 'a man of African descent', 'olive Mediterranean skin', 'a woman resembling Taylor Swift'])
+    assert.ok(refusal(t), t);
+  for (const t of ['a black-and-white photograph of a woman', 'a man in a white shirt', 'French doors open onto a terrace', 'Chinese lanterns hang above the street', 'the white face of the clock tower', 'a woman with very light, pinkish skin, platinum blonde hair and blue eyes', 'a man with light olive skin and dark brown wavy hair', 'a woman with monolid eyes and a broad face', 'an African elephant at a waterhole', 'Stylish young woman in a red coat.', 'Photograph. Athletic man running on a beach'])
+    assert.equal(refusal(t), null, t);
+});
+
+test('encoder: a description that names a group is never rendered; the optimiser sees why', async () => {
+  const calls = [], log = [];
+  const analyst = mockAnalyst(calls);
+  const describe = analyst.describe;
+  analyst.describe = async (t, n) => {
+    const r = await describe(t, n);
+    return { ...r, value: [{ ...r.value[0], prompt: `A Scandinavian-looking woman. ${r.value[0].prompt}` }, ...r.value.slice(1)] };
+  };
+  const renderer = mockRenderer(log);
+  const r = await encode({ target, models: ['acme/alpha'], renderer, analyst, budgetUSD: 1, population: 3, maxGenerations: 2, seeds: [1], refine: false });
+  assert.ok(log.every(x => !/Scandinavian/.test(x.description)), 'never sent to a renderer');
+  assert.equal(r.candidates.filter(c => c.generation === 0).length, 2, 'the other two first drafts were rendered');
+  const seen = calls.find(c => c[0] === 'propose');
+  assert.ok(seen && seen[3].includes(0), 'the refused draft reaches the optimiser with fitness 0');
+});
+
+test('toObservation: people read in their own words; details only from a clear face; small target people left to the crowd', () => {
+  const person = (bbox, extra) => ({ bbox_2d: bbox, face: 'clear', gender: 'Female', age: 'young adult', skin_tone: 'light medium', eye_colour: 'blue', lips: 'pouty', ...extra });
+  const o = toObservation({ subjects: [], people: [person([100, 200, 300, 900]), person([600, 500, 650, 560]), person([400, 100, 700, 600], { face: 'small' })], crowd: 'few' }, null, 'xy');
+  assert.equal(o.people.length, 2, 'the person 6% of the frame tall is left out of the target');
+  assert.equal(o.crowd, 'few');
+  const [a, b] = o.people;
+  assert.deepEqual(a.box, { ymin: 0.2, xmin: 0.1, ymax: 0.9, xmax: 0.3 }, 'largest first, in [ymin, xmin, ymax, xmax]');
+  assert.deepEqual([a.traits.gender, a.traits.skin_tone, a.traits.eye_colour, a.traits.lips], ['female', 'light-medium', 'blue', null], 'case, spaces and hyphens do not matter; unknown words are dropped');
+  assert.equal(b.face, 'small');
+  assert.equal(b.traits.eye_colour, null, 'no eye colour from a small face');
+  assert.equal(b.traits.skin_tone, 'light-medium');
+  // A render keeps people down to the smallest listed, so a shrunken person is still found.
+  assert.equal(toObservation({ subjects: [], people: [person([600, 500, 650, 560])] }, [], 'xy').people.length, 1);
+  assert.match(describeObservation(PORTRAIT), /- person 1 \(young woman at centre\): x 30%–70%, y 15%–95% of the frame \(80% of the frame tall\); face clear; apparent gender female, age young adult, skin tone very light, hair platinum blonde, hair length long, eyes blue, lips thin, skin undertone pinkish/);
+  assert.match(describeObservation(PORTRAIT), /- other people, too small or too many to list: none/);
+  // One person listed twice is one person; a target subject that is a person is measured as the person.
+  const twice = toObservation({ subjects: [{ name: 'woman', bbox_2d: [101, 199, 301, 902] }, { name: 'sea', bbox_2d: [0, 0, 1000, 500] }], people: [person([100, 200, 300, 900]), person([102, 201, 302, 899])] }, null, 'xy');
+  assert.equal(twice.people.length, 1);
+  assert.deepEqual(twice.subjects.map(s => s.name), ['sea']);
+  // US spelling and common synonyms land on the listed words.
+  const us = toObservation({ subjects: [], people: [person([100, 200, 300, 900], { age: 'Teenager', hair_colour: 'gray', eye_colour: 'Gray', clothing: 'multicolored', glasses: 'sun glasses' })] }, null, 'xy').people[0].traits;
+  assert.deepEqual([us.age, us.hair_colour, us.eye_colour, us.clothing, us.glasses], ['teen', 'grey', 'grey', 'multicoloured', 'sunglasses']);
 });
 
 test('encoder: measured feedback drives the loop to the goal', async () => {

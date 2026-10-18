@@ -217,7 +217,10 @@ function candidateCard(c: Candidate): HTMLElement {
 
 let currentGen: HTMLElement | null = null;
 function onEvent(e: EncodeEvent): void {
-  if (e.type === 'target') log(`Measured the image: ${e.observation.subjects.map(s => s.name).join(', ') || 'no distinct subjects'}${e.observation.horizon !== null ? `, horizon at ${Math.round(e.observation.horizon * 100)}%` : ''}.`);
+  if (e.type === 'target') {
+    const o = e.observation, n = o.people.length;
+    log(`Measured the image: ${o.subjects.map(s => s.name).join(', ') || 'no distinct subjects'}${n ? `, ${n} ${n === 1 ? 'person' : 'people'}` : ''}${o.horizon !== null ? `, horizon at ${Math.round(o.horizon * 100)}%` : ''}.`);
+  }
   if (e.type === 'phase') { log({ inspect: 'Measuring the image…', describe: `Describing the image${e.lineage && e.lineage > 1 ? ` (attempt ${e.lineage})` : ''}…`, evolve: 'Rendering, measuring and improving…', refine: 'Trying per-model refinements…', done: 'Done.' }[e.phase]); currentGen = null; log(`${$('spend').textContent || 'Nothing spent yet.'}`); }
   if (e.type === 'log') log(e.message);
   if (e.type === 'spend') $('spend').textContent = `Estimated spend ${usd(e.spent)} of ${usd(e.limit)}`;

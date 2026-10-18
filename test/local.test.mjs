@@ -13,7 +13,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   OpenAIChatClient, LocalAnalyst, LocalRenderer, LOCAL_FLUX, FLUX_SIZES, REPLICATE_MODELS, base64ToBytes, encode, previewRatio,
-  SYSTEM, inspectSystem, describePrompt, inspectTargetPrompt, inspectRenderPrompt, proposePrompt, describeObservation,
+  SYSTEM, inspectSystem, describePrompt, inspectTargetPrompt, inspectRenderPrompt, proposePrompt, describeObservation, TRAITS,
 } from '../dist/encoder.mjs';
 import { buildInput } from '../dist/test/replicate.js';
 import { parse } from '../dist/jai.mjs';
@@ -175,11 +175,20 @@ test('analyst describe: the system prompt, one data: URL image, exactly n drafts
 });
 
 const OBS_ANSWER = { horizon_y: 805, horizon_shape: 'flat', camera: 'wide, eye level', lighting: 'low sun', medium: 'photograph' };
+/** The people list as the grammar fixes it: a box, the face, then every trait as one of its words or null. */
+const PEOPLE = max => ({
+  type: 'array', maxItems: max,
+  items: {
+    type: 'object',
+    properties: { bbox_2d: { type: 'array', items: { type: 'integer', minimum: 0, maximum: 1000 }, minItems: 4, maxItems: 4 }, face: { enum: ['clear', 'small', 'hidden', null] }, stands_out: { type: 'string', maxLength: 80 }, ...Object.fromEntries(TRAITS.map(t => [t.key, { enum: [...t.values, null] }])) },
+    required: ['bbox_2d', 'face', 'stands_out', ...TRAITS.map(t => t.key)], additionalProperties: false,
+  },
+});
 
-test('analyst inspect (target): 1 to 5 subjects with integer boxes, greedy, never thinking', async () => {
+test('analyst inspect (target): up to 5 subjects and the people, integer boxes and listed words, greedy, never thinking', async () => {
   const { f, analyst } = analystWith(() => answer({ subjects: [{ name: 'red bicycle', bbox_2d: [100, 400, 500, 900] }], ...OBS_ANSWER }), { thinking: 'all' });
   const r = await analyst.inspect(TARGET, null, { models: ['FLUX.1 schnell'], careful: true });
-  assert.deepEqual(r.value, { subjects: [{ name: 'red bicycle', box: { ymin: 0.4, xmin: 0.1, ymax: 0.9, xmax: 0.5 } }], horizon: 0.805, horizonShape: 'flat', camera: 'wide, eye level', lighting: 'low sun', medium: 'photograph' });
+  assert.deepEqual(r.value, { subjects: [{ name: 'red bicycle', box: { ymin: 0.4, xmin: 0.1, ymax: 0.9, xmax: 0.5 } }], people: [], crowd: null, horizon: 0.805, horizonShape: 'flat', camera: 'wide, eye level', lighting: 'low sun', medium: 'photograph' });
   assert.equal(r.cost, 0);
   const { body } = f.calls[0];
   assert.equal(body.messages[0].content, inspectSystem('xy'), 'boxes in Qwen\'s own [x1, y1, x2, y2] order');
@@ -190,14 +199,14 @@ test('analyst inspect (target): 1 to 5 subjects with integer boxes, greedy, neve
   const scene = { horizon_y: { anyOf: [coord, { type: 'null' }] }, horizon_shape: { enum: ['flat', 'curved', null] }, camera: { type: 'string', maxLength: 120 }, lighting: { type: 'string', maxLength: 120 }, medium: { type: 'string', maxLength: 120 } };
   assert.deepEqual(sentSchema(f.calls[0]), {
     type: 'object',
-    properties: { subjects: { type: 'array', items: { type: 'object', properties: { name: { type: 'string', minLength: 1, maxLength: 60 }, bbox_2d: box }, required: ['name', 'bbox_2d'], additionalProperties: false }, minItems: 1, maxItems: 5 }, ...scene },
-    required: ['subjects', 'horizon_y', 'horizon_shape', 'camera', 'lighting', 'medium'], additionalProperties: false,
+    properties: { subjects: { type: 'array', items: { type: 'object', properties: { name: { type: 'string', minLength: 1, maxLength: 60 }, bbox_2d: box }, required: ['name', 'bbox_2d'], additionalProperties: false }, maxItems: 5 }, people: PEOPLE(5), crowd: { enum: ['none', 'few', 'some', 'many', null] }, ...scene },
+    required: ['subjects', 'people', 'crowd', 'horizon_y', 'horizon_shape', 'camera', 'lighting', 'medium'], additionalProperties: false,
   });
   assert.deepEqual(body.chat_template_kwargs, { enable_thinking: false });
-  assert.deepEqual(sampling(body), { temperature: 0, max_tokens: 800 });
+  assert.deepEqual(sampling(body), { temperature: 0, max_tokens: 4096 });
 });
 
-test('analyst inspect (render): one entry per given subject, named from the list in any order, boxes may be null', async () => {
+test('analyst inspect (render): one entry per given subject, named from the list in any order, boxes may be null; up to 6 people', async () => {
   const { f, analyst } = analystWith(() => answer({ subjects: [{ name: 'red bicycle', bbox_2d: [120, 410, 520, 880] }, { name: 'white wall', bbox_2d: null }], ...OBS_ANSWER, horizon_y: null, horizon_shape: null }));
   const subjects = ['red bicycle', 'white wall'];
   const r = await analyst.inspect({ url: 'data:image/png;base64,iVBORw0KGgo=' }, subjects, { models: ['FLUX.1 schnell'] });
@@ -213,11 +222,12 @@ test('analyst inspect (render): one entry per given subject, named from the list
   assert.equal(list.maxItems, 2);
   assert.deepEqual(list.items.properties.name, { type: 'string', enum: ['red bicycle', 'white wall'] });
   assert.deepEqual(list.items.properties.bbox_2d, { anyOf: [{ type: 'array', items: { type: 'integer', minimum: 0, maximum: 1000 }, minItems: 4, maxItems: 4 }, { type: 'null' }] });
+  assert.deepEqual(sentSchema(f.calls[0]).properties.people, PEOPLE(6), 'a render lists one more person than the target, down to a twentieth of the frame');
   // Answered in another order, each box still lands on its subject.
   const swapped = analystWith(() => answer({ subjects: [{ name: 'white wall', bbox_2d: [0, 0, 600, 1000] }, { name: 'red bicycle', bbox_2d: [120, 410, 520, 880] }], ...OBS_ANSWER }));
   const r2 = await swapped.analyst.inspect({ url: 'data:image/png;base64,iVBORw0KGgo=' }, subjects, { models: ['FLUX.1 schnell'] });
   assert.deepEqual(r2.value.subjects.map(s => [s.name, s.box?.ymin]), [['red bicycle', 0.41], ['white wall', 0]]);
-  assert.deepEqual(sampling(body), { temperature: 0, max_tokens: 800 });
+  assert.deepEqual(sampling(body), { temperature: 0, max_tokens: 4096 });
   // No subjects with boxes in the target: an empty list.
   const none = analystWith(() => answer({ subjects: [], ...OBS_ANSWER }));
   await none.analyst.inspect(TARGET, [], { models: [] });
@@ -226,7 +236,7 @@ test('analyst inspect (render): one entry per given subject, named from the list
   assert.equal('prefixItems' in empty, false);
 });
 
-const TARGET_OBS = { subjects: [{ name: 'red bicycle', box: { ymin: 0.4, xmin: 0.1, ymax: 0.9, xmax: 0.5 } }], horizon: 0.8, horizonShape: 'flat', camera: 'wide', lighting: 'sun', medium: 'photograph' };
+const TARGET_OBS = { subjects: [{ name: 'red bicycle', box: { ymin: 0.4, xmin: 0.1, ymax: 0.9, xmax: 0.5 } }], people: [], crowd: null, horizon: 0.8, horizonShape: 'flat', camera: 'wide', lighting: 'sun', medium: 'photograph' };
 const history = [{ draft: { prompt: 'Photograph of a red bicycle', style: ['photo'], avoid: [] }, fitness: 0.61, feedback: { 'FLUX.1 schnell': 'Largest first: red bicycle: 1.4× too wide' } }];
 const proposeCtx = (scope, n = 3) => ({ models: ['FLUX.1 schnell'], maxWords: 120, targetObservation: TARGET_OBS, history, notes: 'earlier notes', n, scope });
 
@@ -273,8 +283,15 @@ test('analyst max_tokens: room for the longest answer the schema allows; with th
     await analyst.propose(TARGET, proposeCtx({ kind: 'core' }, 2));
     return f.calls.map(c => c.body.max_tokens);
   };
-  assert.deepEqual(await think('propose'), [2 * DRAFT_TOKENS + NOTES_TOKENS, 800, 8192]);
-  assert.deepEqual(await think('all'), [8192, 800, 8192]);
+  assert.deepEqual(await think('propose'), [2 * DRAFT_TOKENS + NOTES_TOKENS, 4096, 8192]);
+  assert.deepEqual(await think('all'), [8192, 4096, 8192]);
+  // The longest inspection: five subjects, six people with the longest word of every trait, and the scene.
+  const longestWord = values => values.reduce((a, v) => (v.length > a.length ? v : a), '');
+  const person = { bbox_2d: [1000, 1000, 1000, 1000], face: 'hidden', stands_out: 'x'.repeat(80), ...Object.fromEntries(TRAITS.map(t => [t.key, longestWord(t.values)])) };
+  const inspection = { subjects: Array(5).fill({ name: 'x'.repeat(60), bbox_2d: [1000, 1000, 1000, 1000] }), people: Array(6).fill(person), crowd: 'some', ...OBS_ANSWER, camera: 'x'.repeat(120), lighting: 'x'.repeat(120), medium: 'x'.repeat(120) };
+  // Pessimistic: every digit its own token, the rest at 3 characters a token, indented.
+  const text = JSON.stringify(inspection, null, 1), digits = text.replace(/\D/g, '').length;
+  assert.ok(4096 >= digits + (text.length - digits) / 3, String(digits + (text.length - digits) / 3));
 });
 
 test('analyst thinking: off by default; propose, or describe and propose; inspection never', async () => {

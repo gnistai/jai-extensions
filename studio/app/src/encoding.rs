@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::output::{describe_observation, first_feedback, short_model};
+use crate::output::{first_feedback, short_model};
 
 /// Largest image accepted for encoding (DESIGN.md section 12).
 pub const MAX_IMAGE_BYTES: u64 = 40 << 20;
@@ -472,11 +472,7 @@ pub fn contact_sheet(report: &Value, info: &SheetInfo) -> String {
         .get("seconds")
         .and_then(Value::as_f64)
         .unwrap_or(info.seconds);
-    let target = report
-        .get("target")
-        .filter(|t| t.is_object())
-        .map(describe_observation)
-        .unwrap_or_default();
+    let target = str_of(report, "targetDescribed");
     let best_id = report.get("best").map(|b| str_of(b, "id")).unwrap_or("");
     let error = str_of(report, "error");
     let analyst = str_of(report, "analyst");
@@ -486,7 +482,7 @@ pub fn contact_sheet(report: &Value, info: &SheetInfo) -> String {
         h,
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>JAI encoding: {src}</title>\n<style>{SHEET_STYLE}</style></head><body>\n<h1>JAI encoding of {src}</h1>\n<div class=\"row\"><figure style=\"max-width:360px\"><img src=\"target.jpg\" alt=\"Target image\"><figcaption>Target, {width}×{height}</figcaption></figure><pre style=\"flex:1;min-width:260px\">{target}</pre></div>\n<h2>Result</h2><pre>{text}</pre>\n<table><tr><th>Model</th><th>Score</th></tr>",
         src = esc(source),
-        target = esc(&target),
+        target = esc(target),
         text = esc(text),
     );
     for r in arr(report, "ranking") {
@@ -499,7 +495,7 @@ pub fn contact_sheet(report: &Value, info: &SheetInfo) -> String {
     }
     let _ = write!(
         h,
-        "</table>\n<p>Stopped: {}{} in {:.0} s.{} Fitness is measured against the target's boxes, horizon and colours.</p>\n",
+        "</table>\n<p>Stopped: {}{} in {:.0} s.{} Fitness is measured against the target's subjects, people, horizon and colours.</p>\n",
         esc(stop),
         if error.is_empty() {
             String::new()
@@ -633,6 +629,7 @@ mod tests {
             "analyst": "local/qwen3.8-27b",
             "target": {"subjects": [{"name": "castle", "box": {"ymin": 0.2, "xmin": 0.1, "ymax": 0.7, "xmax": 0.5}}],
                        "horizon": 0.6, "horizonShape": "flat", "camera": "wide", "lighting": "dusk", "medium": "photo"},
+            "targetDescribed": "- castle: x 10%–50%, y 20%–70% of the frame (width 40%, height 50%)\n- horizon: 60% from the top, flat",
             "text": "a castle at dusk\nstyle=photo",
             "ranking": [{"model": "black-forest-labs/flux-schnell", "score": 0.734}],
             "stopReason": "goal", "error": null, "seconds": 312.4,

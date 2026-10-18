@@ -311,7 +311,7 @@ test('host encode: renders streamed to saveRender, events as JSON with render re
 
   // The report: the Node CLI's report.json shape, renders by file name.
   const report = out.report;
-  assert.deepEqual(Object.keys(report), ['source', 'size', 'models', 'analyst', 'optimiser', 'settings', 'target', 'budgetUSD', 'text', 'ranking', 'stopReason', 'error', 'spentEstimateUSD', 'seconds', 'generations', 'best', 'candidates', 'spend']);
+  assert.deepEqual(Object.keys(report), ['source', 'size', 'models', 'analyst', 'optimiser', 'settings', 'target', 'targetDescribed', 'budgetUSD', 'text', 'ranking', 'stopReason', 'error', 'spentEstimateUSD', 'seconds', 'generations', 'best', 'candidates', 'spend']);
   assert.equal(report.source, 'earthrise.jpg');
   assert.deepEqual(report.size, [1200, 800]);
   assert.deepEqual(report.models, ['black-forest-labs/flux-schnell']);

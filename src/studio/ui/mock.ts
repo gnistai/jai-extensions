@@ -82,8 +82,9 @@ const ENGINE_READY: Record<EngineKind, string[]> = {
 // ---------------------------------------------------------------- painted placeholder scenes
 
 /** A lighthouse at sunset; the encoder mock jitters these numbers and measures the result. */
-interface Scene { horizon: number; tower: number; towerH: number; island: number; boatX: number; boat: boolean; sunX: number; hue: number; light: number; medium: number }
-const TARGET: Scene = { horizon: 0.58, tower: 0.61, towerH: 0.44, island: 1, boatX: 0.17, boat: true, sunX: 0.3, hue: 0, light: 0, medium: 0 };
+interface Scene { horizon: number; tower: number; towerH: number; island: number; boatX: number; boat: boolean; sunX: number; hue: number; light: number; medium: number; walkerX: number; coat: number }
+const TARGET: Scene = { horizon: 0.58, tower: 0.61, towerH: 0.44, island: 1, boatX: 0.17, boat: true, sunX: 0.3, hue: 0, light: 0, medium: 0, walkerX: 0.86, coat: 0 };
+const COATS = ['yellow', 'red'];
 const MEDIA = ['watercolour painting', 'digital painting', 'photograph'];
 const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
 
@@ -111,6 +112,8 @@ function jitter(b: Scene, spread: number, rand: () => number): Scene {
     hue: b.hue + n() * 45 * spread,
     light: clamp(b.light + n() * 14 * spread, -14, 14),
     medium: rand() < 0.35 * spread ? Math.floor(rand() * 3) : b.medium,
+    walkerX: clamp(b.walkerX + n() * 0.15 * spread, 0.55, 0.92),
+    coat: rand() < 0.4 * spread ? 1 - b.coat : b.coat,
   };
 }
 
@@ -120,6 +123,7 @@ function toward(a: Scene, t: number): Scene {
   return {
     horizon: mix(a.horizon, TARGET.horizon), tower: mix(a.tower, TARGET.tower), towerH: mix(a.towerH, TARGET.towerH), island: mix(a.island, TARGET.island),
     boatX: mix(a.boatX, TARGET.boatX), boat: a.boat || t > 0.3, sunX: mix(a.sunX, TARGET.sunX), hue: mix(a.hue, 0), light: mix(a.light, 0), medium: t > 0.3 ? 0 : a.medium,
+    walkerX: mix(a.walkerX, TARGET.walkerX), coat: t > 0.3 ? 0 : a.coat,
   };
 }
 
@@ -163,6 +167,14 @@ function paint(w: number, h: number, s: Scene): HTMLCanvasElement {
     g.fillStyle = '#2a2420'; g.beginPath(); g.moveTo(bx - X(0.035), by); g.lineTo(bx + X(0.035), by); g.lineTo(bx + X(0.025), by + Y(0.03)); g.lineTo(bx - X(0.025), by + Y(0.03)); g.closePath(); g.fill();
     g.fillStyle = '#efe6d6'; g.beginPath(); g.moveTo(bx, by - Y(0.085)); g.lineTo(bx, by - Y(0.004)); g.lineTo(bx + X(0.03), by - Y(0.004)); g.closePath(); g.fill();
   }
+  // A walker in a raincoat on the rocks in the right foreground.
+  const wx = X(s.walkerX);
+  g.fillStyle = `hsl(${20 + hue} 16% ${9 + L / 2}%)`;
+  g.beginPath(); g.moveTo(wx - X(0.16), h); g.quadraticCurveTo(wx - X(0.05), Y(0.9), wx + X(0.04), Y(0.93)); g.quadraticCurveTo(wx + X(0.12), Y(0.95), wx + X(0.2), h); g.closePath(); g.fill();
+  g.fillStyle = s.coat ? '#b8262d' : '#e8b520';
+  g.beginPath(); g.moveTo(wx - X(0.012), Y(0.78)); g.lineTo(wx + X(0.012), Y(0.78)); g.lineTo(wx + X(0.022), Y(0.92)); g.lineTo(wx - X(0.022), Y(0.92)); g.closePath(); g.fill();
+  g.fillStyle = '#d9a982'; g.beginPath(); g.arc(wx, Y(0.755), Math.min(X(0.011), Y(0.022)), 0, Math.PI * 2); g.fill();
+  g.fillStyle = '#3b2a1f'; g.fillRect(wx - X(0.012), Y(0.733), X(0.024), Y(0.012));
   if (s.medium === 0) { g.fillStyle = 'rgba(255, 250, 240, 0.07)'; for (let i = 0; i < 40; i++) g.fillRect(X(((i * 37) % 100) / 100), Y(((i * 53) % 100) / 100), X(0.08), Y(0.05)); }
   return c;
 }
@@ -178,6 +190,11 @@ function observe(s: Scene): Observation {
       { name: 'rocky island', box: box(hy - 0.08, s.tower - 0.2 * s.island, hy + 0.11, s.tower + 0.25 * s.island) },
       { name: 'sailing boat', box: s.boat ? box(hy - 0.04, s.boatX - 0.035, hy + 0.075, s.boatX + 0.035) : null },
     ],
+    people: [{
+      box: box(0.725, s.walkerX - 0.024, 0.93, s.walkerX + 0.024), face: 'small',
+      traits: { gender: 'female', age: 'young adult', skin_tone: 'light', hair_colour: 'dark brown', hair_length: 'short', clothing: COATS[s.coat] ?? 'yellow', pose: 'standing', facing: 'camera' },
+    }],
+    crowd: 'none',
     horizon: hy, horizonShape: 'flat', camera: 'eye level, wide shot',
     lighting: s.hue > 30 ? 'cool dusk light' : 'low warm sunset light from the left', medium: MEDIA[s.medium] ?? 'watercolour painting',
   };
@@ -198,13 +215,14 @@ function draftOf(s: Scene): Draft {
   const size = s.towerH > 0.4 ? 'tall and slender, its lantern high in the sky' : s.towerH > 0.3 ? 'of middling height' : 'small against the sky';
   const hz = s.horizon > 0.62 ? 'low in the frame' : s.horizon < 0.52 ? 'above the middle' : 'just below the middle';
   const boat = s.boat ? `, and a small sailing boat ${s.boatX < 0.25 ? 'far to the left' : 'left of the island'}` : '';
+  const walker = `On the dark rocks in the right foreground a woman with light skin and short dark brown hair stands in a ${COATS[s.coat] ?? 'yellow'} raincoat, about a fifth of the frame tall${s.walkerX > 0.8 ? ', near the right edge' : ''}.`;
   return {
-    prompt: `A red-and-white striped lighthouse stands on a dark rocky island ${where}, ${size}. Calm sea with the horizon ${hz}${boat}. The low sun on the left turns the sky orange, fading to violet above.`,
-    style: [MEDIA[s.medium] ?? 'watercolour painting', 'soft washes'], avoid: ['text', 'people'],
+    prompt: `A red-and-white striped lighthouse stands on a dark rocky island ${where}, ${size}. Calm sea with the horizon ${hz}${boat}. ${walker} The low sun on the left turns the sky orange, fading to violet above.`,
+    style: [MEDIA[s.medium] ?? 'watercolour painting', 'soft washes'], avoid: ['text'],
   };
 }
 
-const VIEW_PROMPT = 'A red-and-white lighthouse on a rocky island at sunset, calm sea, a small sailing boat far left';
+const VIEW_PROMPT = 'A red-and-white lighthouse on a rocky island at sunset, calm sea, a small sailing boat far left, a woman in a yellow raincoat on the rocks at right';
 const VIEW_DOC = `${VIEW_PROMPT};aspect=16:10;style=watercolour, soft washes`;
 
 // ---------------------------------------------------------------- the backend

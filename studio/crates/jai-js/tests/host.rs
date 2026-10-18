@@ -134,14 +134,16 @@ async fn chat(
             json!({ "notes": "", "additions": (0..n).map(|i| format!("addition {i}")).collect::<Vec<_>>() })
         }
         "jai_target_inspection" => {
-            json!({ "subjects": [{ "name": "planet", "bbox_2d": [450, 400, 600, 550] }] })
+            json!({ "subjects": [{ "name": "planet", "bbox_2d": [450, 400, 600, 550] }],
+                    "people": [{ "bbox_2d": [100, 300, 300, 900], "face": "clear", "gender": "female", "eye_colour": "blue" }], "crowd": "none" })
         }
         "jai_render_inspection" => {
             let names: Vec<Value> = props["subjects"]["items"]["properties"]["name"]["enum"]
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
-            json!({ "subjects": names.into_iter().map(|n| json!({ "name": n, "bbox_2d": [440, 380, 610, 560] })).collect::<Vec<_>>() })
+            json!({ "subjects": names.into_iter().map(|n| json!({ "name": n, "bbox_2d": [440, 380, 610, 560] })).collect::<Vec<_>>(),
+                    "people": [{ "bbox_2d": [100, 300, 300, 900], "face": "clear", "gender": "female", "eye_colour": "brown" }], "crowd": "none" })
         }
         other => {
             return (
@@ -581,6 +583,25 @@ async fn encode_against_a_mock_server() {
     }
     assert_eq!(out.report["candidates"].as_array().map(Vec::len), Some(4));
     assert_eq!(out.report["source"], "disc.png");
+
+    // People: measured in the target, described in words for the CLI, compared in every render.
+    let described = out.report["targetDescribed"].as_str().unwrap_or_default();
+    assert!(
+        described.contains("- person 1 (woman at left)"),
+        "{described}"
+    );
+    let target_event = events
+        .iter()
+        .find(|e| e["type"] == "target")
+        .expect("a target event");
+    assert_eq!(target_event["described"].as_str(), Some(described));
+    let feedback = candidates[0]["candidate"]["renders"][0]["measure"]["feedback"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        feedback.contains("person 1 (woman at left): eyes brown (target blue)"),
+        "{feedback}"
+    );
 }
 
 #[tokio::test]

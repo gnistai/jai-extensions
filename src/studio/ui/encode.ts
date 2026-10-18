@@ -1,9 +1,10 @@
 // Encode tab (studio/DESIGN.md section 11): choose an image, set the encoder
 // options (the CLI's defaults), then watch the run: the target with its
-// measured subjects and horizon, fitness per generation, the best candidate's
+// measured subjects, people and horizon, fitness per generation, the best candidate's
 // renders with their measured feedback, and every candidate. At the end: the
 // document, Save .jai, Open in viewer and Reveal report folder.
 import { encode as encodeFile, parse } from '../../jai/index.ts';
+import { personLabel, traitsInWords } from '../../encoder/people.ts';
 import {
   api, events, type Box, type CandidateRef, type EncodeDone, type EncodeEvent, type EncodeEventMessage, type EncodeSettings,
   type Generation, type ImagePreview, type Observation, type RenderRef,
@@ -21,7 +22,8 @@ export interface EncodeTab {
 const PHASES: Record<string, string> = { inspect: 'Measuring the image', describe: 'Writing first descriptions', evolve: 'Rendering and improving', refine: 'Refining', done: 'Finishing' };
 const SUBJECT_SLOTS = 5;
 
-interface Mark { n: number; box: Box; label?: string }
+/** A subject (numbered 1…) or a person (P1…), drawn dashed in one colour. */
+interface Mark { n: number; box: Box; label?: string; person?: boolean }
 interface Job { id: string; dir: string; settings: EncodeSettings; started: number }
 
 const clampBox = (b: Box): Box => ({ ymin: Math.max(0, b.ymin), xmin: Math.max(0, b.xmin), ymax: Math.min(1, b.ymax), xmax: Math.min(1, b.xmax) });
@@ -46,10 +48,10 @@ function overlay(img: HTMLImageElement, marks: Mark[], horizon: number | null, l
     }
   }
   for (const m of marks) {
-    const b = m.box;
-    shape('rect', { x: b.xmin * 1000, y: b.ymin * 1000, width: Math.max(1, (b.xmax - b.xmin) * 1000), height: Math.max(1, (b.ymax - b.ymin) * 1000) }, `ov-box s${slot(m.n)}`);
+    const b = m.box, colour = m.person ? 'sp' : `s${slot(m.n)}`, id = m.person ? `P${m.n}` : String(m.n);
+    shape('rect', { x: b.xmin * 1000, y: b.ymin * 1000, width: Math.max(1, (b.xmax - b.xmin) * 1000), height: Math.max(1, (b.ymax - b.ymin) * 1000) }, `ov-box ${m.person ? 'ov-person ' : ''}${colour}`);
     if (!labelled) continue;
-    const t = el('span', { className: `ov-tag s${slot(m.n)}` }, m.label ? `${m.n} ${m.label}` : String(m.n));
+    const t = el('span', { className: `ov-tag ${colour}` }, m.label ? `${id} ${m.label}` : id);
     if (b.xmin > 0.7) t.style.right = pct(1 - b.xmax); else t.style.left = pct(b.xmin);
     t.style.top = pct(b.ymin);
     if (b.ymin > 0.08) t.classList.add('above');
@@ -156,18 +158,22 @@ export function initEncode(ctx: TabContext): EncodeTab {
     }
   }
 
-  /** The target preview with the measured subjects and horizon once the target event arrived. */
+  /** The target preview with the measured subjects, people and horizon once the target event arrived. */
   function drawTarget(): void {
     const holder = $('enc-target');
     if (!image) { holder.replaceChildren(); return; }
     const img = el('img', { src: image.preview.dataUrl, width: image.preview.width, height: image.preview.height, alt: `The image to encode: ${image.name}` });
     const marks: Mark[] = [];
     target?.subjects.forEach((s, i) => { if (s.box) marks.push({ n: i + 1, box: s.box, label: s.name }); });
+    target?.people.forEach((p, i) => marks.push({ n: i + 1, box: p.box, label: personLabel(p).replace(/ at \w+$/, ''), person: true }));
     holder.replaceChildren(overlay(img, marks, target?.horizon ?? null, true));
     const list = $('enc-subjects');
     if (!target) { list.replaceChildren(); list.hidden = true; return; }
     const items = target.subjects.map((s, i) => el('li', {}, el('i', { className: `swatch s${slot(i + 1)}` }), el('b', {}, `${i + 1} ${s.name}`),
       el('span', { className: 'muted' }, s.box ? ` x ${pct(s.box.xmin)}–${pct(s.box.xmax)}, y ${pct(s.box.ymin)}–${pct(s.box.ymax)}` : ' (no box)')));
+    items.push(...target.people.map((p, i) => el('li', {}, el('i', { className: 'swatch person sp' }), el('b', {}, `P${i + 1} ${personLabel(p)}`),
+      el('span', { className: 'muted' }, ` ${pct(p.box.ymax - p.box.ymin)} of the frame tall${p.face ? `, face ${p.face}` : ''}${traitsInWords(p) ? `: ${traitsInWords(p)}` : ''}`))));
+    if (target.crowd && target.crowd !== 'none') items.push(el('li', { className: 'muted measured' }, `Other people: ${target.crowd}`));
     if (target.horizon !== null) items.push(el('li', {}, el('i', { className: 'swatch horizon' }), el('b', {}, 'horizon'), el('span', { className: 'muted' }, ` ${pct(target.horizon)} from the top${target.horizonShape ? `, ${target.horizonShape}` : ''}`)));
     const looks = [target.camera, target.lighting, target.medium].filter(Boolean).join(' · ');
     if (looks) items.push(el('li', { className: 'muted measured' }, looks));
@@ -175,7 +181,7 @@ export function initEncode(ctx: TabContext): EncodeTab {
     list.hidden = false;
   }
 
-  /** A render's measured subject boxes, rebuilt from the target boxes and the measured offsets. */
+  /** A render's measured boxes: subjects rebuilt from the target boxes and the measured offsets, people as found. */
   function renderMarks(r: RenderRef): { marks: Mark[]; horizon: number | null } {
     const m = r.measure;
     if (!target || !m) return { marks: [], horizon: null };
@@ -189,6 +195,7 @@ export function initEncode(ctx: TabContext): EncodeTab {
       const cx = (tb.xmin + tb.xmax) / 2 + sm.dx, cy = (tb.ymin + tb.ymax) / 2 + sm.dy;
       marks.push({ n, box: clampBox({ xmin: cx - w / 2, xmax: cx + w / 2, ymin: cy - h / 2, ymax: cy + h / 2 }) });
     }
+    for (const p of m.people) if (p.box) marks.push({ n: p.n, box: clampBox(p.box), person: true });
     return { marks, horizon: target.horizon !== null && m.horizon !== null ? target.horizon + m.horizon : null };
   }
 
@@ -310,8 +317,8 @@ export function initEncode(ctx: TabContext): EncodeTab {
       case 'target': {
         target = e.observation;
         drawTarget();
-        const named = target.subjects.filter(s => s.box).map(s => s.name);
-        log(`Measured the image: ${named.join(', ') || 'no distinct subjects'}${target.horizon !== null ? `, horizon at ${pct(target.horizon)}` : ''}.`);
+        const named = target.subjects.filter(s => s.box).map(s => s.name), n = target.people.length;
+        log(`Measured the image: ${named.join(', ') || 'no distinct subjects'}${n ? `, ${n} ${n === 1 ? 'person' : 'people'}` : ''}${target.horizon !== null ? `, horizon at ${pct(target.horizon)}` : ''}.`);
         break;
       }
       case 'candidate': addCandidate(e.candidate); break;

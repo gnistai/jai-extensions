@@ -184,10 +184,13 @@ body.dragging .stage-card.locked .drop { border-color: var(--border-strong); bac
 .s3 { --c: #1baf7a; --on-c: #1d1b18; }
 .s4 { --c: #eda100; --on-c: #1d1b18; }
 .s5 { --c: #e87ba4; --on-c: #1d1b18; }
+.sp { --c: #f4f1ea; --on-c: #1d1b18; }
+.ov-person { stroke-dasharray: 6 4; }
 .subjects { list-style: none; padding: 10px 0 0; margin: 10px 0 0; border-top: 1px solid var(--border); display: grid; gap: 3px; font-size: 13px; }
 .subjects li { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .subjects b { font-weight: 600; }
 .swatch { width: 12px; height: 12px; border-radius: 3px; border: 2px solid var(--c); flex: none; }
+.swatch.person { border-style: dashed; border-color: var(--text); }
 .swatch.horizon { height: 0; border: 0; border-top: 2px solid var(--text-muted); border-radius: 0; }
 .subjects .measured { margin-top: 2px; }
 .big-number { font-size: 26px; font-weight: 700; line-height: 1; }

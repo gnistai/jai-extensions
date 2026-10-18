@@ -4,6 +4,7 @@
 // llama.cpp turns into a grammar. See studio/DESIGN.md section 9.
 import type { ChatResult, OpenAIChatClient } from '../providers/openai-chat.ts';
 import { describeObservation } from './metrics.ts';
+import { CROWD, FACES, MAX_RENDER_PEOPLE, MAX_TARGET_PEOPLE, TRAITS } from './people.ts';
 import { SYSTEM, cleanText, describePrompt, inspectRenderPrompt, inspectSystem, inspectTargetPrompt, parseAnswer, proposePrompt, toAdditions, toDrafts, toObservation } from './prompts.ts';
 import type { Analyst, AnalystContext, AnalystReply, Draft, ImageRef, Observation, ProposeContext } from './types.ts';
 
@@ -38,14 +39,24 @@ const SCENE: Record<string, Schema> = {
   medium: text(120),
 };
 
+/** One person: the box, then every trait as one of its words or null (people.ts). */
+const PERSON = object({
+  bbox_2d: BOX,
+  face: { enum: [...FACES, null] },
+  // Written first, to look at the face before judging it; never read back (it could carry a label).
+  stands_out: text(80),
+  ...Object.fromEntries(TRAITS.map(t => [t.key, { enum: [...t.values, null] }])),
+});
+const people = (max: number): Record<string, Schema> => ({ people: { type: 'array', items: PERSON, maxItems: max }, crowd: { enum: [...CROWD, null] } });
+
 /** describe and core propose: exactly n drafts. */
 const draftsFormat = (n: number): Format => ({ name: 'jai_drafts', schema: object({ notes: text(NOTES_CHARS), drafts: exactly(DRAFT, n) }) });
 /** refine propose: exactly n additions. */
 const additionsFormat = (n: number): Format => ({ name: 'jai_additions', schema: object({ notes: text(NOTES_CHARS), additions: exactly(text(ADDITION_CHARS, 1), n) }) });
-/** Target inspection: 1 to 5 subjects with boxes. */
+/** Target inspection: up to 5 subjects with boxes (none in a plain portrait), and the prominent people. */
 const TARGET_FORMAT: Format = {
   name: 'jai_target_inspection',
-  schema: object({ subjects: { type: 'array', items: object({ name: text(60, 1), bbox_2d: BOX }), minItems: 1, maxItems: 5 }, ...SCENE }),
+  schema: object({ subjects: { type: 'array', items: object({ name: text(60, 1), bbox_2d: BOX }), maxItems: 5 }, ...people(MAX_TARGET_PEOPLE), ...SCENE }),
 };
 /**
  * Render inspection: one entry per given subject, each named from the list, each
@@ -56,13 +67,14 @@ const TARGET_FORMAT: Format = {
 function renderFormat(subjects: string[]): Format {
   const n = subjects.length;
   const name = n ? { type: 'string', enum: subjects } : text(60);
-  return { name: 'jai_render_inspection', schema: object({ subjects: exactly(object({ name, bbox_2d: orNull(BOX) }), n), ...SCENE }) };
+  return { name: 'jai_render_inspection', schema: object({ subjects: exactly(object({ name, bbox_2d: orNull(BOX) }), n), ...people(MAX_RENDER_PEOPLE), ...SCENE }) };
 }
 
 // ------------------------------------------------------------ sampling
 
 interface Sampling { temperature: number; max_tokens: number; top_p?: number; top_k?: number; presence_penalty?: number }
-const INSPECTING: Sampling = { temperature: 0, max_tokens: 800 };
+/** Room for five subjects, six people with every trait and the scene, counting every digit as a token. */
+const INSPECTING: Sampling = { temperature: 0, max_tokens: 4096 };
 const WRITING = { temperature: 0.7, top_p: 0.8, top_k: 20, presence_penalty: 0.5 } as const;
 
 /** JAI Studio clamps max_tokens to this (DESIGN.md section 7). */

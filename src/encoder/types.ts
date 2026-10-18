@@ -22,10 +22,30 @@ export interface Draft { prompt: string; style: string[]; avoid: string[] }
 /** A box as frame fractions, 0 at top and left. */
 export interface Box { ymin: number; xmin: number; ymax: number; xmax: number }
 
+/** How readable a person's face is: features readable, visible but too small for detail, or turned away or covered. */
+export type FaceVisibility = 'clear' | 'small' | 'hidden';
+
+/**
+ * One person as an inspection reads them: where they are, how readable the
+ * face is, and their visible traits in the closed vocabularies of TRAITS
+ * (people.ts), null where a trait cannot be seen. Appearance only, never
+ * identity: the aim is the same kind of person, not the same face.
+ */
+export interface Person {
+  box: Box;
+  face: FaceVisibility | null;
+  /** Trait key -> one of that trait's values, or null when not readable. */
+  traits: Record<string, string | null>;
+}
+
 /** What an inspection of one image measured. */
 export interface Observation {
-  /** Main subjects or regions; for a render, in the target's order and naming, box null when absent. */
+  /** Main subjects or regions other than people; for a render, in the target's order and naming, box null when absent. */
   subjects: Array<{ name: string; box: Box | null }>;
+  /** Prominent people, largest first. */
+  people: Person[];
+  /** The people too small or too many to list: 'none', 'few', 'some', 'many', or null when not read. */
+  crowd: string | null;
   /** Horizon height as a frame fraction from the top, or null when there is none. */
   horizon: number | null;
   /** Shape of the horizon line: 'flat', 'curved', or '' when unknown or absent. */
@@ -46,10 +66,30 @@ export interface SubjectMeasure {
   error: number;
 }
 
+/** One target person compared with the render person matched to them (people.ts). */
+export interface PersonMeasure {
+  /** The target person's number, 1 for the first listed. */
+  n: number;
+  /** The target person in words, for example "young woman at left". */
+  label: string;
+  /** The matched render person's box, or null when no render person matched. */
+  box: Box | null;
+  /** Centre offset render − target, frame fractions, and ln(render size / target size); 0 when missing. */
+  dx: number; dy: number; sw: number; sh: number;
+  /** Traits that differ: the render's value and the target's. */
+  differs: Array<{ trait: string; render: string; target: string }>;
+  /** 0..1: layout, traits, and the person's error: 1 − (1 − 0.6 layout)(1 − traits), so 1 when missing or of another kind. */
+  layoutError: number; traitError: number; error: number;
+}
+
 /** The measured difference of one render from the target. */
 export interface Measure {
   fitness: number;
   subjects: SubjectMeasure[];
+  /** The target's people in order. */
+  people: PersonMeasure[];
+  /** Prominent people in the render that match no one in the target. */
+  extraPeople: number;
   /** Render horizon − target horizon (positive: lower), null when not measurable. */
   horizon: number | null;
   /** Colour/layout similarity of thumbnails, 0..1, null without thumbnails. */
