@@ -37,6 +37,16 @@ pub fn no_ffmpeg_dir(paths: &Paths) -> PathBuf {
 /// the weights before that, so a 200 here means ready.
 pub const SD_HEALTH_PATH: &str = "/v1/models";
 
+/// sd-server's `--max-vram`: a negative value keeps that many GiB of VRAM free.
+/// Without it the FLUX weights (12.2 GB in Q8) stay on the GPU and leave too
+/// little for a render's 1.27 GB working buffer at 1 megapixel once the desktop
+/// and other programs take 2 to 3 GB: every render then fails ("generate_image
+/// returned no results"). With 3 GiB kept free the weights wait in RAM and move
+/// to the GPU as far as the budget allows. Measured on a 16 GB RTX 5070 Ti at
+/// 1216x832: about 6.3 s a render instead of 5.5 s, and still working with
+/// another 3.3 GB taken by a second program after the engine loaded.
+pub const SD_VRAM_RESERVE_GIB: &str = "-3";
+
 /// Everything needed to start and supervise one engine process.
 #[derive(Clone)]
 pub struct LaunchSpec {
@@ -184,6 +194,8 @@ pub fn sd_spec(
         "--sampling-method".into(),
         "euler".into(),
         "--eager-load".into(),
+        "--max-vram".into(),
+        SD_VRAM_RESERVE_GIB.into(),
         "-l".into(),
         addr.ip().to_string(),
         "--listen-port".into(),
@@ -623,6 +635,8 @@ pub(crate) mod tests {
             "--sampling-method",
             "euler",
             "--eager-load",
+            "--max-vram",
+            "-3",
             "-l",
             "127.18.52.86",
             "--listen-port",

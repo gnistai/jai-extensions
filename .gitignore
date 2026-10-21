@@ -5,6 +5,7 @@
 # node / build
 node_modules/
 dist/
+target/
 .cache/
 *.zip
 npm-debug.log*

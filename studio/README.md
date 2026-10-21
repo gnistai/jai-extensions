@@ -53,7 +53,7 @@ Requirements:
 - With less VRAM, edit `config.json` (see Settings and data): set `llm.mtp` to false (it takes
   about 2 GB), lower `llm.ctx` (for example to 8192), and if the LLM still does not fit, set
   `llm.gpuLayers` to a number of layers instead of `"all"` (the rest run on the CPU, more
-  slowly). For FLUX, `image.extraArgs` can add sd-server's `--vae-tiling` or `--offload-to-cpu`.
+  slowly). FLUX needs no setting: it keeps 3 GB of VRAM free by itself (below).
 - The CUDA engines need the Visual C++ runtime 14.40 or newer; the Models tab offers to install
   it when it is missing.
 
@@ -283,6 +283,11 @@ and the LLM gets many times slower. So, with the default 20k context:
 
 The check runs at every LLM start, so MTP comes back once VRAM is free again (after closing a
 game, say). The figures include a 0.5 GB margin and grow with `llm.ctx`.
+
+FLUX keeps 3 GB of VRAM free for the desktop and other programs (sd-server's `--max-vram -3`):
+its weights wait in RAM and move to the GPU as far as that allows. On a 16 GB card a render at
+1216x832 takes about 6.3 s; without the reserve it would fail as soon as the desktop and other
+programs took more than about 2 GB.
 
 ## Settings and data
 

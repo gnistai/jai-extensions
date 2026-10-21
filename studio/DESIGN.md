@@ -443,9 +443,16 @@ llama-server -m <models>/Qwen3.8-27B-UD-IQ3_XXS.gguf --mmproj <models>/mmproj-F1
 
 ```
 sd-server --diffusion-model <flux> --vae <ae> --clip_l <clip_l> --t5xxl <t5>
-  --cfg-scale 1.0 --steps <steps> --sampling-method euler --eager-load
+  --cfg-scale 1.0 --steps <steps> --sampling-method euler --eager-load --max-vram -3
   -l <127.x.y.z> --listen-port <port>  <extraArgs…>
 ```
+
+- `--max-vram -3` keeps 3 GiB of VRAM free (`SD_VRAM_RESERVE_GIB`). Without it the FLUX weights
+  (12.2 GB) stay on the GPU, and a 1-megapixel render's 1.27 GB working buffer no longer fits once
+  the desktop and other programs take 2 to 3 GB of a 16 GB card: every render fails. With it the
+  weights wait in RAM and move to the GPU as far as the budget allows, so the image engine adapts
+  to the card and to what else runs. Measured on the RTX 5070 Ti at 1216x832: about 6.3 s a render
+  instead of 5.5 s, still working with another 3.3 GB taken after the engine loaded.
 
 - The working directory is the engine dir.
 - Health check: `GET /v1/models` returns 200. sd-server only starts listening after its context
