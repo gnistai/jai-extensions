@@ -13,7 +13,8 @@ async function main(): Promise<void> {
   const origin = new URL(tab.url).origin;
   $('site').textContent = origin;
   const state = await send<StateReply>({ type: 'state', origin });
-  $('token-note').hidden = state.hasToken;
+  $('token-note').hidden = state.ready;
+  if (state.renderer === 'studio') $('renderer-note').textContent = 'Renders are made by JAI Studio on this computer; nothing leaves it.';
   ($('mode') as HTMLSelectElement).value = state.mode;
   $('usage').textContent = `Today: ${state.usage.today} of ${state.usage.maxPerDay} renders · at most ${state.usage.maxPerPage} per page`;
   for (const id of ['open-options', 'options-link']) $(id).addEventListener('click', e => { e.preventDefault(); void chrome.runtime.openOptionsPage(); });
@@ -37,13 +38,13 @@ async function main(): Promise<void> {
       ol.append(li);
     }
     list.append(ol);
-    const canRender = state.hasToken && state.mode !== 'never';
+    const canRender = state.ready && state.mode !== 'never';
     $<HTMLButtonElement>('render-all').disabled = !canRender || !state.disclosed || !renderable;
     $<HTMLButtonElement>('restore-all').disabled = false;
     if (canRender && !state.disclosed) $('usage').textContent += ' · open an image’s JAI control once to accept the provider notice for this site';
   }
   $('render-all').addEventListener('click', async () => {
-    if (!confirm(`Render ${renderable} image(s) with Replicate? This costs money under your account.`)) return;
+    if (state.renderer === 'replicate' && !confirm(`Render ${renderable} image(s) with Replicate? This costs money under your account.`)) return;
     await chrome.tabs.sendMessage(tab.id!, { type: 'renderAll' });
     window.close();
   });

@@ -5,7 +5,7 @@
 <body>
   <h1>JAI Viewer</h1>
   <div class="muted" id="site"></div>
-  <div id="token-note" class="notice" hidden style="margin-top:8px">No Replicate token yet. <a href="#" id="open-options">Open options</a> to add one. Without it, nothing is ever rendered.</div>
+  <div id="token-note" class="notice" hidden style="margin-top:8px">No renderer is set up yet. <a href="#" id="open-options">Open options</a> to connect JAI Studio or add a Replicate token. Without one, nothing is ever rendered.</div>
   <h2>JAI images on this page</h2>
   <div id="list" class="muted">Scanning…</div>
   <div class="row" style="margin-top:10px">
@@ -21,7 +21,7 @@
   <div class="muted" id="usage"></div>
   <h2>Encode</h2>
   <p style="margin:0">Turn an image into JAI text. <a href="encode.html" target="_blank" id="encode-link">Open the encoder</a>, or right-click any image.</p>
-  <p class="muted" style="margin-top:12px">Renders are made by Replicate under your account and cost money. <a href="#" id="options-link">Options</a></p>
+  <p class="muted" style="margin-top:12px"><span id="renderer-note">Renders are made by Replicate under your account and cost money.</span> <a href="#" id="options-link">Options</a></p>
   <script type="module" src="popup.js"></script>
 </body>
 </html>

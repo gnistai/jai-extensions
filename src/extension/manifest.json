@@ -3,7 +3,7 @@
   "name": "JAI Viewer (reference)",
   "short_name": "JAI Viewer",
   "version": "0.1.0",
-  "description": "Reference viewer for JAI (Just AI Images): finds JAI images on a page and renders them with your own Replicate account, when you ask.",
+  "description": "Reference viewer for JAI (Just AI Images): renders JAI images on a page with JAI Studio on your computer or Replicate, when you ask.",
   "minimum_chrome_version": "116",
   "icons": {
     "16": "icons/icon16.png",

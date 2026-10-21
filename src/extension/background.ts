@@ -1,22 +1,53 @@
 // Background service worker of the JAI reference viewer.
 //
-// The only context that ever holds the Replicate token or talks to a provider.
-// Content scripts send it a canonical JAI document plus, for transform, pixels
-// the page itself could read; it applies the user's consent and budgets,
-// chooses among the models the user enabled, renders, and returns bytes.
+// The only context that ever holds a token (Replicate's or JAI Studio's) or
+// talks to a provider. Content scripts send it a canonical JAI document plus,
+// for transform, pixels the page itself could read; it applies the user's
+// consent and budgets, chooses among the chosen renderer's models, renders,
+// and returns bytes.
 import { identity, interpret, readJSON, serialize, sha256Hex, type CatalogModel } from '../jai/index.ts';
 import { FAMILIES, REPLICATE_MODELS, ReplicateRenderer } from '../renderers/replicate.ts';
+import { LOCAL_FLUX, LocalRenderer } from '../renderers/local.ts';
 import { HttpReplicateClient } from '../providers/replicate-client.ts';
-import { PortLedger, allowedModel, sanitizeInput } from './encode-guard.ts';
+import { findStudio, type StudioServer } from '../providers/studio.ts';
+import { PortLedger, allowedModel, sanitizeInput, studioRequest } from './encode-guard.ts';
 import { RateLimit, privilegedFetchAllowed } from './fetch-guard.ts';
-import { INTERPRETER_CODES, RenderError, type RenderIntent } from '../renderers/types.ts';
+import { INTERPRETER_CODES, RenderError, type ModelInfo, type RenderIntent, type RenderResult } from '../renderers/types.ts';
 import { previewRatio } from '../renderers/image-size.ts';
 import { idbAll, idbClear, idbDelete, idbGet, idbSet } from './idb.ts';
-import { MAX_JAI_BYTES, b64decode, b64encode, getSettings, readCapped, saveSettings, siteMode, today, type BgRequest, type EncodePortReply, type EncodePortRequest, type RenderPortReply, type RenderPortRequest, type Settings, type StateReply } from './shared.ts';
+import { MAX_JAI_BYTES, STUDIO_ORIGINS, b64decode, b64encode, cacheKey, getSettings, readCapped, saveSettings, siteMode, today, type BgRequest, type EncodePortReply, type EncodePortRequest, type RenderPortReply, type RenderPortRequest, type Settings, type StateReply, type StudioStatus } from './shared.ts';
 
-// ---------------------------------------------------------------- token
+// ---------------------------------------------------------------- tokens
 
 const getToken = (): Promise<string | undefined> => idbGet<string>('secrets', 'replicate');
+const getStudioToken = (): Promise<string | undefined> => idbGet<string>('secrets', 'studio');
+
+// ---------------------------------------------------------------- JAI Studio
+
+const STUDIO_GONE = "JAI Studio isn't running, or it has a new token. Start JAI Studio, or connect it again with its new token in the extension options.";
+const STUDIO_PERMISSION = 'Connect JAI Studio again in the extension options.';
+
+/**
+ * The JAI Studio server that proves it holds `token`, or why there is none.
+ * Asked anew each time: the probe is ten requests on this computer, and Studio
+ * may have restarted on another of its ports or have a new token.
+ */
+async function studioServer(token: string): Promise<StudioServer | string> {
+  if (!(await chrome.permissions.contains({ origins: STUDIO_ORIGINS }))) return STUDIO_PERMISSION;
+  return (await findStudio(token)) ?? STUDIO_GONE;
+}
+
+/**
+ * Keeps this worker alive while `work` runs. Chrome stops an extension worker
+ * after 30 s without an event or an extension API call, and JAI Studio answers
+ * only when the job is done, which can take minutes behind other jobs or an
+ * engine swap. An API call every 20 s resets the timer (measured in Chrome 155:
+ * a 330 s request completes with it; without it the worker stops at 30 s).
+ */
+async function whileWaiting<T>(work: Promise<T>): Promise<T> {
+  const timer = setInterval(() => { void chrome.runtime.getPlatformInfo(); }, 20_000);
+  try { return await work; } finally { clearInterval(timer); }
+}
 
 // ---------------------------------------------------------------- budgets and queue
 
@@ -28,6 +59,7 @@ let running = 0;
 const waiting: Array<() => void> = [];
 
 async function acquire(max: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) throw new RenderError('Canceled', 'canceled');
   if (running < max) { running++; return; }
   await new Promise<void>((resolve, reject) => {
     const go = (): void => { running++; resolve(); };
@@ -63,8 +95,15 @@ async function usageToday(): Promise<number> { await loadUsage(); return usageNo
 
 // ---------------------------------------------------------------- model choice
 
-function catalog(s: Settings): CatalogModel[] {
-  return REPLICATE_MODELS.filter(m => s.enabledModels.includes(m.id)).map(m => ({ id: m.id, aliases: m.aliases, family: m.family, imageInput: m.imageInput, default: m.id === s.defaultModel }));
+type Choice = ModelInfo & { version?: string };
+
+/** The chosen renderer's models: JAI Studio's FLUX.1 schnell, or the Replicate models the user enabled. */
+function modelsFor(s: Settings): Choice[] {
+  return s.renderer === 'studio' ? [{ ...LOCAL_FLUX, label: `${LOCAL_FLUX.label} · JAI Studio` }] : REPLICATE_MODELS.filter(m => s.enabledModels.includes(m.id));
+}
+
+function catalog(s: Settings, models: Choice[]): CatalogModel[] {
+  return models.map(m => ({ id: m.id, aliases: m.aliases, family: m.family, imageInput: m.imageInput, default: s.renderer === 'studio' || m.id === s.defaultModel }));
 }
 
 // ---------------------------------------------------------------- render
@@ -74,30 +113,28 @@ interface CacheEntry { b64: string; mime: string; model: string; sentPrompt: str
 async function handleRender(req: RenderPortRequest, post: (m: RenderPortReply) => void, signal: AbortSignal): Promise<void> {
   await loadUsage();
   const s = await getSettings();
-  const token = await getToken();
-  if (!token) return post({ type: 'error', kind: 'config', message: 'Add your Replicate API token in the extension options first.' });
+  const studio = s.renderer === 'studio';
+  const token = studio ? await getStudioToken() : await getToken();
+  if (!token) return post({ type: 'error', kind: 'config', message: studio ? 'Connect JAI Studio in the extension options first.' : 'Add your Replicate API token in the extension options first.' });
   const mode = siteMode(s, req.origin);
   if (mode === 'never') return post({ type: 'error', kind: 'config', message: 'JAI rendering is turned off for this site.' });
-  if (!s.disclosed[req.origin]) return post({ type: 'error', kind: 'consent', message: 'Accept the provider notice for this site first.' });
+  // The provider notice is about sending the document to Replicate; with JAI Studio nothing leaves the computer.
+  if (!studio && !s.disclosed[req.origin]) return post({ type: 'error', kind: 'consent', message: 'Accept the provider notice for this site first.' });
   if (req.automatic && mode !== 'auto') return post({ type: 'error', kind: 'consent', message: 'Automatic rendering is not enabled for this site.' });
 
   const read = readJSON(req.canonicalJSON);
   if (read.diagnostics.some(d => d.code === 'invalid-json')) return post({ type: 'error', kind: 'config', message: 'Invalid document.' });
 
+  const models = modelsFor(s);
   const hasInput = req.inputImage !== null;
-  const { interpreted: it, diagnostics: idiag } = interpret(read.document, { catalog: catalog(s), families: FAMILIES, hasOriginal: hasInput, governingRatio: req.governingRatio });
-  let modelId = req.modelId && s.enabledModels.includes(req.modelId) ? req.modelId : it.matched ?? null;
-  if (!modelId) return post({ type: 'error', kind: 'config', message: 'No model is enabled. Choose one in the options.' });
-  const model = REPLICATE_MODELS.find(m => m.id === modelId);
-  if (!model) return post({ type: 'error', kind: 'config', message: 'Unknown model.' });
-  modelId = model.id;
-  if (it.mode === 'transform' && hasInput && !model.imageInput) {
-    const alt = REPLICATE_MODELS.find(m => m.imageInput && s.enabledModels.includes(m.id));
-    if (alt && !req.modelId) modelId = alt.id;
-  }
+  const { interpreted: it, diagnostics: idiag } = interpret(read.document, { catalog: catalog(s, models), families: FAMILIES, hasOriginal: hasInput, governingRatio: req.governingRatio });
+  let model = models.find(m => m.id === (req.modelId ?? it.matched)) ?? models.find(m => m.id === it.matched);
+  if (!model) return post({ type: 'error', kind: 'config', message: 'No model is enabled. Choose one in the options.' });
+  if (it.mode === 'transform' && hasInput && !model.imageInput && !req.modelId) model = models.find(m => m.imageInput) ?? model;
+  const modelId = model.id;
 
   // Per-model refinements follow the model actually used, which may differ from the matched one.
-  const merged = modelId === it.matched ? it : interpret(read.document, { catalog: catalog(s), families: FAMILIES, hasOriginal: hasInput, governingRatio: req.governingRatio, selected: modelId }).interpreted;
+  const merged = modelId === it.matched ? it : interpret(read.document, { catalog: catalog(s, models), families: FAMILIES, hasOriginal: hasInput, governingRatio: req.governingRatio, selected: modelId }).interpreted;
 
   // Cache: identity + renderer configuration + input image + top-level site (spec: Caches).
   const inputHash = req.inputImage ? await sha256Hex(b64decode(req.inputImage.b64)) : '-';
@@ -106,7 +143,7 @@ async function handleRender(req: RenderPortRequest, post: (m: RenderPortReply) =
   const preview = previewRatio(it.preview);
   const ratio = it.ratio ?? preview;
   const ratioKey = ratio ? ratio.toFixed(3) : '-';
-  const key = await sha256Hex(new TextEncoder().encode([await identity(read.document), modelId, model.version ?? '', s.foldAvoid ? 'fold' : 'omit', inputHash, ratioKey, req.topSite].join('|')));
+  const key = await cacheKey({ identity: await identity(read.document), renderer: s.renderer, modelId, version: model.version ?? '', foldAvoid: s.foldAvoid, inputHash, ratioKey, topSite: req.topSite });
   // Identical requests already in flight share one provider job (never pay twice).
   // Registration is synchronous, before any further await, so concurrent requests cannot race.
   const pending = inflight.get(key);
@@ -136,14 +173,25 @@ async function handleRender(req: RenderPortRequest, post: (m: RenderPortReply) =
   addUsage(1);
 
   post({ type: 'status', status: 'queued' });
+  // Stopped before the provider was asked: give the reservation back.
+  const giveBack = (): void => { perPage.set(req.pageId, Math.max(0, (perPage.get(req.pageId) ?? 1) - 1)); addUsage(-1); finish(null); };
   try {
     await acquire(s.maxConcurrent, signal);
   } catch {
-    // Canceled before the provider was asked: give the reservation back.
-    perPage.set(req.pageId, Math.max(0, (perPage.get(req.pageId) ?? 1) - 1));
-    addUsage(-1);
-    finish(null);
+    giveBack();
     return post({ type: 'error', kind: 'canceled', message: 'Canceled' });
+  }
+  // JAI Studio proves it holds the token right before the token goes to it: the render may have
+  // waited for a slot, and a Studio that quit meanwhile may have left its port to another program.
+  let server: StudioServer | null = null;
+  if (studio) {
+    const found = await studioServer(token);
+    if (typeof found === 'string' || signal.aborted) {
+      giveBack();
+      release();
+      return post(signal.aborted ? { type: 'error', kind: 'canceled', message: 'Canceled' } : { type: 'error', kind: 'config', message: found as string });
+    }
+    server = found;
   }
   const t0 = Date.now();
   try {
@@ -152,26 +200,32 @@ async function handleRender(req: RenderPortRequest, post: (m: RenderPortReply) =
       aspect: it.aspect ? { width: it.aspect.width, height: it.aspect.height } : null,
       mode: it.mode, strength: it.strength, seed: it.seed,
     };
-    const renderer = new ReplicateRenderer(token, { foldAvoid: s.foldAvoid });
-    const result = await renderer.render({
+    const request = {
       intent, modelId, signal,
       inputImage: req.inputImage ? { bytes: b64decode(req.inputImage.b64), mime: req.inputImage.mime } : null,
       governingRatio: req.governingRatio, previewRatio: preview, target: req.target,
-      onStatus: st => post({ type: 'status', status: st }),
-    });
+      onStatus: (st: string) => post({ type: 'status', status: st }),
+    };
+    // JPEG from JAI Studio: the render cache is never trimmed, and Replicate's renders are compressed too.
+    const result: RenderResult = server
+      ? await whileWaiting(new LocalRenderer(server.url, token, { outputFormat: 'jpeg' }).render(request))
+      : await new ReplicateRenderer(token, { foldAvoid: s.foldAvoid }).render(request);
     const interpreterCodes = idiag.filter(d => INTERPRETER_CODES.has(d.code));
     const diagnostics = [...interpreterCodes.map(d => ({ code: d.code, ...(d.key ? { key: d.key } : {}) })), ...result.diagnostics];
     const b64 = b64encode(result.bytes);
     const entry: CacheEntry = { b64, mime: result.mime, model: result.model, sentPrompt: result.sentPrompt, sentNegative: result.sentNegative, sentInput: result.sentInput, jobId: result.jobId, diagnostics, created: Date.now() };
     await idbSet('cache', key, entry);
-    if (s.keepHistory) await idbSet('history', `${Date.now()}-${result.jobId ?? ''}`, { time: new Date().toISOString(), site: req.topSite, model: result.model, jobId: result.jobId, jai: serialize(read.document), costHint: model.costHint });
+    // JAI Studio has no job ids, and two of its renders can finish in the same millisecond.
+    if (s.keepHistory) await idbSet('history', `${Date.now()}-${result.jobId ?? crypto.randomUUID()}`, { time: new Date().toISOString(), site: req.topSite, renderer: s.renderer, model: result.model, jobId: result.jobId, jai: serialize(read.document), costHint: model.costHint });
     const done: Extract<RenderPortReply, { type: 'done' }> = { type: 'done', dataURL: `data:${result.mime};base64,${b64}`, mime: result.mime, model: result.model, modelLabel: model.label, sentPrompt: result.sentPrompt, sentNegative: result.sentNegative, sentInput: result.sentInput, jobId: result.jobId, diagnostics, cached: false, seconds: Math.round((Date.now() - t0) / 100) / 10 };
     finish(done);
     post(done);
   } catch (e) {
     finish(null);
     const err = e instanceof RenderError ? e : new RenderError(String((e as Error)?.message ?? e), 'provider');
-    post({ type: 'error', kind: err.kind, message: err.message });
+    // A refused token or a server that went away: say what to do rather than the HTTP detail.
+    const message = studio && (err.kind === 'auth' || err.kind === 'network') ? STUDIO_GONE : err.message;
+    post({ type: 'error', kind: err.kind, message });
   } finally {
     release();
   }
@@ -190,12 +244,24 @@ function senderOrigin(sender: chrome.runtime.MessageSender | undefined): string 
 function handleEncodePort(port: chrome.runtime.Port): void {
   const jobs = new Map<number, AbortController>();
   const ledger = new PortLedger();
+  let renderer: 'replicate' | 'studio' | null = null;
+  // JAI Studio proves it holds the token once per run, as `jai encode --local` does, and again
+  // after any failure. Asking before every request would not work: the run keeps up to eight
+  // long requests open, and Chrome's six connections per host leave the probe waiting.
+  let studio: Promise<StudioServer | string> | null = null;
   let open = true;
   const post = (m: EncodePortReply): void => { if (open) port.postMessage(m); };
   port.onDisconnect.addListener(() => { open = false; for (const ac of jobs.values()) ac.abort(); jobs.clear(); });
   port.onMessage.addListener((msg: EncodePortRequest) => {
-    if (msg?.type === 'begin') { ledger.begin(msg.budgetUSD); return; }
+    if (msg?.type === 'begin') {
+      // Declared once, when the port opens: the renderer, and for Replicate the run's spending limit.
+      if (renderer) return;
+      renderer = msg.renderer === 'studio' ? 'studio' : 'replicate';
+      if (msg.renderer === 'replicate') ledger.begin(msg.budgetUSD);
+      return;
+    }
     if (msg?.type === 'cancel') { jobs.get(msg.id)?.abort(); return; }
+    if (msg?.type === 'studio') { if (renderer === 'studio') handleStudioRequest(msg); return; }
     if (msg?.type !== 'predict' || !Number.isSafeInteger(msg.id) || jobs.has(msg.id)) return;
     const refuse = (message: string): void => post({ type: 'error', id: msg.id, kind: 'config', message, jobId: null });
     const model = allowedModel(msg.model ?? {});
@@ -220,6 +286,39 @@ function handleEncodePort(port: chrome.runtime.Port): void {
       } finally { jobs.delete(msg.id); ledger.done(model, metrics); }
     })();
   });
+
+  /** One JAI Studio request for the encode page: checked, sent with the token, answered with Studio's status and body. */
+  function handleStudioRequest(msg: Extract<EncodePortRequest, { type: 'studio' }>): void {
+    if (!Number.isSafeInteger(msg.id) || jobs.has(msg.id)) return;
+    const reply = (status: number, text: string): void => post({ type: 'studio-reply', id: msg.id, status, text });
+    const refuse = (status: number, message: string): void => reply(status, JSON.stringify({ error: { message } }));
+    const bad = studioRequest(msg.path, msg.body);
+    if (bad) return refuse(400, bad);
+    const denied = ledger.admitFree();
+    if (denied) return refuse(503, denied);
+    const ac = new AbortController();
+    jobs.set(msg.id, ac);
+    void (async () => {
+      try {
+        const token = await getStudioToken();
+        if (!token) return refuse(401, 'Connect JAI Studio in the extension options first.');
+        studio ??= studioServer(token);
+        const server = await studio;
+        if (typeof server === 'string') { studio = null; return refuse(503, server); }
+        const { status, text } = await whileWaiting((async () => {
+          const res = await fetch(server.url + msg.path, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(msg.body), credentials: 'omit', redirect: 'error', signal: ac.signal });
+          return { status: res.status, text: await res.text() };
+        })());
+        if (status === 401) { studio = null; return refuse(401, STUDIO_GONE); }
+        reply(status, text);
+      } catch {
+        // Canceled by the page, which already gave up on this request; otherwise Studio went away.
+        if (ac.signal.aborted) return;
+        studio = null;
+        refuse(503, STUDIO_GONE);
+      } finally { jobs.delete(msg.id); ledger.doneFree(); }
+    })();
+  }
 }
 
 chrome.runtime.onConnect.addListener(port => {
@@ -279,10 +378,12 @@ async function onRequest(msg: BgRequest | { type: 'found'; count: number }, send
   switch (msg.type) {
     case 'state': {
       const s = await getSettings();
+      const studio = s.renderer === 'studio';
       const reply: StateReply = {
-        hasToken: !!(await getToken()), mode: siteMode(s, msg.origin), disclosed: !!s.disclosed[msg.origin],
-        models: REPLICATE_MODELS.map(m => ({ id: m.id, label: m.label, imageInput: m.imageInput, costHint: m.costHint, enabled: s.enabledModels.includes(m.id), description: m.description })),
-        defaultModel: s.defaultModel, usage: { today: await usageToday(), maxPerDay: s.maxPerDay, maxPerPage: s.maxPerPage }, minDisplayedPx: s.minDisplayedPx,
+        renderer: s.renderer, ready: !!(studio ? await getStudioToken() : await getToken()),
+        mode: siteMode(s, msg.origin), disclosed: studio || !!s.disclosed[msg.origin],
+        models: modelsFor(s).map(m => ({ id: m.id, label: m.label, imageInput: m.imageInput, costHint: m.costHint, description: m.description })),
+        defaultModel: studio ? LOCAL_FLUX.id : s.defaultModel, usage: { today: await usageToday(), maxPerDay: s.maxPerDay, maxPerPage: s.maxPerPage }, minDisplayedPx: s.minDisplayedPx,
       };
       return reply;
     }
@@ -344,6 +445,30 @@ async function onRequest(msg: BgRequest | { type: 'found'; count: number }, send
         return { ok: true, username: j.username ?? '' };
       } catch (e) { return { ok: false, error: String((e as Error).message) }; }
     }
+    case 'studioConnect': {
+      // Studio's own rule for a token: 16 to 512 printable ASCII characters (jai-core token.rs).
+      const t = msg.token.trim();
+      if (!/^[\x21-\x7e]{16,512}$/.test(t)) return { ok: false, error: 'That does not look like a JAI Studio token (jai_…). Copy it from JAI Studio.' };
+      if (!(await chrome.permissions.contains({ origins: STUDIO_ORIGINS }))) return { ok: false, error: 'The extension may not reach JAI Studio without the permission. Connect again and allow it.' };
+      const server = await findStudio(t);
+      if (!server) return { ok: false, error: "No JAI Studio with this token answers on this computer's ports 5240 to 5249. Start JAI Studio, copy its token again, and connect." };
+      await idbSet('secrets', 'studio', t);
+      await saveSettings({ renderer: 'studio' });
+      return { ok: true, version: server.version };
+    }
+    case 'studioStatus': {
+      const t = await getStudioToken();
+      const permission = await chrome.permissions.contains({ origins: STUDIO_ORIGINS });
+      const server = t && permission ? await findStudio(t) : null;
+      const status: StudioStatus = { saved: !!t, permission, running: !!server, version: server?.version ?? null };
+      return status;
+    }
+    case 'studioDisconnect': {
+      // The renderer stays JAI Studio, now not set up, so nothing renders until the user chooses again:
+      // never switch to Replicate, which costs money and sends documents off the computer, by itself.
+      await idbDelete('secrets', 'studio');
+      return { ok: true };
+    }
     case 'history': return idbAll('history');
     case 'clearHistory': await idbClear('history'); return true;
     case 'clearCache': await idbClear('cache'); return true;
@@ -357,7 +482,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Pages other than the options page may not manage the token.
   // Content scripts report the web page's URL; only the extension's own pages have its origin.
   const fromExtensionPage = !!sender.url?.startsWith(chrome.runtime.getURL(''));
-  if (['setToken', 'clearToken', 'testToken', 'tokenStatus', 'setSiteMode', 'history', 'clearHistory', 'clearCache'].includes((msg as { type: string }).type) && !fromExtensionPage) { sendResponse(null); return false; }
+  if (['setToken', 'clearToken', 'testToken', 'tokenStatus', 'studioConnect', 'studioStatus', 'studioDisconnect', 'setSiteMode', 'history', 'clearHistory', 'clearCache'].includes((msg as { type: string }).type) && !fromExtensionPage) { sendResponse(null); return false; }
   onRequest(msg, sender).then(sendResponse, e => sendResponse({ error: String(e) }));
   return true;
 });

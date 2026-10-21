@@ -33,8 +33,9 @@ legend{font-weight:600;margin-bottom:4px}
 </head>
 <body>
 <h1>JAI encoder</h1>
-<p class="muted" style="margin-top:0">Turns an image into a JAI description by analysis by synthesis: a vision model describes the image, your chosen image models render the description, the renders are compared with the original, and the description is revised until the renders match as closely as the budget allows.</p>
-<div id="token-note" class="notice" hidden>No Replicate token yet. <a href="#" id="open-options">Open the options</a> to add one.</div>
+<p class="muted" style="margin-top:0">Turns an image into a JAI description by analysis by synthesis: a vision model describes the image, image models render the description, the renders are compared with the original, and the description is revised until the renders match as closely as the run's limits allow.</p>
+<p class="muted" id="renderer-line">Runs on <b id="renderer-name">Replicate</b>, as chosen under “Render with” in the <a href="#" class="open-options">options</a>.</p>
+<div id="token-note" class="notice" hidden><span id="token-note-text">No renderer is set up yet.</span> <a href="#" class="open-options">Open the options</a> to connect JAI Studio or add a Replicate token.</div>
 
 <div class="card">
   <h2 style="margin-top:0">1. Image</h2>
@@ -49,16 +50,17 @@ legend{font-weight:600;margin-bottom:4px}
 
 <div class="card">
   <h2 style="margin-top:0">2. Settings</h2>
-  <fieldset class="models"><legend>Target models</legend><div id="models"></div></fieldset>
+  <fieldset class="models replicate-only"><legend>Target models</legend><div id="models"></div></fieldset>
   <div class="grid">
-    <label>Spending limit (USD) <input type="number" id="budget" min="0.05" max="5" step="0.05" value="0.50"></label>
+    <label class="replicate-only">Spending limit (USD) <input type="number" id="budget" min="0.05" max="5" step="0.05" value="0.50"></label>
     <label>Candidates per generation <input type="number" id="population" min="2" max="6" step="1" value="4"></label>
     <label>Generations <input type="number" id="generations" min="1" max="12" step="1" value="8"></label>
-    <label>Analyst <select id="analyst"><option value="luna">OpenAI GPT-5.6 luna</option><option value="gemini">Google Gemini 2.5 Flash</option></select></label>
+    <label class="replicate-only">Analyst <select id="analyst"><option value="luna">OpenAI GPT-5.6 luna</option><option value="gemini">Google Gemini 2.5 Flash</option></select></label>
     <label>Independent attempts <input type="number" id="restarts" min="1" max="3" step="1" value="1"></label>
   </div>
-  <p class="notice" id="consent-text">Encoding sends a copy of this image, at most 1024 pixels on its longest side and without metadata, to Replicate. Replicate runs the analyst, which describes and measures images, and the image models you chose, under your account. The limit is enforced from price estimates; Replicate bills actual usage.</p>
-  <label><input type="checkbox" id="consent" aria-describedby="consent-text"> I understand</label>
+  <p class="notice replicate-only" id="consent-text">Encoding sends a copy of this image, at most 1024 pixels on its longest side and without metadata, to Replicate. Replicate runs the analyst, which describes and measures images, and the image models you chose, under your account. The limit is enforced from price estimates; Replicate bills actual usage.</p>
+  <label class="replicate-only"><input type="checkbox" id="consent" aria-describedby="consent-text"> I understand</label>
+  <p class="notice studio-only" hidden>Encoding sends a copy of this image, at most 1024 pixels on its longest side and without metadata, to JAI Studio on this computer, which describes and measures it with its Qwen model and renders with its FLUX.1 schnell. Nothing leaves the computer.</p>
   <div class="row">
     <button type="button" id="start" disabled>Encode</button>
     <button type="button" id="cancel" class="secondary" disabled>Cancel</button>

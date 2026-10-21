@@ -123,9 +123,16 @@ file, so no Replicate token is needed, and sends the token only after the server
 proved that it holds it (the `/health` proof below). It needs a shared server (JAI Studio,
 its tray or `jai serve`).
 
+The JAI browser extension renders and encodes with JAI Studio once you paste the token into its
+options and press **Connect**: copy it with **Copy** next to the token in the Server tab, or with
+**Copy server token** in the tray menu. The extension finds Studio on `127.0.0.1` at ports 5240
+to 5249 and sends the token only to the one that proves it holds it, so a Studio set to another
+port, or bound only to a LAN address, is not found. With "Keep running in the tray when the
+window is closed" (on by default), closing the window keeps Studio serving the extension from the
+tray; "Start in the tray when I sign in" (Windows) has it ready after a restart.
+
 Other programs use the HTTP API below with the URL and token that `jai token` prints, for
-example any OpenAI-compatible client pointed at `http://127.0.0.1:5240/v1`. (The JAI browser
-extension renders with Replicate and cannot use JAI Studio yet.)
+example any OpenAI-compatible client pointed at `http://127.0.0.1:5240/v1`.
 
 ## HTTP API
 
@@ -354,9 +361,11 @@ Studio's notifications; the icon is `cache\notification-icon.png` in the data fo
   to you (see Settings and data): on Unix the file is also mode 0600. `jai token
   --regenerate` or **Make a new token** in the Server tab replaces it; clients that use it
   must then be updated. A `jai` command's temporary server uses a token of its own that never
-  leaves the process. Clients find the server through `server.json` and send it the token only
-  after it has proved that it holds the token (`/health?nonce=…`), so a program that took the
-  port of a server that crashed never sees it.
+  leaves the process. Clients find the server through `server.json` (the browser extension,
+  which cannot read it, asks ports 5240 to 5249) and send it the token only after it has proved
+  that it holds the token (`/health?nonce=…`), so a program that took the port of a server that
+  crashed never sees it. The extension stores its copy in its own IndexedDB and uses it only in
+  its background worker; web pages and content scripts never see it.
 - The Host allow-list and the Origin rule keep web pages out; there are no CORS headers.
   Request heads must arrive within 30 s and at most 256 connections are served at once.
 - The engines listen on a random loopback address and port (`127.x.y.z`), so web pages cannot

@@ -2,7 +2,7 @@
   "name": "jai-tools",
   "private": true,
   "version": "0.1.0",
-  "description": "Reference tools for JAI (Just AI Images): a Chrome MV3 viewer extension with an encoder page, a CLI (encode, render, validate), a TypeScript JAI library, a Replicate renderer and an encoder engine",
+  "description": "Reference tools for JAI (Just AI Images): a Chrome MV3 viewer extension with an encoder page, a CLI (encode, render, validate), a TypeScript JAI library, Replicate and JAI Studio renderers, an encoder engine, and JAI Studio",
   "license": "MIT",
   "type": "module",
   "scripts": {

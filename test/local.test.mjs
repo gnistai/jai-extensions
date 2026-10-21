@@ -5,18 +5,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { createHmac } from 'node:crypto';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  OpenAIChatClient, LocalAnalyst, LocalRenderer, LOCAL_FLUX, FLUX_SIZES, REPLICATE_MODELS, base64ToBytes, encode, previewRatio,
+  OpenAIChatClient, LocalAnalyst, LocalRenderer, LOCAL_FLUX, STUDIO_PORTS, proveStudio, findStudio, FLUX_SIZES, REPLICATE_MODELS, base64ToBytes, encode, previewRatio,
   SYSTEM, inspectSystem, describePrompt, inspectTargetPrompt, inspectRenderPrompt, proposePrompt, describeObservation, TRAITS,
 } from '../dist/encoder.mjs';
 import { buildInput } from '../dist/test/replicate.js';
 import { parse } from '../dist/jai.mjs';
+import { startFakeStudio } from './fake-studio.mjs';
 
 const BASE = 'http://127.0.0.1:5240';
 const TOKEN = 'jai_test-token';
@@ -605,6 +605,43 @@ test('encode() with LocalAnalyst: a cancel while Qwen proposes stops as canceled
   assert.equal(r.candidates.length, 2);
 });
 
+// ---------------------------------------------------------------- finding JAI Studio (src/providers/studio.ts)
+
+/** A loopback port with nothing listening on it. */
+const closedPort = async () => { const s = createServer(); await new Promise(r => s.listen(0, '127.0.0.1', r)); const { port } = s.address(); await new Promise(r => s.close(r)); return port; };
+
+test('proveStudio: only a server holding the token proves it, for its own port; the token itself is never sent', async () => {
+  const fake = await startFakeStudio({ token: TOKEN });
+  const other = createServer((req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"name":"something-else"}'); });
+  await new Promise(r => other.listen(0, '127.0.0.1', r));
+  try {
+    assert.deepEqual(await proveStudio(fake.url, fake.port, TOKEN), { url: fake.url, version: '0.1.0' });
+    assert.equal(await proveStudio(fake.url, fake.port, 'jai_someone-elses-token'), 'unproven');
+    assert.equal(await proveStudio(fake.url, fake.port + 1, TOKEN), 'unproven', 'an answer relayed from another port does not match');
+    assert.equal(await proveStudio(`http://127.0.0.1:${other.address().port}`, other.address().port, TOKEN), 'absent');
+    const closed = await closedPort();
+    assert.equal(await proveStudio(`http://127.0.0.1:${closed}`, closed, TOKEN), 'absent');
+    assert.equal(fake.requests.length, 3);
+    for (const q of fake.requests) {
+      assert.match(q.url, /^\/health\?nonce=[A-Za-z0-9_-]{43}$/);
+      assert.equal(q.headers.authorization, undefined);
+    }
+    assert.equal(new Set(fake.requests.map(q => q.url)).size, 3, 'a fresh nonce for every probe');
+  } finally { await fake.close(); await new Promise(r => other.close(r)); }
+});
+
+test("findStudio: Studio's ten ports, all asked at once; the lowest one that proves the token wins", async () => {
+  assert.deepEqual(STUDIO_PORTS, [5240, 5241, 5242, 5243, 5244, 5245, 5246, 5247, 5248, 5249]);
+  const servers = [await startFakeStudio({ token: 'jai_someone-elses-token' }), await startFakeStudio({ token: TOKEN }), await startFakeStudio({ token: TOKEN })];
+  try {
+    const ports = [await closedPort(), ...servers.map(s => s.port)].sort((a, b) => a - b);
+    const lowest = Math.min(servers[1].port, servers[2].port);
+    assert.deepEqual(await findStudio(TOKEN, ports), { url: `http://127.0.0.1:${lowest}`, version: '0.1.0' });
+    assert.equal(await findStudio('jai_nobody-has-this-token', ports), null);
+    for (const s of servers) assert.ok(s.requests.every(q => q.url.startsWith('/health?nonce=') && !q.headers.authorization));
+  } finally { for (const s of servers) await s.close(); }
+});
+
 // ---------------------------------------------------------------- bin/jai.mjs --local
 
 const CLI = fileURLToPath(new URL('../bin/jai.mjs', import.meta.url));
@@ -624,29 +661,11 @@ const runCLI = (args, env) => new Promise((resolve, reject) => {
  * for the token it holds: another one plays a process that took the port.
  */
 async function fakeStudio({ proofToken = TOKEN } = {}) {
-  const requests = [];
-  const server = createServer((req, res) => {
-    let body = '';
-    req.on('data', c => { body += c; });
-    req.on('end', () => {
-      requests.push({ method: req.method, url: req.url, headers: req.headers, body: body ? JSON.parse(body) : null });
-      const reply = (status, json) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(json)); };
-      const url = new URL(req.url, 'http://x');
-      if (url.pathname === '/health') {
-        const nonce = url.searchParams.get('nonce');
-        const proof = nonce && proofToken ? createHmac('sha256', proofToken).update(`jai-health:${server.address().port}:${nonce}`).digest('base64url') : undefined;
-        return reply(200, { name: 'jai', ...(proof ? { proof } : {}) });
-      }
-      if (req.headers.authorization !== `Bearer ${TOKEN}`) return reply(401, { error: { message: 'Missing or bad token' } });
-      if (req.url === '/v1/images/generations') return reply(200, imageReply(JSON.parse(body)).json);
-      reply(404, { error: { message: 'no such route' } });
-    });
-  });
-  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  const fake = await startFakeStudio({ token: TOKEN, proofToken, images: imageReply });
   const home = mkdtempSync(join(tmpdir(), 'jai-cli-'));
-  writeFileSync(join(home, 'server.json'), JSON.stringify({ host: '127.0.0.1', port: server.address().port, pid: process.pid }));
+  writeFileSync(join(home, 'server.json'), JSON.stringify({ host: '127.0.0.1', port: fake.port, pid: process.pid }));
   writeFileSync(join(home, 'token'), `${TOKEN}\n`);
-  return { home, requests, close: () => new Promise(r => server.close(r)) };
+  return { home, requests: fake.requests, close: fake.close };
 }
 
 test('CLI --local: renders through JAI Studio over node:http, not Node\'s fetch with its 300 s limit', async () => {
@@ -693,6 +712,15 @@ test('CLI --local: the token goes only to a server that proves it holds it', asy
       assert.equal(fake.requests[0].headers.authorization, undefined);
     } finally { await fake.close(); }
   }
+});
+
+test('CLI --local: a server.json whose port has no server says so', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'jai-cli-'));
+  writeFileSync(join(home, 'server.json'), JSON.stringify({ host: '127.0.0.1', port: await closedPort(), pid: process.pid }));
+  writeFileSync(join(home, 'token'), `${TOKEN}\n`);
+  const r = await runCLI(['render', 'A castle;seed=5', '--local', '--out', join(home, 'castle.png')], { JAI_HOME: home });
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /No JAI Studio server answers at http:\/\/127\.0\.0\.1:\d+\. Start JAI Studio or run `jai serve`\./);
 });
 
 test('CLI --local: --scale has the app\'s range, 0.25 to 1.25', async () => {

@@ -39,7 +39,8 @@ export class ProviderError extends Error {
  */
 const CHAT_TIMEOUT_MS = 600_000;
 
-const CHAT_FIELDS = ['max_tokens', 'temperature', 'top_p', 'top_k', 'presence_penalty', 'response_format', 'chat_template_kwargs', 'seed'] as const;
+/** The request fields `complete()` forwards besides `messages`. */
+export const CHAT_FIELDS = ['max_tokens', 'temperature', 'top_p', 'top_k', 'presence_penalty', 'response_format', 'chat_template_kwargs', 'seed'] as const;
 
 /** Error codes of an HTTP client's own time limits (undici, behind Node's fetch). */
 const HTTP_CLIENT_TIMEOUTS = new Set(['UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT']);

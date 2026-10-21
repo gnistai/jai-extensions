@@ -5,6 +5,7 @@
 // port has a fixed spending ceiling and a concurrency cap. Spec: Parameter
 // forwarding; What leaves the browser.
 import type { ModelRef } from '../providers/replicate-client.ts';
+import { CHAT_FIELDS } from '../providers/openai-chat.ts';
 import { REPLICATE_MODELS } from '../renderers/replicate.ts';
 import { tokenCostUSD, worstCaseUSD } from '../providers/pricing.ts';
 
@@ -95,6 +96,41 @@ export function sanitizeInput(model: ModelRef, raw: unknown): Sanitized {
   return { input: out };
 }
 
+// ---------------------------------------------------------------- JAI Studio requests
+
+/** The two JAI Studio endpoints the encoder uses, and the request fields each may carry. */
+const STUDIO_FIELDS: Record<string, readonly string[]> = {
+  '/v1/chat/completions': ['messages', ...CHAT_FIELDS],
+  '/v1/images/generations': ['prompt', 'width', 'height', 'seed', 'steps', 'output_format'],
+};
+
+/**
+ * Check an encode page's request for JAI Studio: one of the two endpoints, only
+ * their fields, and images only as data: URLs, so the server is never asked to
+ * fetch anything. Studio checks the values itself (studio/DESIGN.md section 7).
+ * Returns an error message or null.
+ */
+export function studioRequest(path: unknown, body: unknown): string | null {
+  const fields = typeof path === 'string' && Object.hasOwn(STUDIO_FIELDS, path) ? STUDIO_FIELDS[path]! : null;
+  if (!fields) return 'That JAI Studio request is not available to the encoder.';
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return 'Invalid request.';
+  const unknown = Object.keys(body).find(k => !fields.includes(k));
+  if (unknown) return `Unknown field ${unknown}.`;
+  if (path === '/v1/chat/completions') {
+    const messages = (body as { messages?: unknown }).messages;
+    if (!Array.isArray(messages)) return 'Invalid messages.';
+    for (const m of messages) {
+      const content = (m as { content?: unknown } | null)?.content;
+      if (!Array.isArray(content)) continue;
+      for (const part of content) {
+        const url = (part as { image_url?: { url?: unknown } } | null)?.image_url?.url;
+        if ((part as { type?: unknown } | null)?.type === 'image_url' && !(typeof url === 'string' && url.startsWith('data:image/'))) return 'Images go to JAI Studio only as data: URLs.';
+      }
+    }
+  }
+  return null;
+}
+
 /** Per-port ledger: a ceiling fixed once at the start, and a cap on concurrent predictions. */
 export class PortLedger {
   private ceiling: number | null = null;
@@ -106,6 +142,13 @@ export class PortLedger {
     this.ceiling = Math.min(budget, MAX_ENCODE_BUDGET);
     return true;
   }
+  /** Count one JAI Studio request (free, so no ceiling); returns an error message or null. */
+  admitFree(): string | null {
+    if (this.inFlight >= MAX_IN_FLIGHT) return 'Too many requests at once.';
+    this.inFlight++;
+    return null;
+  }
+  doneFree(): void { this.inFlight = Math.max(0, this.inFlight - 1); }
   /** Hold the worst case of one prediction; returns an error message or null. */
   admit(model: ModelRef): string | null {
     if (this.ceiling === null) return 'The encoder did not declare a spending limit.';

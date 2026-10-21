@@ -63,9 +63,8 @@ test('settings port: a new port from 1024 to 65535; the stored one stays allowed
   assert.equal(checkPort('0', 0), null);
 });
 
-test('Server tab texts: no pairing with the browser extension, which cannot use JAI Studio yet', () => {
-  assert.doesNotMatch(HTML, /\bpair/i);
-  assert.match(HTML, /The JAI browser extension renders with Replicate and cannot use JAI Studio yet\./);
+test('Server tab texts: the browser extension takes the token in its options and finds JAI Studio on its usual ports', () => {
+  assert.match(HTML, /To use JAI Studio from the JAI browser extension, copy the token and paste it into the extension's options; the extension finds JAI Studio on ports 5240 to 5249\./);
   for (const id of ['srv-licenses-box', 'srv-cuda-note', 'set-config-problem']) assert.match(HTML, new RegExp(`id="${id}"`), id);
 });
 

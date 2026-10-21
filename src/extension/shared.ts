@@ -1,8 +1,16 @@
 // Settings, message types and helpers shared by the extension's contexts.
+import { sha256Hex } from '../jai/index.ts';
 
 export type SiteMode = 'never' | 'on-request' | 'auto';
 
+/** Who renders: JAI Studio on this computer, or Replicate under the user's account. */
+export type RendererChoice = 'studio' | 'replicate';
+
+/** The host permission JAI Studio needs: its server on 127.0.0.1, on whichever of its ports it took. */
+export const STUDIO_ORIGINS = ['http://127.0.0.1/*'];
+
 export interface Settings {
+  renderer: RendererChoice;
   enabledModels: string[];
   defaultModel: string;
   /** When a model has no negative prompt: fold avoid into the prompt (true) or omit and report. */
@@ -20,6 +28,7 @@ export interface Settings {
 }
 
 export const DEFAULT_SETTINGS: Settings = {
+  renderer: 'replicate',
   enabledModels: ['black-forest-labs/flux-schnell', 'black-forest-labs/flux-kontext-pro'],
   defaultModel: 'black-forest-labs/flux-schnell',
   foldAvoid: true,
@@ -57,16 +66,23 @@ export type BgRequest =
   | { type: 'clearToken' }
   | { type: 'tokenStatus' }
   | { type: 'testToken' }
+  | { type: 'studioConnect'; token: string }
+  | { type: 'studioStatus' }
+  | { type: 'studioDisconnect' }
   | { type: 'history' }
   | { type: 'clearHistory' }
   | { type: 'clearCache' };
 
-export interface ModelChoice { id: string; label: string; imageInput: boolean; costHint: number; enabled: boolean; description: string }
+export interface ModelChoice { id: string; label: string; imageInput: boolean; costHint: number; description: string }
 
 export interface StateReply {
-  hasToken: boolean;
+  renderer: RendererChoice;
+  /** The chosen renderer is set up: JAI Studio connected, or a Replicate token saved. */
+  ready: boolean;
   mode: SiteMode;
+  /** No provider notice is pending for this site: always true with JAI Studio, where nothing leaves the computer. */
   disclosed: boolean;
+  /** The chosen renderer's models. */
   models: ModelChoice[];
   defaultModel: string;
   usage: { today: number; maxPerDay: number; maxPerPage: number };
@@ -92,6 +108,22 @@ export type RenderPortReply =
   | { type: 'status'; status: string }
   | { type: 'done'; dataURL: string; mime: string; model: string; modelLabel: string; sentPrompt: string; sentNegative: string | null; sentInput: Record<string, unknown>; jobId: string | null; diagnostics: Array<{ code: string; key?: string; requested?: string; actual?: string }>; cached: boolean; seconds: number }
   | { type: 'error'; kind: string; message: string };
+
+/** JAI Studio as the options and encode pages show it: a token saved, the permission granted, and the server found now. */
+export interface StudioStatus { saved: boolean; permission: boolean; running: boolean; version: string | null }
+
+/**
+ * The render cache key (spec: Caches): document identity plus the renderer
+ * configuration (renderer, model, version, how avoid is sent), the input image,
+ * the requested ratio and the top-level site. JAI Studio's keys start with
+ * "studio" (it always folds avoid into the prompt); Replicate's keep their
+ * format, so renders already paid for stay cached.
+ */
+export function cacheKey(k: { identity: string; renderer: RendererChoice; modelId: string; version: string; foldAvoid: boolean; inputHash: string; ratioKey: string; topSite: string }): Promise<string> {
+  const studio = k.renderer === 'studio';
+  const parts = [k.identity, k.modelId, k.version, studio || k.foldAvoid ? 'fold' : 'omit', k.inputHash, k.ratioKey, k.topSite];
+  return sha256Hex(new TextEncoder().encode((studio ? ['studio', ...parts] : parts).join('|')));
+}
 
 export const b64encode = (bytes: Uint8Array): string => {
   let s = '';
@@ -127,13 +159,18 @@ async function readCapped(res: Response, max: number): Promise<Uint8Array | null
 
 // ---------------------------------------------------------------- encoder port
 // The encode page runs the encoder engine; the background, which alone holds
-// the token, runs each Replicate prediction for it, for allow-listed models only.
+// the tokens, runs each Replicate prediction for it, for allow-listed models
+// only, or each JAI Studio request, for the encoder's two endpoints only.
 export interface EncodeModelRef { id: string; version?: string }
 export type EncodePortRequest =
-  | { type: 'begin'; budgetUSD: number }
+  | { type: 'begin'; renderer: 'replicate'; budgetUSD: number }
+  | { type: 'begin'; renderer: 'studio' }
   | { type: 'predict'; id: number; model: EncodeModelRef; input: Record<string, unknown> }
+  | { type: 'studio'; id: number; path: string; body: Record<string, unknown> }
   | { type: 'cancel'; id: number };
 export type EncodePortReply =
   | { type: 'status'; id: number; status: string }
   | { type: 'result'; id: number; prediction: { id: string; status: string; output: unknown; metrics?: Record<string, unknown> } }
-  | { type: 'error'; id: number; kind: string; message: string; jobId: string | null };
+  | { type: 'error'; id: number; kind: string; message: string; jobId: string | null }
+  /** JAI Studio's HTTP reply, or the background's own refusal in the same shape (OpenAI's error body). */
+  | { type: 'studio-reply'; id: number; status: number; text: string };

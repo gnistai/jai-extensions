@@ -18,7 +18,7 @@ mkdirSync('dist/studio/ui', { recursive: true });
 const common = { bundle: true, target: 'es2022', logLevel: 'warning', legalComments: 'none', external: ['node:*'] };
 await build({ ...common, entryPoints: ['src/jai/index.ts'], format: 'esm', platform: 'neutral', outfile: 'dist/jai.mjs' });
 await build({ ...common, entryPoints: ['src/renderers/replicate.ts', 'src/renderers/prompt.ts'], format: 'esm', platform: 'neutral', outdir: 'dist/test' });
-for (const f of ['src/extension/encode-guard.ts', 'src/extension/fetch-guard.ts', 'src/providers/replicate-client.ts']) await build({ ...common, entryPoints: [f], format: 'esm', platform: 'neutral', outfile: `dist/test/${f.split('/').pop().replace('.ts', '.js')}` });
+for (const f of ['src/extension/encode-guard.ts', 'src/extension/fetch-guard.ts', 'src/extension/shared.ts', 'src/providers/replicate-client.ts']) await build({ ...common, entryPoints: [f], format: 'esm', platform: 'neutral', outfile: `dist/test/${f.split('/').pop().replace('.ts', '.js')}` });
 await build({ ...common, entryPoints: ['src/encoder/index.ts'], format: 'esm', platform: 'neutral', outfile: 'dist/encoder.mjs' });
 await build({ ...common, entryPoints: ['src/extension/background.ts'], format: 'esm', platform: 'browser', outfile: 'dist/extension/background.js' });
 await build({ ...common, entryPoints: ['src/extension/content.ts'], format: 'iife', platform: 'browser', outfile: 'dist/extension/content.js' });

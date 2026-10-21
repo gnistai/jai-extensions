@@ -2,7 +2,8 @@
 // cancellation by id, and failures that must not orphan provider work.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { sanitizeInput, allowedModel, allowedImage, PortLedger, GEMINI, LUNA, costOf } from '../dist/test/encode-guard.js';
+import { sanitizeInput, allowedModel, allowedImage, PortLedger, GEMINI, LUNA, costOf, studioRequest, MAX_IN_FLIGHT } from '../dist/test/encode-guard.js';
+import { cacheKey } from '../dist/test/shared.js';
 import { HttpReplicateClient } from '../dist/test/replicate-client.js';
 import { cleanText, toDrafts, encode } from '../dist/encoder.mjs';
 
@@ -113,7 +114,7 @@ test('engine: an inspection failure is one failed render, not a crash; nothing r
 
 test('fetch guard: only .jai over http(s), no private targets from public pages, rate limited', async () => {
   const { isPrivateHost, privilegedFetchAllowed, RateLimit } = await import('../dist/test/fetch-guard.js');
-  for (const h of ['localhost', 'a.localhost', '127.0.0.1', '10.1.2.3', '172.20.0.1', '192.168.1.1', '169.254.1.1', '100.64.0.1', '0.0.0.0', '[::1]', 'fd12:3456::1', 'fe80::1', '::ffff:192.168.0.1', 'router', 'nas.local', 'printer.lan']) assert.equal(isPrivateHost(h), true, h);
+  for (const h of ['localhost', 'a.localhost', '127.0.0.1', '10.1.2.3', '172.20.0.1', '192.168.1.1', '169.254.1.1', '100.64.0.1', '0.0.0.0', '[::1]', 'fd12:3456::1', 'fe80::1', '::ffff:192.168.0.1', '[::ffff:c0a8:101]', 'router', 'nas.local', 'printer.lan']) assert.equal(isPrivateHost(h), true, h);
   for (const h of ['example.org', '8.8.8.8', '172.32.0.1', '2001:db8::1', 'cdn.example.com']) assert.equal(isPrivateHost(h), false, h);
   assert.equal(privilegedFetchAllowed('https://cdn.example/a.jai', 'https://site.example'), true);
   assert.equal(privilegedFetchAllowed('https://cdn.example/a.png', 'https://site.example'), false, 'only .jai paths');
@@ -121,6 +122,53 @@ test('fetch guard: only .jai over http(s), no private targets from public pages,
   assert.equal(privilegedFetchAllowed('http://192.168.1.1/x.jai', 'https://site.example'), false, 'no private address for a public page');
   assert.equal(privilegedFetchAllowed('http://router/x.jai', 'https://site.example'), false, 'no single-label host for a public page');
   assert.equal(privilegedFetchAllowed('http://192.168.1.1/x.jai', 'http://intranet.local'), true, 'a local page may use local resources');
+  // With JAI Studio connected the extension may reach every loopback port: loopback only for a page on loopback.
+  for (const target of ['http://127.0.0.1:5240/x.jai', 'http://localhost:8080/x.jai', 'http://[::1]:5240/x.jai', 'http://[::ffff:127.0.0.1]:5240/x.jai', 'http://0.0.0.0:5240/x.jai', 'http://[::]:5240/x.jai']) {
+    assert.equal(privilegedFetchAllowed(target, 'http://intranet.local'), false, `${target} from a private page`);
+    assert.equal(privilegedFetchAllowed(target, 'http://192.168.1.5'), false, `${target} from a LAN page`);
+    assert.equal(privilegedFetchAllowed(target, 'https://site.example'), false, `${target} from a public page`);
+    assert.equal(privilegedFetchAllowed(target, 'http://localhost:8766'), true, `${target} from a loopback page`);
+  }
   const rl = new RateLimit(2, 1000);
   assert.ok(rl.allow('t', 0)); assert.ok(rl.allow('t', 1)); assert.equal(rl.allow('t', 2), false); assert.ok(rl.allow('t', 1500));
+});
+
+test('guard: JAI Studio requests from the encode page: two endpoints, their fields, data: images only', () => {
+  const chat = { messages: [{ role: 'system', content: 'x' }, { role: 'user', content: [{ type: 'text', text: 'Describe' }, { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,/9j/' } }] }], max_tokens: 4096, temperature: 0, response_format: { type: 'json_schema' }, chat_template_kwargs: { enable_thinking: false } };
+  assert.equal(studioRequest('/v1/chat/completions', chat), null);
+  assert.equal(studioRequest('/v1/images/generations', { prompt: 'A castle', width: 1024, height: 768, seed: 5, steps: 4, output_format: 'jpeg' }), null);
+  for (const path of ['/v1/models', '/v1/status', '/health', '/v1/images/generations/../x', 'http://evil.example/v1/chat/completions', 'toString', '__proto__', 42]) assert.match(studioRequest(path, {}), /not available/, String(path));
+  assert.match(studioRequest('/v1/chat/completions', { ...chat, model: 'other', stream: true }), /Unknown field model/);
+  assert.match(studioRequest('/v1/images/generations', { prompt: 'A', n: 4 }), /Unknown field n/);
+  assert.match(studioRequest('/v1/images/generations', { prompt: 'A', response_format: 'url' }), /Unknown field response_format/);
+  assert.match(studioRequest('/v1/chat/completions', null), /Invalid request/);
+  assert.match(studioRequest('/v1/chat/completions', [chat]), /Invalid request/);
+  assert.match(studioRequest('/v1/chat/completions', { messages: 'hi' }), /Invalid messages/);
+  for (const url of ['https://example.org/a.png', 'file:///c:/secret.png', 'http://127.0.0.1:5240/x', 'data:text/html,<b>x</b>']) {
+    const remote = { messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url } }] }] };
+    assert.match(studioRequest('/v1/chat/completions', remote), /only as data: URLs/, url);
+  }
+});
+
+test('guard: a JAI Studio port counts requests against the in-flight cap and has no spending limit to declare', () => {
+  const ledger = new PortLedger();
+  for (let i = 0; i < MAX_IN_FLIGHT; i++) assert.equal(ledger.admitFree(), null);
+  assert.match(ledger.admitFree(), /Too many requests/);
+  ledger.doneFree();
+  assert.equal(ledger.admitFree(), null);
+  assert.match(ledger.admit(FLUX), /did not declare a spending limit/, 'Replicate predictions stay closed on a Studio port');
+});
+
+test('render cache key: the renderer is part of it; JAI Studio always folds avoid', async () => {
+  const base = { identity: 'id', renderer: 'replicate', modelId: FLUX.id, version: '', foldAvoid: true, inputHash: '-', ratioKey: '1.000', topSite: 'https://site.example' };
+  const replicate = await cacheKey(base);
+  const studio = await cacheKey({ ...base, renderer: 'studio' });
+  assert.match(replicate, /^[0-9a-f]{64}$/);
+  assert.notEqual(studio, replicate, 'the same document and model, another renderer');
+  // Replicate's keys keep the format they had before JAI Studio, so renders already paid for stay cached.
+  const { sha256Hex } = await import('../dist/jai.mjs');
+  assert.equal(replicate, await sha256Hex(new TextEncoder().encode(['id', FLUX.id, '', 'fold', '-', '1.000', 'https://site.example'].join('|'))));
+  assert.equal(await cacheKey({ ...base, renderer: 'studio', foldAvoid: false }), studio);
+  assert.notEqual(await cacheKey({ ...base, foldAvoid: false }), replicate);
+  assert.notEqual(await cacheKey({ ...base, topSite: 'https://other.example' }), replicate);
 });

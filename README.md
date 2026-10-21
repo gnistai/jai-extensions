@@ -7,7 +7,7 @@ holds four layers, each depending only on the ones above it:
 | Layer | Where | What |
 |---|---|---|
 | Library | `src/jai/` | Format logic only: no network, no rendering |
-| Engines | `src/providers/`, `src/renderers/`, `src/encoder/` | UI-free and environment-neutral: Replicate client, renderer, encoder loop |
+| Engines | `src/providers/`, `src/renderers/`, `src/encoder/` | UI-free and environment-neutral: Replicate and JAI Studio clients, renderers, encoder loop |
 | Apps | `src/extension/`, `bin/jai.mjs`, `studio/` | The Chrome extension (viewer and encode page), the command line, and JAI Studio |
 | Tests | `test/` | Unit tests with mocked providers, the spec's conformance suite, end to end in Chrome |
 
@@ -17,18 +17,20 @@ In detail:
   canonical serialisation of JAI text, `.jai` files, `data:image/jai` URLs,
   HTML discovery, parameter interpretation and validation. It passes the
   specification's full conformance suite.
-- **`src/renderers/`** — a provider-independent renderer interface and the
-  Replicate adapter.
+- **`src/renderers/`** — a provider-independent renderer interface and two
+  adapters: Replicate (`replicate.ts`) and JAI Studio's local FLUX.1 schnell
+  (`local.ts`).
 - **`src/encoder/`** — the image encoder engine: image to JAI by analysis by
   synthesis, with pluggable analyst, optimiser and renderer, hard budgets and
   per-model refinements (`prompt/<target>`).
 - **`src/extension/`** — a Chrome Manifest V3 extension that finds JAI images on
-  web pages and renders them with your own Replicate account, when you ask, and
-  an **encode page** that turns an image into JAI.
+  web pages and renders them, when you ask, with JAI Studio on your own computer
+  or your own Replicate account, and an **encode page** that turns an image into
+  JAI.
 - **`bin/jai.mjs`** — a command-line app: `jai encode`, `jai render`,
   `jai validate`. With `--local` it uses JAI Studio's models instead of Replicate.
 - **`studio/`** — **JAI Studio**, one `jai` executable (Windows and Linux) that is a
-  command line, a desktop viewer and encoder, a Windows tray service, and a local model
+  command line, a desktop viewer and encoder, a tray service, and a local model
   server: Qwen3.8 27B (llama.cpp) and FLUX.1 schnell (stable-diffusion.cpp) on your own GPU,
   behind OpenAI-style `/v1/chat/completions` and `/v1/images/generations` on 127.0.0.1. It
   runs the same TypeScript library and encoder inside an embedded JavaScript engine. See
@@ -50,10 +52,14 @@ the definition of the format.
    as JAI. Ordinary images are never touched.
 2. Each JAI image gets a small **JAI** control. It opens a panel with the
    parsed description, diagnostics, the canonical text, and a choice of renderer.
-3. **Render** sends the description (and, for `mode=transform`, the picture shown
-   on the page, if the page itself is allowed to read it) to Replicate, then
+3. **Render** sends the description to the renderer chosen in the options, then
    swaps the render in while keeping the layout box. **Show original** switches
-   back at any time.
+   back at any time. With **JAI Studio** the description goes to Studio's server
+   on this computer and nothing leaves it; Studio renders every document with
+   FLUX.1 schnell, and a `mode=transform` document from its text. With
+   **Replicate** the description (and, for `mode=transform`, the picture shown
+   on the page, if the page itself is allowed to read it) goes to Replicate
+   under your account.
 
 Per site you can choose *render when I ask* (the default), *render visible JAI
 images automatically* (needs permission for that site, and respects your page
@@ -91,7 +97,12 @@ section [Encoding images](https://jai.gnist.ai/spec/#image-encoding):
    same way. Independent restarts (`--restarts`) can share the budget; the
    best by fitness wins.
 
-From the command line (reads `REPLICATE_API_TOKEN`):
+With JAI Studio (chosen in the extension's options, or the CLI's `--local`),
+Qwen3.8 27B describes, measures and writes the candidates, FLUX.1 schnell is
+the only target model, and the run costs nothing.
+
+From the command line (reads `REPLICATE_API_TOKEN`; with `--local`, JAI
+Studio's token from its data folder):
 
 ```sh
 npm install && npm run build   # Node 20.9 or later
@@ -118,12 +129,14 @@ else at its `preview`'s ratio, else at the model's default; it never fetches a
 with `original-not-readable`.
 
 In the extension, open **Encode** from the popup or right-click an image and
-choose **Encode this image as JAI**. The page runs the same engine. Every
-provider call goes through the background worker, which holds the token and
-accepts calls only from the encode page itself. It rebuilds each input from an
-allow-list of fields per model and accepts images only as re-encoded `data:`
-images or Replicate output URLs. It also enforces the run's spending limit,
-fixed when the run starts, and caps concurrent calls.
+choose **Encode this image as JAI**. The page runs the same engine, on the
+renderer chosen in the options. Every provider call goes through the background
+worker, which holds the tokens and accepts calls only from the encode page
+itself, and caps concurrent calls. With JAI Studio it passes on only Studio's
+chat and image endpoints, their known fields and `data:` images, and the run is
+free. With Replicate it rebuilds each input from an allow-list of fields per
+model, accepts images only as re-encoded `data:` images or Replicate output
+URLs, and enforces the run's spending limit, fixed when the run starts.
 
 A run for one model with six candidates per generation and two seeds costs
 about $0.25 and takes five to seven minutes; on Earthrise it climbed from
@@ -143,21 +156,27 @@ npm run build          # writes dist/extension/
 
 Then open `chrome://extensions`, enable **Developer mode**, choose **Load
 unpacked**, and select `dist/extension`. `npm run package` writes a zip for
-distribution. Open the extension's options, paste a Replicate API token
-(`r8_…`, from <https://replicate.com/account/api-tokens>), and enable the models
-you want.
+distribution. Open the extension's options and set up a renderer: paste JAI
+Studio's token (**Copy** next to the token in Studio's Server tab, or **Copy
+server token** in its tray menu) and press **Connect**, or paste a Replicate API
+token (`r8_…`, from <https://replicate.com/account/api-tokens>) and enable the
+models you want. The extension finds JAI Studio on this computer at ports 5240
+to 5249.
 
 ## Privacy, security and cost
 
-- **Nothing happens without you.** No image is rendered until you allow the
-  provider notice for a site and click Render, or explicitly turn on automatic
-  rendering for that site.
-- **Your token stays in the extension.** It is stored in the extension's private
-  IndexedDB (not `chrome.storage`, which in-page extension code can read), used
-  only by the background worker, and sent only to `api.replicate.com`.
-- **Only Replicate sees your renders.** The extension sends the mapped
-  parameters and locally re-encoded image bytes. It never sends the page URL,
-  title, cookies or other page content, and nothing goes through any Gnist
+- **Nothing happens without you.** No image is rendered until you click Render
+  (with Replicate, after you allow its provider notice for the site), or
+  explicitly turn on automatic rendering for that site.
+- **Your tokens stay in the extension.** They are stored in the extension's
+  private IndexedDB (not `chrome.storage`, which in-page extension code can
+  read) and used only by the background worker. The Replicate token is sent
+  only to `api.replicate.com`; JAI Studio's only to the Studio server on
+  `127.0.0.1` that has first proved it holds the same token.
+- **Renders go only to the renderer you chose.** The extension sends JAI Studio
+  on this computer the mapped parameters, and Replicate the mapped parameters
+  plus, for `mode=transform`, the locally re-encoded image bytes. It never sends
+  the page URL, title, cookies or other page content, and nothing goes through any Gnist
   server.
 - **Documents cannot take control.** A document's `model` value only selects
   among the models you enabled. No key can make the extension download weights
@@ -165,15 +184,19 @@ you want.
 - **Pixels are only used when the page can read them.** For `mode=transform`, an
   image is sent only if the page itself could read it (same-origin or CORS);
   cross-origin images are never fetched with your cookies.
-- **Costs are bounded.** Rendering is paid per image on your Replicate account.
-  The extension caps renders per page, per day and in parallel, caches
-  results, shares one job between identical images, and cancels provider jobs
-  when you cancel or leave the page.
-- **Encoding sends your image to Replicate.** The encode page and the CLI send
-  a copy, at most 1024 pixels on its longest side and without metadata, to the
-  vision models on Replicate that describe it, measure it and write the next
-  candidates (the analyst and the optimiser). With `--local` the CLI sends it
-  only to JAI Studio's server on your own computer. Nothing is sent until you
+- **Costs are bounded.** Rendering with Replicate is paid per image on your
+  account; JAI Studio costs nothing. Either way the extension caps renders per
+  page, per day and in parallel, caches
+  results, shares one job between identical images, and stops the job when you
+  cancel or leave the page (JAI Studio finishes a render that has already
+  started).
+- **Encoding sends your image to JAI Studio or Replicate.** The encode page and
+  the CLI send a copy, at most 1024 pixels on its longest side and without
+  metadata, to the vision model that describes and measures it and writes the
+  next candidates (the analyst and the optimiser). With JAI Studio (chosen in
+  the extension's options, or the CLI's `--local`) that is Qwen3.8 27B in
+  Studio's server on your own computer, and nothing leaves it. With Replicate it
+  is the vision models on Replicate; the encode page sends nothing until you
   consent and start, and the spending limit is enforced before every call.
 - **Bandwidth.** The browser has usually already downloaded the original image
   before the extension sees the page, so rendering does not save bandwidth.
@@ -187,9 +210,13 @@ you want.
 | FLUX.1 Kontext pro | image editing | best for `mode=transform`; no strength control (reported) |
 | Stable Diffusion XL | text to image, image to image | native negative prompt for `avoid`; style terms first |
 
+JAI Studio renders every document with FLUX.1 schnell on your own GPU, at no
+cost.
+
 How JAI parameters map to each model (aspect snapping, negative prompts or
 folding, strength polarity, seeds) lives in
-[`src/renderers/replicate.ts`](src/renderers/replicate.ts). Every parameter the
+[`src/renderers/replicate.ts`](src/renderers/replicate.ts) (Replicate) and
+[`src/renderers/local.ts`](src/renderers/local.ts) (JAI Studio). Every parameter the
 model could not honour as written is reported with the specification's
 renderer diagnostic codes, and the panel shows the exact text sent.
 
@@ -206,7 +233,11 @@ Chrome for Testing, saves a token through the options page, renders a test
 page with all three carriers (including a `.jai` file in `src`), and checks replacement, accessibility, restore,
 de-duplication and a strict-CSP page, checks that content scripts cannot use
 the encoder's port, and runs a tiny real encode on the encode page. It costs
-about $0.03. See [`test/e2e/README.md`](test/e2e/README.md).
+about $0.03. `test/e2e/studio.mjs` does the same with JAI Studio as the
+renderer, against `test/fake-studio.mjs` at no cost (connect, render, a
+transform document, a 70 s reply, a refused token, a stopped Studio, a tiny
+encode), or with `--real` against the JAI Studio running on this computer. See
+[`test/e2e/README.md`](test/e2e/README.md).
 
 ### Adding a renderer
 

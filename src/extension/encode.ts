@@ -1,12 +1,13 @@
-// Encode page (app layer): UI, image decoding and thumbnails with canvas, and a
-// ReplicateClient that sends every prediction through the background, which
-// alone holds the token. The engine (src/encoder) does the rest.
+// Encode page (app layer): UI, image decoding and thumbnails with canvas, and
+// provider access through the background, which alone holds the tokens: a
+// ReplicateClient that sends every prediction there, or a fetch for JAI
+// Studio's two endpoints. The engine (src/encoder) does the rest.
 import { encode as encodeFile, type JaiDocument } from '../jai/index.ts';
-import { GeminiAnalyst, OpenAIAnalyst, encode, type Candidate, type EncodeEvent, type ImageRef, type Thumbnail } from '../encoder/index.ts';
-import type { ModelRef, PredictOptions, Prediction, ReplicateClient } from '../providers/replicate-client.ts';
+import { GeminiAnalyst, LocalAnalyst, LocalRenderer, LOCAL_FLUX, OpenAIAnalyst, OpenAIChatClient, encode, type Candidate, type EncodeEvent, type ImageRef, type Thumbnail } from '../encoder/index.ts';
+import type { FetchLike, ModelRef, PredictOptions, Prediction, ReplicateClient } from '../providers/replicate-client.ts';
 import { REPLICATE_MODELS, ReplicateRenderer } from '../renderers/replicate.ts';
 import { RenderError } from '../renderers/types.ts';
-import { readCapped, type EncodePortReply } from './shared.ts';
+import { getSettings, readCapped, type EncodePortReply, type RendererChoice, type StudioStatus } from './shared.ts';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string): T => document.getElementById(id) as T;
 const el = <K extends keyof HTMLElementTagNameMap>(tag: K, props: Partial<HTMLElementTagNameMap[K]> = {}, ...kids: Array<Node | string>): HTMLElementTagNameMap[K] => {
@@ -27,10 +28,10 @@ class PortClient implements ReplicateClient {
   private connect(): chrome.runtime.Port {
     if (this.port) return this.port;
     const port = chrome.runtime.connect({ name: 'encode' });
-    port.postMessage({ type: 'begin', budgetUSD: this.budgetUSD });
+    port.postMessage({ type: 'begin', renderer: 'replicate', budgetUSD: this.budgetUSD });
     port.onMessage.addListener((m: EncodePortReply) => {
       const w = this.waiting.get(m.id);
-      if (!w) return;
+      if (!w || m.type === 'studio-reply') return;
       if (m.type === 'status') { w.onStatus?.(m.status); return; }
       this.waiting.delete(m.id);
       if (m.type === 'result') w.resolve(m.prediction as Prediction);
@@ -59,6 +60,54 @@ class PortClient implements ReplicateClient {
     });
   }
 }
+
+/**
+ * A fetch for JAI Studio's two endpoints, through the background: it sends the
+ * path and JSON body over the encode port, and the background adds the server
+ * and the token. Studio's replies, and the background's own refusals in the
+ * same shape, come back as responses; it throws only when the port drops.
+ */
+class StudioPort {
+  private port: chrome.runtime.Port | null = null;
+  private next = 1;
+  private waiting = new Map<number, { resolve: (r: Response) => void; reject: (e: Error) => void }>();
+  private connect(): chrome.runtime.Port {
+    if (this.port) return this.port;
+    const port = chrome.runtime.connect({ name: 'encode' });
+    port.postMessage({ type: 'begin', renderer: 'studio' });
+    port.onMessage.addListener((m: EncodePortReply) => {
+      if (m.type !== 'studio-reply') return;
+      const w = this.waiting.get(m.id);
+      if (!w) return;
+      this.waiting.delete(m.id);
+      w.resolve(new Response(m.text, { status: m.status, headers: { 'content-type': 'application/json' } }));
+    });
+    port.onDisconnect.addListener(() => {
+      this.port = null;
+      for (const w of this.waiting.values()) w.reject(new TypeError("the extension's background stopped"));
+      this.waiting.clear();
+    });
+    this.port = port;
+    return port;
+  }
+  readonly fetch: FetchLike = (url, init = {}) => {
+    const id = this.next++;
+    const port = this.connect();
+    return new Promise((resolve, reject) => {
+      const signal = init.signal;
+      if (signal?.aborted) return reject(new DOMException('Aborted', 'AbortError'));
+      this.waiting.set(id, { resolve, reject });
+      signal?.addEventListener('abort', () => {
+        if (!this.waiting.delete(id)) return;
+        port.postMessage({ type: 'cancel', id });
+        reject(new DOMException('Aborted', 'AbortError'));
+      }, { once: true });
+      port.postMessage({ type: 'studio', id, path: new URL(url).pathname, body: JSON.parse(String(init.body)) });
+    });
+  };
+}
+/** The base the local providers build their URLs on; the background replaces it with the server it found. */
+const STUDIO_BASE = 'http://127.0.0.1';
 
 // ---------------------------------------------------------------- images
 
@@ -120,10 +169,12 @@ for (const m of REPLICATE_MODELS) {
 }
 const chosenModels = (): string[] => [...modelsBox.querySelectorAll<HTMLInputElement>('input:checked')].map(i => i.value);
 
+let renderer: RendererChoice = 'replicate';
+
 function refresh(): void {
   const start = $<HTMLButtonElement>('start'), cancel = $<HTMLButtonElement>('cancel');
   const hadFocus = document.activeElement === start || document.activeElement === cancel;
-  start.disabled = !!running || !loaded || !chosenModels().length || !$<HTMLInputElement>('consent').checked;
+  start.disabled = !!running || !loaded || (renderer !== 'studio' && (!chosenModels().length || !$<HTMLInputElement>('consent').checked));
   cancel.disabled = !running;
   // Keep keyboard focus on whichever button is usable.
   if (hadFocus && (document.activeElement as HTMLButtonElement | null)?.disabled) (running ? cancel : start).focus();
@@ -193,8 +244,26 @@ if (src && /^(https?:\/\/|data:image\/)/i.test(src)) {
   });
 }
 
-void chrome.runtime.sendMessage({ type: 'tokenStatus' }).then((t: { set: boolean } | null) => { $('token-note').hidden = !!t?.set; });
-$('open-options').addEventListener('click', e => { e.preventDefault(); void chrome.runtime.openOptionsPage(); });
+// The renderer chosen in the options decides where the run goes; this page only shows it.
+void (async () => {
+  renderer = (await getSettings()).renderer;
+  const studio = renderer === 'studio';
+  $('renderer-name').textContent = studio ? 'JAI Studio on this computer' : 'Replicate';
+  for (const e of document.querySelectorAll<HTMLElement>('.replicate-only')) e.hidden = studio;
+  for (const e of document.querySelectorAll<HTMLElement>('.studio-only')) e.hidden = !studio;
+  if (studio) {
+    const st = await chrome.runtime.sendMessage({ type: 'studioStatus' }) as StudioStatus | null;
+    $('token-note-text').textContent = !st?.saved ? 'JAI Studio is not connected.'
+      : !st.permission ? 'The permission to reach JAI Studio was removed.'
+      : !st.running ? 'No JAI Studio with this token answers. Start JAI Studio, or connect it again with its new token.' : '';
+    $('token-note').hidden = !!st?.saved && st.running;
+  } else {
+    const t = await chrome.runtime.sendMessage({ type: 'tokenStatus' }) as { set: boolean } | null;
+    $('token-note').hidden = !!t?.set;
+  }
+  refresh();
+})();
+for (const a of document.querySelectorAll('.open-options')) a.addEventListener('click', e => { e.preventDefault(); void chrome.runtime.openOptionsPage(); });
 
 function candidateCard(c: Candidate): HTMLElement {
   const figs = c.renders.map(r => {
@@ -203,7 +272,7 @@ function candidateCard(c: Candidate): HTMLElement {
       const url = URL.createObjectURL(new Blob([r.result.bytes as BlobPart], { type: r.result.mime }));
       objectURLs.push(url);
       img = el('img', { src: url, alt: `AI render of candidate ${c.id} by ${REPLICATE_MODELS.find(m => m.id === r.model)?.label ?? r.model}` });
-    } else img = el('div', { className: 'err' }, 'failed');
+    } else img = el('div', { className: 'err', title: r.error ?? '' }, 'failed');
     const label = REPLICATE_MODELS.find(m => m.id === r.model)?.label ?? r.model;
     const fig = el('figure', {}, img, el('figcaption', {}, `${label} ${r.score.toFixed(3)}`));
     if (r.measure) fig.title = r.measure.feedback;
@@ -221,9 +290,9 @@ function onEvent(e: EncodeEvent): void {
     const o = e.observation, n = o.people.length;
     log(`Measured the image: ${o.subjects.map(s => s.name).join(', ') || 'no distinct subjects'}${n ? `, ${n} ${n === 1 ? 'person' : 'people'}` : ''}${o.horizon !== null ? `, horizon at ${Math.round(o.horizon * 100)}%` : ''}.`);
   }
-  if (e.type === 'phase') { log({ inspect: 'Measuring the image…', describe: `Describing the image${e.lineage && e.lineage > 1 ? ` (attempt ${e.lineage})` : ''}…`, evolve: 'Rendering, measuring and improving…', refine: 'Trying per-model refinements…', done: 'Done.' }[e.phase]); currentGen = null; log(`${$('spend').textContent || 'Nothing spent yet.'}`); }
+  if (e.type === 'phase') { log({ inspect: 'Measuring the image…', describe: `Describing the image${e.lineage && e.lineage > 1 ? ` (attempt ${e.lineage})` : ''}…`, evolve: 'Rendering, measuring and improving…', refine: 'Trying per-model refinements…', done: 'Done.' }[e.phase]); currentGen = null; if (renderer !== 'studio') log(`${$('spend').textContent || 'Nothing spent yet.'}`); }
   if (e.type === 'log') log(e.message);
-  if (e.type === 'spend') $('spend').textContent = `Estimated spend ${usd(e.spent)} of ${usd(e.limit)}`;
+  if (e.type === 'spend' && renderer !== 'studio') $('spend').textContent = `Estimated spend ${usd(e.spent)} of ${usd(e.limit)}`;
   if (e.type === 'candidate') {
     if (!currentGen) { currentGen = el('section', { className: 'gen' }, el('h3', {}, e.candidate.phase === 'refine' ? 'Refinement' : `Generation ${e.candidate.generation}`), el('div', { className: 'cands' })); $('gens').append(currentGen); }
     currentGen.querySelector('.cands')!.append(candidateCard(e.candidate));
@@ -244,17 +313,34 @@ $('start').addEventListener('click', async () => {
   for (const u of objectURLs) URL.revokeObjectURL(u);
   objectURLs = [];
   $('log').textContent = ''; $('gens').textContent = ''; $('result-card').hidden = true; $('progress-card').hidden = false;
-  const budget = Math.min(5, Math.max(0.05, Number($<HTMLInputElement>('budget').value) || 0.5));
-  const client = new PortClient(budget);
-  const analyst = $<HTMLSelectElement>('analyst').value === 'gemini' ? new GeminiAnalyst(client) : new OpenAIAnalyst(client);
+  const studio = renderer === 'studio';
+  // JAI Studio: its Qwen and FLUX.1 schnell, free, with the settings of Studio's own Encode tab (host-entry.ts).
+  // Replicate: the analyst and models chosen here, within the spending limit.
+  let providers;
+  if (studio) {
+    const port = new StudioPort();
+    providers = {
+      models: [LOCAL_FLUX.id], budgetUSD: 0, refine: false,
+      renderer: new LocalRenderer(STUDIO_BASE, '', { fetch: port.fetch, outputFormat: 'jpeg' }),
+      analyst: new LocalAnalyst(new OpenAIChatClient(STUDIO_BASE, '', { fetch: port.fetch })),
+    };
+  } else {
+    const budgetUSD = Math.min(5, Math.max(0.05, Number($<HTMLInputElement>('budget').value) || 0.5));
+    const client = new PortClient(budgetUSD);
+    providers = {
+      models: chosenModels(), budgetUSD,
+      renderer: new ReplicateRenderer(client, { foldAvoid: true }),
+      analyst: $<HTMLSelectElement>('analyst').value === 'gemini' ? new GeminiAnalyst(client) : new OpenAIAnalyst(client),
+    };
+  }
   running = new AbortController();
   refresh();
   try {
     const r = await encode({
-      target: loaded.target, models: chosenModels(), renderer: new ReplicateRenderer(client, { foldAvoid: true }), analyst,
+      target: loaded.target, ...providers,
       thumbnail: async res => { const b = await createImageBitmap(new Blob([res.bytes as BlobPart], { type: res.mime })); const t = coverThumb(b, b.width, b.height); b.close(); return t; },
       targetThumbnail: loaded.thumb, restarts: Math.min(3, Math.max(1, Number($<HTMLInputElement>('restarts').value) || 1)),
-      budgetUSD: budget, population: Math.min(6, Math.max(2, Number($<HTMLInputElement>('population').value) || 4)),
+      population: Math.min(6, Math.max(2, Number($<HTMLInputElement>('population').value) || 4)),
       maxGenerations: Math.min(12, Math.max(1, Number($<HTMLInputElement>('generations').value) || 8)),
       signal: running.signal, onEvent,
     });
@@ -263,8 +349,8 @@ $('start').addEventListener('click', async () => {
     const table = $('ranking');
     table.textContent = '';
     table.append(el('tr', {}, el('th', {}, 'Model'), el('th', {}, 'Score')), ...r.ranking.map(x => el('tr', {}, el('td', {}, REPLICATE_MODELS.find(m => m.id === x.model)?.label ?? x.model), el('td', {}, x.score.toFixed(3)))));
-    const reasons: Record<string, string> = { budget: 'the spending limit was reached', plateau: 'scores stopped improving', generations: 'all generations ran', time: 'the time limit was reached', canceled: 'you canceled', error: 'of an error', complete: 'it finished' };
-    $('result-note').textContent = `Stopped because ${reasons[r.stopReason]}${r.error ? ` (${r.error})` : ''}. Estimated spend ${usd(r.spent)} in ${Math.round(r.seconds)} s.`;
+    const reasons: Record<string, string> = { goal: 'the goal was reached', budget: 'the spending limit was reached', plateau: 'scores stopped improving', generations: 'all generations ran', time: 'the time limit was reached', canceled: 'you canceled', error: 'of an error', complete: 'it finished' };
+    $('result-note').textContent = `Stopped because ${reasons[r.stopReason]}${r.error ? ` (${r.error})` : ''}. ${studio ? `Rendered and measured with JAI Studio's local models in ${Math.round(r.seconds)} s.` : `Estimated spend ${usd(r.spent)} in ${Math.round(r.seconds)} s.`}`;
     $('result-card').hidden = false;
     $('result-heading').focus();
   } catch (e) {

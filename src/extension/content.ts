@@ -304,12 +304,13 @@ function init(): void {
         for (const d of diags) ul.append(el('li', {}, d.code + (d.key ? ':' + d.key : '')));
         p.append(el('h3', {}, 'Diagnostics'), ul);
       }
-      // Model choice: only models the user enabled (selectors, never locators).
+      // Model choice: only the chosen renderer's models, for Replicate the ones the user enabled (selectors, never locators).
       const sel = el('select');
-      const enabled = state.models.filter(m => m.enabled);
+      const enabled = state.models;
       sel.append(new Option('Best match for the document', ''));
-      for (const m of enabled) sel.append(new Option(`${m.label}${m.imageInput ? ' · image input' : ''} · ~$${m.costHint}`, m.id));
+      for (const m of enabled) sel.append(new Option(`${m.label}${m.imageInput ? ' · image input' : ''}${m.costHint ? ` · ~$${m.costHint}` : ''}`, m.id));
       p.append(el('h3', {}, 'Renderer'), sel);
+      if (state.renderer === 'studio') p.append(el('div', { className: 'muted' }, 'Renders with JAI Studio on this computer; nothing leaves it.'));
       const status = el('div', { className: 'status', textContent: statusText(item) });
       status.setAttribute('aria-live', 'polite');
       p.append(status);
@@ -319,10 +320,10 @@ function init(): void {
       const toggleBtn = el('button', { className: 'act secondary', type: 'button', textContent: item.status === 'rendered' ? 'Show original' : 'Show render', disabled: !item.render });
       row.append(renderBtn, cancelBtn, toggleBtn);
       p.append(row);
-      if (!state.hasToken) {
-        const a = el('a', { href: '#', textContent: 'Add your Replicate token' });
+      if (!state.ready) {
+        const a = el('a', { href: '#', textContent: 'Connect JAI Studio or add a Replicate token' });
         a.addEventListener('click', e => { e.preventDefault(); void send({ type: 'openOptions' }); });
-        p.append(el('div', { className: 'notice' }, a, ' to render. Without it, JAI images stay as they are.'));
+        p.append(el('div', { className: 'notice' }, a, ' to render. Until then, JAI images stay as they are.'));
         renderBtn.disabled = true;
       } else if (!state.disclosed) {
         const notice = el('div', { className: 'notice' },
@@ -778,6 +779,6 @@ function init(): void {
   void send<StateReply>({ type: 'state', origin }).then(s => {
     state = s;
     if (s.mode === 'never') { off = true; for (const i of items.values()) i.badge?.remove(); mo.disconnect(); return; }
-    if (s.mode === 'auto' && s.hasToken && s.disclosed && window === window.top) { autoOn = true; for (const i of items.values()) maybeAuto(i); }
+    if (s.mode === 'auto' && s.ready && s.disclosed && window === window.top) { autoOn = true; for (const i of items.values()) maybeAuto(i); }
   });
 }

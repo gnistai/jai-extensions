@@ -46,3 +46,23 @@ The driver needs `puppeteer-core` and must run on the same machine as Chrome.
 Use a fresh profile directory after changing extension code: Chrome keeps running a
 cached copy of the background worker in a reused profile, even after a version bump,
 so tests silently exercise old code. A fresh profile re-renders (a few cents).
+
+## With JAI Studio as the renderer
+
+`studio.mjs` runs the viewer and the encode page against JAI Studio instead of
+Replicate. By default it starts `test/fake-studio.mjs` on Studio's first free
+port (5240 to 5249), at no cost, and checks connecting from the options page
+(a token no Studio holds is refused), the render of `page.html` and a transform document, a 70 s reply
+(the background worker must stay alive with no debugger attached, and stop once
+idle afterwards), a refused token after the proof, a stopped Studio, the
+encoder's port, a tiny encode and Remove. With `--real` it uses the JAI Studio
+running on this computer, reading its token from Studio's data folder, in a
+visible window; it skips the fake-only checks.
+
+```sh
+npm run build
+# copy dist/extension, and add to host_permissions in that copy only:
+# "http://127.0.0.1/*" (JAI Studio) and "http://localhost:8767/*" (the test pages,
+# which the script serves itself)
+node test/e2e/studio.mjs <chrome> <extension-copy> test/e2e <out-dir> [--real]
+```

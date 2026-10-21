@@ -4,10 +4,28 @@
 <style>main{max-width:760px;margin:0 auto;padding:24px 16px 64px}</style></head>
 <body><main>
   <h1>JAI Viewer</h1>
-  <p class="muted">The reference viewer for <a href="https://jai.gnist.ai/">JAI (Just AI Images)</a>. It renders JAI images only when you ask, with the provider and models you choose here.</p>
+  <p class="muted">The reference viewer for <a href="https://jai.gnist.ai/">JAI (Just AI Images)</a>. It renders JAI images only when you ask, with the renderer and models you choose here.</p>
 
   <div class="card notice">
-    <strong>How rendering works.</strong> When you render a JAI image, this extension sends its description, and for "transform" images the picture shown on the page, to <strong>Replicate</strong>, using your own API token. Replicate processes and may log what you send under <a href="https://replicate.com/terms">its terms</a>, and charges your account per image. Nothing is sent to any other server, and nothing is rendered until you allow it for a site.
+    <strong>How rendering works.</strong> When you render a JAI image, this extension sends its description to the renderer you choose below.
+    With <strong>JAI Studio</strong>, the desktop app, it goes to JAI Studio's server on this computer: nothing leaves the computer and nothing costs money.
+    With <strong>Replicate</strong>, the description, and for "transform" images the picture shown on the page, goes to Replicate with your own API token. Replicate processes and may log what you send under <a href="https://replicate.com/terms">its terms</a>, and charges your account per image; nothing is rendered there until you allow it for a site.
+    Nothing is sent to any other server.
+  </div>
+
+  <h2>Render with</h2>
+  <div class="card" role="radiogroup" aria-label="Render with">
+    <label><input type="radio" name="renderer" value="studio" id="use-studio"> JAI Studio on this computer: free, and nothing leaves the computer</label>
+    <label><input type="radio" name="renderer" value="replicate" id="use-replicate"> Replicate, under your account: paid per image</label>
+    <p class="muted" style="margin-bottom:0">Each renderer can be chosen once it is set up below, and connecting JAI Studio chooses it. The extension never switches to the other renderer by itself: not when the chosen one fails, and not when it is removed.</p>
+  </div>
+
+  <h2>JAI Studio on this computer</h2>
+  <div class="card">
+    <div id="studio-status" class="muted" role="status">Checking…</div>
+    <label>Token <input id="studio-token" type="password" autocomplete="off" spellcheck="false" placeholder="jai_…" style="width:100%"></label>
+    <div class="row"><button id="studio-connect" type="button">Connect</button><button id="studio-remove" type="button" class="secondary">Remove</button></div>
+    <p class="muted" style="margin-bottom:0">Copy the token in JAI Studio: <strong>Copy</strong> next to the token in the Server tab, or <strong>Copy server token</strong> in the tray menu. JAI Studio must be running on its usual ports (5240 to 5249). With "Keep running in the tray when the window is closed" (on by default) it goes on running after you close its window, and on Windows it can start in the tray when you sign in. Connecting asks for permission to reach this computer's own address (127.0.0.1). The token is stored only in this browser profile, in the extension's private storage; the background worker sends it only to a JAI Studio on this computer that has proved it holds the same token, and web pages and the extension's in-page code never see it.</p>
   </div>
 
   <h2>Replicate API token</h2>
@@ -18,9 +36,9 @@
     <p class="muted" style="margin-bottom:0">Create one at <a href="https://replicate.com/account/api-tokens">replicate.com/account/api-tokens</a>. It is stored only in this browser profile, in the extension's private storage, and is used only by the extension's background worker to call api.replicate.com. Web pages and the extension's in-page code never see it.</p>
   </div>
 
-  <h2>Models</h2>
+  <h2>Replicate models</h2>
   <div class="card">
-    <p class="muted" style="margin-top:0">A JAI document can name preferred models, but only models enabled here are ever used. A document can never make the extension download or run anything else.</p>
+    <p class="muted" style="margin-top:0">A JAI document can name preferred models, but only models enabled here are ever used on Replicate. A document can never make the extension download or run anything else. JAI Studio renders every document with its FLUX.1 schnell.</p>
     <table><thead><tr><th>Use</th><th>Model</th><th>Default</th><th>Approx. cost</th></tr></thead><tbody id="models"></tbody></table>
     <label style="margin-top:12px"><input type="checkbox" id="fold-avoid"> When a model has no negative prompt, add "avoid" items to the prompt (otherwise they are left out and reported)</label>
   </div>
@@ -38,7 +56,7 @@
   <h2>Sites</h2>
   <div class="card">
     <p class="muted" style="margin-top:0">Every site starts at "render only when I ask". Automatic rendering is per site and still respects the limits above. Choose per site from the toolbar button.</p>
-    <table><thead><tr><th>Site</th><th>Mode</th><th>Provider notice accepted</th><th></th></tr></thead><tbody id="sites"></tbody></table>
+    <table><thead><tr><th>Site</th><th>Mode</th><th>Replicate notice accepted</th><th></th></tr></thead><tbody id="sites"></tbody></table>
   </div>
 
   <h2>History and cache</h2>

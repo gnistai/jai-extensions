@@ -25,8 +25,8 @@ Layers, as in the rest of jai-tools:
 |---|---|
 | Spec | Nothing. Studio is an app; it implements no new normative behaviour. |
 | Library | The TypeScript JAI library (`src/jai`). Unchanged. Studio runs it inside an embedded JavaScript engine. |
-| Engines | TypeScript: the encoder engine plus new local providers (`src/renderers/local.ts`, `src/encoder/local-providers.ts`, `src/providers/openai-chat.ts`). Rust: scheduler, process supervision, downloader, JS host. |
-| Apps | The `jai` executable (CLI, GUI, tray, server), the webview UI, and the Node CLI's new `--local` flag. |
+| Engines | TypeScript: the encoder engine plus new local providers (`src/renderers/local.ts`, `src/encoder/local-providers.ts`, `src/providers/openai-chat.ts`) and finding the server (`src/providers/studio.ts`). Rust: scheduler, process supervision, downloader, JS host. |
+| Apps | The `jai` executable (CLI, GUI, tray, server), the webview UI, the Node CLI's new `--local` flag, and the browser extension's JAI Studio renderer. |
 
 ## 0. Names and constants
 
@@ -48,12 +48,14 @@ Layers, as in the rest of jai-tools:
 jai-tools/
   src/
     providers/openai-chat.ts        OpenAIChatClient (fetch-based, injectable fetch)
+    providers/studio.ts             proveStudio, findStudio: the /health proof with WebCrypto
     renderers/local.ts              LocalRenderer implements Renderer
     encoder/local-providers.ts      LocalAnalyst implements Analyst
     studio/host-entry.ts            entry bundled to dist/studio/host.mjs (runs inside QuickJS)
     studio/ui/                      webview UI: index.html, main.ts, api.ts, *.ts, style.css
   scripts/build.mjs                 also builds dist/studio/host.mjs, dist/studio/ui/*, dist/studio/conformance.mjs
-  test/local.test.mjs               local providers with mocked fetch
+  test/local.test.mjs               local providers with mocked fetch; proof and discovery against test/fake-studio.mjs
+  test/fake-studio.mjs              a fake Studio server (proof, token, real PNGs, analyst answers) for tests and the extension e2e
   test/studio-host.test.mjs         host-entry functions in Node with mocks
   bin/jai.mjs                       Node CLI; gains --local
   studio/
@@ -575,6 +577,11 @@ or to a CLI command's private server (section 10), which has a token of its own.
 answer also carries `"pid"`, and `find` reports that pid: a server that took over the port
 of a killed one proves the token before it rewrites `server.json`.
 
+A client that cannot read `server.json`, the browser extension, finds the server with
+`findStudio` (section 9). It asks `127.0.0.1` on ports 5240 to 5249 for the proof and sends the
+token only to the lowest port that proves it, so it does not find a server on another port or
+one bound only to a LAN address.
+
 ### `GET /v1/models`
 
 ```json
@@ -809,6 +816,7 @@ export interface ChatMessage { role: 'system' | 'user' | 'assistant'; content: s
 export interface ChatRequest { messages: ChatMessage[]; max_tokens?: number; temperature?: number; top_p?: number; top_k?: number;
   presence_penalty?: number; response_format?: unknown; chat_template_kwargs?: Record<string, unknown>; seed?: number }
 export interface ChatResult { text: string; finishReason: string | null; usage: Record<string, number> | null; timings: Record<string, number> | null }
+export const CHAT_FIELDS: readonly ['max_tokens', 'temperature', 'top_p', 'top_k', 'presence_penalty', 'response_format', 'chat_template_kwargs', 'seed'];   // forwarded besides messages
 export class OpenAIChatClient {
   constructor(baseUrl: string, token: string, opts?: { fetch?: FetchLike; timeoutMs?: number });
   complete(req: ChatRequest, opts?: { signal?: AbortSignal }): Promise<ChatResult>;
@@ -912,11 +920,28 @@ export function sniffImage(bytes: Uint8Array): string | null;   // PNG, JPEG, We
 - Both renderers choose the ratio in the same order: `governingRatio`, the intent's aspect,
   `previewRatio`, then the model's default.
 
+`src/providers/studio.ts`, for clients that must check a server before they send it the token
+(fetch and WebCrypto only, so it runs in Node and in the browser extension):
+
+```ts
+export const STUDIO_PORTS: readonly number[];   // 5240 to 5249 (section 0)
+export interface StudioServer { url: string; version: string }
+export type StudioMiss = 'absent' | 'unproven';
+export function proveStudio(url: string, port: number, token: string): Promise<StudioServer | StudioMiss>;
+export function findStudio(token: string, ports?: readonly number[]): Promise<StudioServer | null>;
+```
+
+- `proveStudio` sends `GET /health?nonce=<32 random bytes, base64url>` (no redirects, 2 s) and
+  compares the `proof` with its own HMAC-SHA256 of `jai-health:<port>:<nonce>` in constant time.
+  `absent`: nothing there answers with `name: "jai"`. `unproven`: the server there does not hold
+  the token. Only the nonce is ever sent.
+- `findStudio` asks `127.0.0.1` on all `ports` at once and returns the first of `ports`, in order,
+  that proves the token (the lowest, for `STUDIO_PORTS`), or null.
+
 `bin/jai.mjs` gains `--local`:
 - It reads `<root>/server.json` and `<root>/token`, with the root resolved as in section 2.
 - It sends the token only to a server that proves it holds it, as `discovery::find` does
-  (section 7): the host must be an IP address, and `GET /health?nonce=<32 random bytes>`
-  (no redirects) must return the matching `proof`, compared in constant time.
+  (section 7): the host must be an IP address, and `proveStudio` must succeed.
 - `encode` then uses LocalRenderer plus LocalAnalyst, and `render` uses LocalRenderer.
 - Their requests go over `node:http`, not Node's fetch: undici gives up after 300 s without
   reply headers, and Studio replies only once the request's engine is free and the job is done.
@@ -1183,7 +1208,8 @@ LLM and Image state.
 
 **Server**:
 - The URL and token, with Copy and Regenerate, and the state: running, or not running with
-  `server_info`'s note saying why (or which other JAI process runs the server).
+  `server_info`'s note saying why (or which other JAI process runs the server). A note says the
+  browser extension takes the token in its options and finds Studio on ports 5240 to 5249.
 - Engine state, swaps and MTP, plus Unload models.
 - Engine logs, with an llm/image toggle.
 - A settings form: idle unload, close to tray, start at login, open .jai files with JAI, port,
@@ -1201,9 +1227,15 @@ keyboard reachable, with visible focus and labels on every control.
 - The server binds 127.0.0.1 by default, and [::1] on the same port so that nobody else can
   listen where `localhost` may lead. Binding anything else needs `--allow-lan` (or the setting),
   the token is still required, and the UI shows a warning.
-- Clients (`discovery::find`, `bin/jai.mjs --local`) send the token only to a server that has
-  proved it holds the token (the `/health` proof), never to whatever took the port of a server
-  that crashed.
+- Clients (`discovery::find`, `bin/jai.mjs --local`, the browser extension) send the token only
+  to a server that has proved it holds the token (the `/health` proof), never to whatever took the
+  port of a server that crashed.
+- The browser extension asks only `127.0.0.1:5240` to `:5249`, stores its copy of the token in
+  the extension's own IndexedDB, uses it only in its background worker (web pages and content
+  scripts never see it), and reaches Studio only through the `http://127.0.0.1/*` permission the
+  user grants when connecting. It asks for the proof right before each render, and once per encode
+  run and again after any failure, as `bin/jai.mjs --local` proves once per run. Its requests carry no Origin
+  header or its `chrome-extension://` origin, and the Origin rule lets both in.
 - Request heads must arrive within 30 s, idle connections close after 30 s, and at most 256
   connections are served at once.
 - The bearer token is required for `/v1/*` and stored with user-only permissions.
@@ -1270,7 +1302,13 @@ Rust, with `cargo test --workspace --exclude jai` on Linux plus `cargo xwin chec
   Node CLI reads them, `render` refusing an unreadable document before it looks for a server,
   a mistyped subcommand, `render --out` and `licenses`.
 
-TypeScript: `npm test`, which adds `test/local.test.mjs` and `test/studio-host.test.mjs`.
+TypeScript: `npm test`, which adds `test/local.test.mjs` (with `proveStudio` and `findStudio`
+against `test/fake-studio.mjs`) and `test/studio-host.test.mjs`.
+
+Browser extension: `test/e2e/studio.mjs` loads the extension into Chrome for Testing against
+`test/fake-studio.mjs` (connect, render, a transform document, a 70 s reply, a refused token, a
+stopped Studio, a tiny encode), and with `--real` (connect, render, the transform document, the
+encode) against the real Studio on Windows.
 
 GPU end to end: `studio/scripts/e2e-windows.sh`, driving the real `jai.exe` on the RTX 5070 Ti.
 

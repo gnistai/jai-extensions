@@ -16,7 +16,6 @@
 // --local, the address and token of JAI Studio's local server come from its
 // data folder (studio/DESIGN.md section 2). Tokens are never printed or
 // written to reports. Run `npm run build` first.
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { request } from 'node:http';
 import { isIP } from 'node:net';
@@ -119,13 +118,9 @@ async function localServer() {
   const host = typeof info.host !== 'string' || !info.host || info.host === '0.0.0.0' ? '127.0.0.1' : info.host === '::' ? '::1' : info.host;
   if (!isIP(host)) { console.error(notRunning); process.exit(1); }
   const url = `http://${host.includes(':') ? `[${host}]` : host}:${port}`;
-  const nonce = randomBytes(32).toString('base64url');
-  const health = await fetch(`${url}/health?nonce=${nonce}`, { redirect: 'error', signal: AbortSignal.timeout(5000) })
-    .then(r => (r.ok ? r.json() : null)).catch(() => null);
-  if (health?.name !== 'jai') { console.error(`No JAI Studio server answers at ${url}. Start JAI Studio or run \`jai serve\`.`); process.exit(1); }
-  const expected = Buffer.from(createHmac('sha256', key).update(`jai-health:${port}:${nonce}`).digest('base64url'));
-  const shown = Buffer.from(typeof health.proof === 'string' ? health.proof : '');
-  if (shown.length !== expected.length || !timingSafeEqual(shown, expected)) {
+  const found = await E.proveStudio(url, port, key);
+  if (found === 'absent') { console.error(`No JAI Studio server answers at ${url}. Start JAI Studio or run \`jai serve\`.`); process.exit(1); }
+  if (found === 'unproven') {
     console.error(`The server at ${url} did not prove that it holds your JAI Studio token, so the token was not sent. Restart JAI Studio or \`jai serve\`.`);
     process.exit(1);
   }
